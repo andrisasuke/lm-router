@@ -562,9 +562,13 @@ func anthropicMessagesToResponsesBody(body []byte) ([]byte, string, bool, error)
 		if role != "assistant" {
 			role = "user"
 		}
+		contentType := "input_text"
+		if role == "assistant" {
+			contentType = "output_text"
+		}
 		input = append(input, map[string]any{
 			"role":    role,
-			"content": anthropicContentToResponsesContent(msg.Content),
+			"content": anthropicContentToResponsesContent(msg.Content, contentType),
 		})
 	}
 
@@ -606,10 +610,10 @@ func anthropicSystemText(raw any) string {
 	}
 }
 
-func anthropicContentToResponsesContent(raw any) []map[string]string {
+func anthropicContentToResponsesContent(raw any, contentType string) []map[string]string {
 	switch v := raw.(type) {
 	case string:
-		return []map[string]string{{"type": "input_text", "text": v}}
+		return []map[string]string{{"type": contentType, "text": v}}
 	case []any:
 		out := make([]map[string]string, 0, len(v))
 		for _, item := range v {
@@ -618,14 +622,16 @@ func anthropicContentToResponsesContent(raw any) []map[string]string {
 				continue
 			}
 			if text, ok := m["text"].(string); ok {
-				out = append(out, map[string]string{"type": "input_text", "text": text})
+				out = append(out, map[string]string{"type": contentType, "text": text})
 			}
 		}
 		if len(out) > 0 {
 			return out
 		}
 	}
-	return []map[string]string{{"type": "input_text", "text": ""}}
+	// Non-text content blocks (images, tool results) are not forwarded to Codex.
+	// They are replaced with an empty input_text placeholder.
+	return []map[string]string{{"type": contentType, "text": ""}}
 }
 
 func writeAnthropicMessageJSON(w http.ResponseWriter, model string, text string) {
@@ -665,7 +671,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	}
 	if stream {
 		// streaming implemented in Task 5
-		writeAnthropicError(w, http.StatusNotImplemented, "api_error", "streaming not yet implemented")
+		writeAnthropicError(w, http.StatusNotImplemented, "not_supported_error", "streaming not yet implemented")
 		return
 	}
 	respBody, _, status, err := s.routeResponses(r.Context(), responsesBody)
