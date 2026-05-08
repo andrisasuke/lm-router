@@ -480,6 +480,54 @@ func TestAnthropicMessagesReturnsAnthropicMessageJSON(t *testing.T) {
 	}
 }
 
+func TestAnthropicMessagesStreamingEvents(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil { t.Fatalf("open store: %v", err) }
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil { t.Fatalf("create key: %v", err) }
+	acct := store.Account{ID:"acct_1", Provider:"openai-codex", Name:"one", Priority:1, Enabled:true, AccessToken:"token-1", RefreshToken:"r1", ExpiresAt:time.Now().Add(time.Hour)}
+	if err := db.UpsertAccount(ctx, acct); err != nil { t.Fatalf("upsert: %v", err) }
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{Store:db, Codex:codex.NewClient(upstream.URL, codex.NewTokenManager(db,nil)), RequireKey:true})
+
+	body := `{"model":"gpt-5.5","max_tokens":16,"messages":[{"role":"user","content":"Say pong"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", key.Secret)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	ct := rec.Header().Get("Content-Type")
+	if !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("content-type=%s", ct)
+	}
+	respBody := rec.Body.String()
+	// Assert all required event types present in order
+	for _, event := range []string{"message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"} {
+		if !strings.Contains(respBody, event) {
+			t.Fatalf("missing event %q in response:\n%s", event, respBody)
+		}
+	}
+	// Assert delta contains "pong"
+	if !strings.Contains(respBody, "pong") {
+		t.Fatalf("expected delta pong in response:\n%s", respBody)
+	}
+}
+
 func TestChatCompletionsStreamReturnsDone(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir())

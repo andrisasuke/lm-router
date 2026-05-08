@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -523,6 +524,86 @@ func (s *SSEScanner) Err() error {
 	return s.scanner.Err()
 }
 
+func writeAnthropicSSE(w io.Writer, event string, payload map[string]any) {
+	b, _ := json.Marshal(payload)
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+}
+
+func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher http.Flusher) {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+		if event["type"] == "response.output_text.delta" {
+			delta, _ := event["delta"].(string)
+			if delta != "" {
+				writeAnthropicSSE(w, "content_block_delta", map[string]any{
+					"type":  "content_block_delta",
+					"index": 0,
+					"delta": map[string]string{"type": "text_delta", "text": delta},
+				})
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+		}
+	}
+	writeAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+	writeAnthropicSSE(w, "message_delta", map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
+		"usage": map[string]int{"output_tokens": 0},
+	})
+	writeAnthropicSSE(w, "message_stop", map[string]any{"type": "message_stop"})
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+func (s *Server) streamAnthropicMessages(w http.ResponseWriter, r *http.Request, body []byte, model string) {
+	result, status, err := s.openResponseStream(r.Context(), body)
+	if err != nil {
+		writeAnthropicError(w, statusOrDefault(status, http.StatusBadGateway), "api_error", err.Error())
+		return
+	}
+	defer result.Body.Close()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	flusher, _ := w.(http.Flusher)
+
+	writeAnthropicSSE(w, "message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": "msg_lm_router", "type": "message", "role": "assistant",
+			"model": model, "content": []any{},
+			"stop_reason": nil, "stop_sequence": nil,
+			"usage": map[string]int{"input_tokens": 0, "output_tokens": 0},
+		},
+	})
+	writeAnthropicSSE(w, "content_block_start", map[string]any{
+		"type": "content_block_start", "index": 0,
+		"content_block": map[string]string{"type": "text", "text": ""},
+	})
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	convertResponsesStreamToAnthropicSSE(w, result.Body, flusher)
+}
+
 func writeAnthropicError(w http.ResponseWriter, status int, typ string, message string) {
 	writeJSON(w, status, map[string]any{
 		"type": "error",
@@ -670,8 +751,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if stream {
-		// streaming implemented in Task 5
-		writeAnthropicError(w, http.StatusNotImplemented, "not_supported_error", "streaming not yet implemented")
+		s.streamAnthropicMessages(w, r, responsesBody, model)
 		return
 	}
 	respBody, _, status, err := s.routeResponses(r.Context(), responsesBody)
