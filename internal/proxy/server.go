@@ -604,7 +604,11 @@ func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher h
 			continue
 		}
 		switch event["type"] {
-		case "response.reasoning_summary_text.delta":
+		case "response.reasoning_summary_text.delta",
+			"response.reasoning_text.delta",
+			"response.reasoning.delta",
+			"response.reasoning_summary_part.delta",
+			"response.reasoning_part.delta":
 			delta, _ := event["delta"].(string)
 			if delta == "" {
 				continue
@@ -769,12 +773,11 @@ func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher h
 			"index": state.textIndex,
 		})
 	}
-	usageOut := map[string]int{"input_tokens": state.inputTokens, "output_tokens": state.outputTokens}
-	if state.cacheRead > 0 {
-		usageOut["cache_read_input_tokens"] = state.cacheRead
-	}
-	if state.cacheCreate > 0 {
-		usageOut["cache_creation_input_tokens"] = state.cacheCreate
+	usageOut := map[string]int{
+		"input_tokens":                state.inputTokens,
+		"output_tokens":               state.outputTokens,
+		"cache_read_input_tokens":     state.cacheRead,
+		"cache_creation_input_tokens": state.cacheCreate,
 	}
 	writeAnthropicSSE(w, "message_delta", map[string]any{
 		"type":  "message_delta",
@@ -1153,7 +1156,11 @@ func convertResponsesSSEToAnthropicBlocks(sse []byte) anthropicNonStreamResult {
 			continue
 		}
 		switch event["type"] {
-		case "response.reasoning_summary_text.delta":
+		case "response.reasoning_summary_text.delta",
+			"response.reasoning_text.delta",
+			"response.reasoning.delta",
+			"response.reasoning_summary_part.delta",
+			"response.reasoning_part.delta":
 			delta, _ := event["delta"].(string)
 			thinkingBuf.WriteString(delta)
 		case "response.output_text.delta":
@@ -1269,6 +1276,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
 		return
 	}
+	log.Printf("[anthropic-api] inbound /v1/messages body=%s", formatInboundBody(body))
 	responsesBody, model, stream, err := anthropicMessagesToResponsesBody(body)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
@@ -1312,6 +1320,14 @@ func estimateAnthropicTokens(body []byte) int {
 		return 1
 	}
 	return n
+}
+
+func formatInboundBody(body []byte) string {
+	const limit = 8 * 1024
+	if len(body) > limit {
+		return string(body[:limit]) + " (truncated)"
+	}
+	return string(body)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

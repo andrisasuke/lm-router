@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1417,5 +1418,142 @@ func TestAnthropicMessagesAcceptsThinkingInHistory(t *testing.T) {
 	}
 	if !foundAssistantText {
 		t.Fatalf("expected assistant output_text block in upstream input, got %v", input)
+	}
+}
+
+func TestAnthropicMessagesEmitsThinkingFromAlternateReasoningEvents(t *testing.T) {
+	cases := []string{
+		"response.reasoning_text.delta",
+		"response.reasoning.delta",
+		"response.reasoning_summary_part.delta",
+		"response.reasoning_part.delta",
+	}
+	for _, evType := range cases {
+		t.Run(evType, func(t *testing.T) {
+			db, _, apiKey := setupAnthropicTest(t)
+
+			eventLine := fmt.Sprintf("data: {\"type\":\"%s\",\"delta\":\"alt thinking\"}\n\n", evType)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(eventLine))
+				_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer.\"}\n\n"))
+				_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"))
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			}))
+			defer upstream.Close()
+
+			srv := New(ServerConfig{Store: db, Codex: codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)), RequireKey: true})
+
+			body := `{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}],"stream":true}`
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+			req.Header.Set("x-api-key", apiKey)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+
+			srv.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			respBody := rec.Body.String()
+			for _, want := range []string{"thinking_delta", "alt thinking", "signature_delta"} {
+				if !strings.Contains(respBody, want) {
+					t.Fatalf("expected %q in response for %s:\n%s", want, evType, respBody)
+				}
+			}
+		})
+	}
+}
+
+func TestAnthropicMessagesNonStreamingThinkingFromAlternateReasoningEvents(t *testing.T) {
+	cases := []string{
+		"response.reasoning_text.delta",
+		"response.reasoning.delta",
+		"response.reasoning_summary_part.delta",
+		"response.reasoning_part.delta",
+	}
+	for _, evType := range cases {
+		t.Run(evType, func(t *testing.T) {
+			db, _, apiKey := setupAnthropicTest(t)
+
+			eventLine := fmt.Sprintf("data: {\"type\":\"%s\",\"delta\":\"alt thinking\"}\n\n", evType)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(eventLine))
+				_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer.\"}\n\n"))
+				_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"))
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			}))
+			defer upstream.Close()
+
+			srv := New(ServerConfig{Store: db, Codex: codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)), RequireKey: true})
+
+			body := `{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}],"stream":false}`
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+			req.Header.Set("x-api-key", apiKey)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+
+			srv.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			var resp map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("json: %v", err)
+			}
+			content, ok := resp["content"].([]any)
+			if !ok || len(content) < 2 {
+				t.Fatalf("expected at least 2 content blocks for %s, got %v", evType, resp["content"])
+			}
+			thinkingBlock, _ := content[0].(map[string]any)
+			if thinkingBlock["type"] != "thinking" {
+				t.Fatalf("expected content[0].type=thinking for %s, got %v", evType, thinkingBlock["type"])
+			}
+			if thinkingBlock["thinking"] != "alt thinking" {
+				t.Fatalf("expected thinking text 'alt thinking' for %s, got %v", evType, thinkingBlock["thinking"])
+			}
+			if sig, _ := thinkingBlock["signature"].(string); sig == "" {
+				t.Fatalf("expected non-empty signature for %s", evType)
+			}
+		})
+	}
+}
+
+func TestAnthropicMessagesStreamUsageAlwaysIncludesCacheFields(t *testing.T) {
+	db, _, apiKey := setupAnthropicTest(t)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{Store: db, Codex: codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)), RequireKey: true})
+
+	body := `{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	respBody := rec.Body.String()
+	for _, want := range []string{
+		`"cache_read_input_tokens":0`,
+		`"cache_creation_input_tokens":0`,
+		`"input_tokens":3`,
+		`"output_tokens":1`,
+	} {
+		if !strings.Contains(respBody, want) {
+			t.Fatalf("expected %q in response:\n%s", want, respBody)
+		}
 	}
 }
