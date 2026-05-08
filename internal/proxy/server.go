@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -540,6 +541,10 @@ type anthropicStreamState struct {
 	thinkingIndex  int
 	textOpen       bool
 	textIndex      int
+	toolOpen       bool
+	toolIndex      int
+	toolItemID     string
+	sawToolCall    bool
 	inputTokens    int
 	outputTokens   int
 	cacheRead      int
@@ -628,6 +633,73 @@ func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher h
 			if flusher != nil {
 				flusher.Flush()
 			}
+		case "response.output_item.added":
+			item, _ := event["item"].(map[string]any)
+			if item == nil || item["type"] != "function_call" {
+				continue
+			}
+			if state.thinkingOpen {
+				writeAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": state.thinkingIndex})
+				state.thinkingOpen = false
+			}
+			if state.textOpen {
+				writeAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": state.textIndex})
+				state.textOpen = false
+			}
+			state.toolIndex = state.nextBlockIndex
+			state.nextBlockIndex++
+			state.toolOpen = true
+			state.sawToolCall = true
+			callID := stringVal(item["call_id"])
+			if callID == "" {
+				callID = stringVal(item["id"])
+			}
+			state.toolItemID = stringVal(item["id"])
+			writeAnthropicSSE(w, "content_block_start", map[string]any{
+				"type":  "content_block_start",
+				"index": state.toolIndex,
+				"content_block": map[string]any{
+					"type":  "tool_use",
+					"id":    callID,
+					"name":  stringVal(item["name"]),
+					"input": map[string]any{},
+				},
+			})
+			if flusher != nil {
+				flusher.Flush()
+			}
+		case "response.function_call_arguments.delta":
+			if !state.toolOpen {
+				continue
+			}
+			delta, _ := event["delta"].(string)
+			if delta == "" {
+				continue
+			}
+			writeAnthropicSSE(w, "content_block_delta", map[string]any{
+				"type":  "content_block_delta",
+				"index": state.toolIndex,
+				"delta": map[string]string{"type": "input_json_delta", "partial_json": delta},
+			})
+			if flusher != nil {
+				flusher.Flush()
+			}
+		case "response.output_item.done":
+			item, _ := event["item"].(map[string]any)
+			if item == nil || item["type"] != "function_call" {
+				continue
+			}
+			if !state.toolOpen {
+				continue
+			}
+			writeAnthropicSSE(w, "content_block_stop", map[string]any{
+				"type":  "content_block_stop",
+				"index": state.toolIndex,
+			})
+			state.toolOpen = false
+			if flusher != nil {
+				flusher.Flush()
+			}
 		case "response.completed":
 			resp, _ := event["response"].(map[string]any)
 			if resp == nil {
@@ -651,12 +723,21 @@ func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher h
 			state.cacheRead = toInt(usage["cache_read_input_tokens"])
 			state.cacheCreate = toInt(usage["cache_creation_input_tokens"])
 			// Codex response.status ("completed", "failed", …) is a lifecycle string,
-			// not an Anthropic stop_reason. Keep the "end_turn" default.
+			// not an Anthropic stop_reason. Keep the "end_turn" default unless tool calls seen.
+			if state.sawToolCall {
+				state.stopReason = "tool_use"
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("convertResponsesStreamToAnthropicSSE: scanner error: %v", err)
 		return
+	}
+	if state.toolOpen {
+		writeAnthropicSSE(w, "content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": state.toolIndex,
+		})
 	}
 	if state.thinkingOpen {
 		writeAnthropicSSE(w, "content_block_stop", map[string]any{
@@ -733,15 +814,25 @@ type anthropicThinkingConfig struct {
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
 }
 
+type anthropicToolDef struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	InputSchema map[string]any `json:"input_schema,omitempty"`
+}
+
+type anthropicMessage struct {
+	Role    string `json:"role"`
+	Content any    `json:"content"`
+}
+
 type anthropicMessageRequest struct {
-	Model    string `json:"model"`
-	System   any    `json:"system,omitempty"`
-	Messages []struct {
-		Role    string `json:"role"`
-		Content any    `json:"content"`
-	} `json:"messages"`
-	Stream   bool                    `json:"stream,omitempty"`
-	Thinking *anthropicThinkingConfig `json:"thinking,omitempty"`
+	Model      string                   `json:"model"`
+	System     any                      `json:"system,omitempty"`
+	Messages   []anthropicMessage       `json:"messages"`
+	Stream     bool                     `json:"stream,omitempty"`
+	Thinking   *anthropicThinkingConfig `json:"thinking,omitempty"`
+	Tools      []anthropicToolDef       `json:"tools,omitempty"`
+	ToolChoice any                      `json:"tool_choice,omitempty"`
 }
 
 func budgetToEffort(budget int) string {
@@ -770,22 +861,7 @@ func anthropicMessagesToResponsesBody(body []byte) ([]byte, string, bool, error)
 	}
 
 	instructions := anthropicSystemText(req.System)
-	input := make([]map[string]any, 0, len(req.Messages))
-	for _, msg := range req.Messages {
-		role := msg.Role
-		if role != "assistant" {
-			role = "user"
-		}
-		contentType := "input_text"
-		if role == "assistant" {
-			contentType = "output_text"
-		}
-		input = append(input, map[string]any{
-			"type":    "message",
-			"role":    role,
-			"content": anthropicContentToResponsesContent(msg.Content, contentType),
-		})
-	}
+	input := anthropicMessagesToResponsesInput(req.Messages)
 
 	// Always request streaming from Codex — it is the only supported mode.
 	// The Anthropic stream flag controls whether we forward SSE or wrap as JSON.
@@ -803,6 +879,26 @@ func anthropicMessagesToResponsesBody(body []byte) ([]byte, string, bool, error)
 			"effort":  budgetToEffort(req.Thinking.BudgetTokens),
 			"summary": "auto",
 		}
+	}
+	if len(req.Tools) > 0 {
+		tools := make([]map[string]any, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			tool := map[string]any{
+				"type":        "function",
+				"name":        t.Name,
+				"description": t.Description,
+			}
+			if t.InputSchema != nil {
+				tool["parameters"] = t.InputSchema
+			} else {
+				tool["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
+			}
+			tools = append(tools, tool)
+		}
+		out["tools"] = tools
+	}
+	if tc := translateToolChoice(req.ToolChoice); tc != nil {
+		out["tool_choice"] = tc
 	}
 
 	encoded, err := json.Marshal(out)
@@ -833,28 +929,142 @@ func anthropicSystemText(raw any) string {
 	}
 }
 
-func anthropicContentToResponsesContent(raw any, contentType string) []map[string]string {
-	switch v := raw.(type) {
+func translateToolChoice(tc any) any {
+	if tc == nil {
+		return nil
+	}
+	m, ok := tc.(map[string]any)
+	if !ok {
+		return nil
+	}
+	switch m["type"] {
+	case "auto":
+		return "auto"
+	case "any":
+		return "required"
+	case "none":
+		return "none"
+	case "tool":
+		if name, ok := m["name"].(string); ok {
+			return map[string]any{"type": "function", "name": name}
+		}
+	}
+	return nil
+}
+
+func stringVal(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+func toolResultOutput(content any) string {
+	switch v := content.(type) {
 	case string:
-		return []map[string]string{{"type": contentType, "text": v}}
+		return v
 	case []any:
-		out := make([]map[string]string, 0, len(v))
+		var parts []string
+		allText := true
 		for _, item := range v {
 			m, ok := item.(map[string]any)
 			if !ok || m["type"] != "text" {
-				continue
+				allText = false
+				break
 			}
 			if text, ok := m["text"].(string); ok {
-				out = append(out, map[string]string{"type": contentType, "text": text})
+				parts = append(parts, text)
 			}
 		}
-		if len(out) > 0 {
-			return out
+		if allText && len(parts) > 0 {
+			return strings.Join(parts, "")
 		}
+		b, _ := json.Marshal(content)
+		return string(b)
 	}
-	// Non-text content blocks (images, tool results) are not forwarded to Codex.
-	// They are replaced with an empty input_text placeholder.
-	return []map[string]string{{"type": contentType, "text": ""}}
+	if content == nil {
+		return ""
+	}
+	b, _ := json.Marshal(content)
+	return string(b)
+}
+
+func normalizeAnthropicContent(raw any) []map[string]any {
+	switch v := raw.(type) {
+	case string:
+		return []map[string]any{{"type": "text", "text": v}}
+	case []any:
+		blocks := make([]map[string]any, 0, len(v))
+		for _, item := range v {
+			if m, ok := item.(map[string]any); ok {
+				blocks = append(blocks, m)
+			}
+		}
+		return blocks
+	}
+	return nil
+}
+
+func anthropicMessagesToResponsesInput(msgs []anthropicMessage) []map[string]any {
+	items := make([]map[string]any, 0, len(msgs))
+	for _, m := range msgs {
+		blocks := normalizeAnthropicContent(m.Content)
+		textParts := make([]map[string]any, 0)
+
+		flushText := func() {
+			if len(textParts) == 0 {
+				return
+			}
+			role := m.Role
+			if role != "assistant" {
+				role = "user"
+			}
+			items = append(items, map[string]any{
+				"type":    "message",
+				"role":    role,
+				"content": textParts,
+			})
+			textParts = nil
+		}
+
+		for _, b := range blocks {
+			switch b["type"] {
+			case "text":
+				contentType := "input_text"
+				if m.Role == "assistant" {
+					contentType = "output_text"
+				}
+				textParts = append(textParts, map[string]any{
+					"type": contentType,
+					"text": stringVal(b["text"]),
+				})
+			case "tool_use":
+				flushText()
+				var argsStr string
+				if inp := b["input"]; inp != nil {
+					if bs, err := json.Marshal(inp); err == nil {
+						argsStr = string(bs)
+					}
+				}
+				if argsStr == "" {
+					argsStr = "{}"
+				}
+				items = append(items, map[string]any{
+					"type":      "function_call",
+					"call_id":   stringVal(b["id"]),
+					"name":      stringVal(b["name"]),
+					"arguments": argsStr,
+				})
+			case "tool_result":
+				flushText()
+				items = append(items, map[string]any{
+					"type":    "function_call_output",
+					"call_id": stringVal(b["tool_use_id"]),
+					"output":  toolResultOutput(b["content"]),
+				})
+			}
+		}
+		flushText()
+	}
+	return items
 }
 
 func writeAnthropicMessageJSON(w http.ResponseWriter, model string, text string) {
@@ -869,6 +1079,145 @@ func writeAnthropicMessageJSON(w http.ResponseWriter, model string, text string)
 		"usage": map[string]int{
 			"input_tokens":  0,
 			"output_tokens": 0,
+		},
+	})
+}
+
+type anthropicNonStreamResult struct {
+	Content      []map[string]any
+	StopReason   string
+	InputTokens  int
+	OutputTokens int
+}
+
+func convertResponsesSSEToAnthropicBlocks(sse []byte) anthropicNonStreamResult {
+	scanner := bufio.NewScanner(bytes.NewReader(sse))
+
+	result := anthropicNonStreamResult{
+		StopReason: "end_turn",
+	}
+
+	var textBuf strings.Builder
+	type pendingTool struct {
+		callID string
+		name   string
+		args   strings.Builder
+	}
+	var toolOrder []string
+	tools := map[string]*pendingTool{}
+
+	toInt := func(v any) int {
+		switch n := v.(type) {
+		case float64:
+			return int(n)
+		case int:
+			return n
+		}
+		return 0
+	}
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+		switch event["type"] {
+		case "response.output_text.delta":
+			delta, _ := event["delta"].(string)
+			textBuf.WriteString(delta)
+		case "response.output_item.added":
+			item, _ := event["item"].(map[string]any)
+			if item == nil || item["type"] != "function_call" {
+				continue
+			}
+			callID := stringVal(item["call_id"])
+			if callID == "" {
+				callID = stringVal(item["id"])
+			}
+			p := &pendingTool{callID: callID, name: stringVal(item["name"])}
+			tools[stringVal(item["id"])] = p
+			toolOrder = append(toolOrder, stringVal(item["id"]))
+		case "response.function_call_arguments.delta":
+			itemID := stringVal(event["item_id"])
+			if p, ok := tools[itemID]; ok {
+				delta, _ := event["delta"].(string)
+				p.args.WriteString(delta)
+			}
+		case "response.output_item.done":
+			item, _ := event["item"].(map[string]any)
+			if item == nil || item["type"] != "function_call" {
+				continue
+			}
+			itemID := stringVal(item["id"])
+			if p, ok := tools[itemID]; ok && p.args.Len() == 0 {
+				if args, ok2 := item["arguments"].(string); ok2 {
+					p.args.WriteString(args)
+				}
+			}
+		case "response.completed":
+			resp, _ := event["response"].(map[string]any)
+			if resp != nil {
+				if usage, _ := resp["usage"].(map[string]any); usage != nil {
+					result.InputTokens = toInt(usage["input_tokens"])
+					result.OutputTokens = toInt(usage["output_tokens"])
+				}
+			}
+		}
+	}
+
+	if textBuf.Len() > 0 {
+		result.Content = append(result.Content, map[string]any{
+			"type": "text",
+			"text": textBuf.String(),
+		})
+	}
+	for _, itemID := range toolOrder {
+		p := tools[itemID]
+		var inputObj map[string]any
+		if p.args.Len() > 0 {
+			_ = json.Unmarshal([]byte(p.args.String()), &inputObj)
+		}
+		if inputObj == nil {
+			inputObj = map[string]any{}
+		}
+		result.Content = append(result.Content, map[string]any{
+			"type":  "tool_use",
+			"id":    p.callID,
+			"name":  p.name,
+			"input": inputObj,
+		})
+	}
+	if len(toolOrder) > 0 {
+		result.StopReason = "tool_use"
+	}
+
+	return result
+}
+
+func writeAnthropicMessageFull(w http.ResponseWriter, model string, r anthropicNonStreamResult) {
+	content := r.Content
+	if len(content) == 0 {
+		content = []map[string]any{{"type": "text", "text": ""}}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":            "msg_lm_router",
+		"type":          "message",
+		"role":          "assistant",
+		"model":         model,
+		"content":       content,
+		"stop_reason":   r.StopReason,
+		"stop_sequence": nil,
+		"usage": map[string]int{
+			"input_tokens":  r.InputTokens,
+			"output_tokens": r.OutputTokens,
 		},
 	})
 }
@@ -901,8 +1250,8 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, statusOrDefault(status, http.StatusBadGateway), "api_error", err.Error())
 		return
 	}
-	text := codex.ConvertResponsesSSEToOutput(respBody)
-	writeAnthropicMessageJSON(w, model, text)
+	blocks := convertResponsesSSEToAnthropicBlocks(respBody)
+	writeAnthropicMessageFull(w, model, blocks)
 }
 
 func (s *Server) countAnthropicTokens(w http.ResponseWriter, r *http.Request) {

@@ -836,3 +836,383 @@ func TestAnthropicMessagesExtractsUsage(t *testing.T) {
 		t.Fatalf("expected message_stop in response:\n%s", respBody)
 	}
 }
+
+func setupAnthropicTest(t *testing.T) (*store.DB, store.Account, string) {
+	t.Helper()
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	acct := store.Account{ID: "acct_1", Provider: "openai-codex", Name: "one", Priority: 1, Enabled: true, AccessToken: "token-1", RefreshToken: "r1", ExpiresAt: time.Now().Add(time.Hour)}
+	if err := db.UpsertAccount(ctx, acct); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+	return db, acct, key.Secret
+}
+
+func TestAnthropicMessagesForwardsTools(t *testing.T) {
+	db, _, apiKey := setupAnthropicTest(t)
+
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{Store: db, Codex: codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)), RequireKey: true})
+
+	body := `{
+		"model": "gpt-5.5",
+		"messages": [{"role": "user", "content": "search something"}],
+		"tools": [{"name": "web_search_exa", "description": "search", "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}],
+		"tool_choice": {"type": "auto"},
+		"stream": true
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var upstreamBody map[string]any
+	if err := json.Unmarshal(captured, &upstreamBody); err != nil {
+		t.Fatalf("parse upstream body: %v", err)
+	}
+	tools, ok := upstreamBody["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		t.Fatalf("expected tools array in upstream body, got %v", upstreamBody["tools"])
+	}
+	tool, ok := tools[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected tool to be object, got %v", tools[0])
+	}
+	if tool["type"] != "function" {
+		t.Fatalf("expected tool.type=function, got %v", tool["type"])
+	}
+	if tool["name"] != "web_search_exa" {
+		t.Fatalf("expected tool.name=web_search_exa, got %v", tool["name"])
+	}
+	params, ok := tool["parameters"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected tool.parameters to be object, got %v", tool["parameters"])
+	}
+	if params["type"] != "object" {
+		t.Fatalf("expected parameters.type=object, got %v", params["type"])
+	}
+	if upstreamBody["tool_choice"] != "auto" {
+		t.Fatalf("expected tool_choice=auto (string), got %v", upstreamBody["tool_choice"])
+	}
+}
+
+func TestAnthropicMessagesTranslatesToolChoiceAny(t *testing.T) {
+	db, _, apiKey := setupAnthropicTest(t)
+
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{Store: db, Codex: codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)), RequireKey: true})
+
+	body := `{
+		"model": "gpt-5.5",
+		"messages": [{"role": "user", "content": "hi"}],
+		"tools": [{"name": "web_search_exa", "description": "search"}],
+		"tool_choice": {"type": "any"},
+		"stream": true
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var upstreamBody map[string]any
+	if err := json.Unmarshal(captured, &upstreamBody); err != nil {
+		t.Fatalf("parse upstream body: %v", err)
+	}
+	if upstreamBody["tool_choice"] != "required" {
+		t.Fatalf("expected tool_choice=required, got %v", upstreamBody["tool_choice"])
+	}
+}
+
+func TestAnthropicMessagesTranslatesToolChoiceSpecific(t *testing.T) {
+	db, _, apiKey := setupAnthropicTest(t)
+
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{Store: db, Codex: codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)), RequireKey: true})
+
+	body := `{
+		"model": "gpt-5.5",
+		"messages": [{"role": "user", "content": "hi"}],
+		"tools": [{"name": "web_search_exa", "description": "search"}],
+		"tool_choice": {"type": "tool", "name": "web_search_exa"},
+		"stream": true
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var upstreamBody map[string]any
+	if err := json.Unmarshal(captured, &upstreamBody); err != nil {
+		t.Fatalf("parse upstream body: %v", err)
+	}
+	tc, ok := upstreamBody["tool_choice"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected tool_choice to be object, got %v", upstreamBody["tool_choice"])
+	}
+	if tc["type"] != "function" {
+		t.Fatalf("expected tool_choice.type=function, got %v", tc["type"])
+	}
+	if tc["name"] != "web_search_exa" {
+		t.Fatalf("expected tool_choice.name=web_search_exa, got %v", tc["name"])
+	}
+}
+
+func TestAnthropicMessagesPreservesMultiTurnToolHistory(t *testing.T) {
+	db, _, apiKey := setupAnthropicTest(t)
+
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{Store: db, Codex: codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)), RequireKey: true})
+
+	body := `{
+		"model": "gpt-5.5",
+		"messages": [
+			{"role": "user", "content": [{"type": "text", "text": "search AI news"}]},
+			{"role": "assistant", "content": [
+				{"type": "text", "text": "Let me search."},
+				{"type": "tool_use", "id": "toolu_01abc", "name": "web_search_exa", "input": {"query": "AI news"}}
+			]},
+			{"role": "user", "content": [
+				{"type": "tool_result", "tool_use_id": "toolu_01abc", "content": "[{\"title\":\"AI News\",\"url\":\"https://ai.com\"}]"}
+			]}
+		],
+		"stream": true
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var upstreamBody map[string]any
+	if err := json.Unmarshal(captured, &upstreamBody); err != nil {
+		t.Fatalf("parse upstream body: %v", err)
+	}
+	input, ok := upstreamBody["input"].([]any)
+	if !ok || len(input) < 4 {
+		t.Fatalf("expected at least 4 input items, got %v", upstreamBody["input"])
+	}
+
+	item0, _ := input[0].(map[string]any)
+	if item0["type"] != "message" || item0["role"] != "user" {
+		t.Fatalf("input[0] expected user message, got %v", item0)
+	}
+
+	item1, _ := input[1].(map[string]any)
+	if item1["type"] != "message" || item1["role"] != "assistant" {
+		t.Fatalf("input[1] expected assistant message, got %v", item1)
+	}
+
+	item2, _ := input[2].(map[string]any)
+	if item2["type"] != "function_call" {
+		t.Fatalf("input[2] expected function_call, got %v", item2)
+	}
+	if item2["call_id"] != "toolu_01abc" {
+		t.Fatalf("input[2].call_id expected toolu_01abc, got %v", item2["call_id"])
+	}
+	if item2["name"] != "web_search_exa" {
+		t.Fatalf("input[2].name expected web_search_exa, got %v", item2["name"])
+	}
+
+	item3, _ := input[3].(map[string]any)
+	if item3["type"] != "function_call_output" {
+		t.Fatalf("input[3] expected function_call_output, got %v", item3)
+	}
+	if item3["call_id"] != "toolu_01abc" {
+		t.Fatalf("input[3].call_id expected toolu_01abc, got %v", item3["call_id"])
+	}
+}
+
+func TestAnthropicMessagesTranslatesToolChoiceNone(t *testing.T) {
+	db, _, apiKey := setupAnthropicTest(t)
+
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{Store: db, Codex: codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)), RequireKey: true})
+
+	body := `{
+		"model": "gpt-5.5",
+		"messages": [{"role": "user", "content": "hi"}],
+		"tools": [{"name": "test", "description": "t", "input_schema": {"type": "object", "properties": {}}}],
+		"tool_choice": {"type": "none"},
+		"stream": true
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var upstreamBody map[string]any
+	if err := json.Unmarshal(captured, &upstreamBody); err != nil {
+		t.Fatalf("parse upstream body: %v", err)
+	}
+	if upstreamBody["tool_choice"] != "none" {
+		t.Fatalf("expected tool_choice=none (string), got %v", upstreamBody["tool_choice"])
+	}
+}
+
+func TestAnthropicMessagesNonStreamingWithTools(t *testing.T) {
+	db, _, apiKey := setupAnthropicTest(t)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"web_search_exa","arguments":""}}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"query\":\"AI news\"}"}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":3}}}` + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{Store: db, Codex: codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)), RequireKey: true})
+
+	body := `{"model":"gpt-5.5","messages":[{"role":"user","content":"search AI news"}],"tools":[{"name":"web_search_exa","description":"search","input_schema":{"type":"object","properties":{"query":{"type":"string"}}}}],"stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body2 := rec.Body.String()
+	if !strings.Contains(body2, `"type":"tool_use"`) {
+		t.Fatalf("expected tool_use block: %s", body2)
+	}
+	if !strings.Contains(body2, `"name":"web_search_exa"`) {
+		t.Fatalf("expected tool name: %s", body2)
+	}
+	if !strings.Contains(body2, `"stop_reason":"tool_use"`) {
+		t.Fatalf("expected stop_reason tool_use: %s", body2)
+	}
+}
+
+func TestAnthropicMessagesEmitsToolUseStream(t *testing.T) {
+	db, _, apiKey := setupAnthropicTest(t)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"web_search_exa\",\"arguments\":\"\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"que\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"ry\\\":\\\"x\\\"}\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"web_search_exa\",\"arguments\":\"{\\\"query\\\":\\\"x\\\"}\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":3}}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{Store: db, Codex: codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)), RequireKey: true})
+
+	body := `{"model":"gpt-5.5","messages":[{"role":"user","content":"search"}],"tools":[{"name":"web_search_exa","description":"search"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	respBody := rec.Body.String()
+	// The delta string `{"que` is JSON-encoded in the SSE stream as `{\"que`
+	for _, want := range []string{"tool_use", "web_search_exa", "call_1", "input_json_delta", `{\"que`} {
+		if !strings.Contains(respBody, want) {
+			t.Fatalf("expected %q in response:\n%s", want, respBody)
+		}
+	}
+	if !strings.Contains(respBody, `"stop_reason":"tool_use"`) {
+		t.Fatalf("expected stop_reason=tool_use in response:\n%s", respBody)
+	}
+
+	checkEventOrder := func(markers []string) {
+		lastIdx := -1
+		for _, m := range markers {
+			idx := strings.Index(respBody[lastIdx+1:], m)
+			if idx < 0 {
+				t.Fatalf("missing event %q in response:\n%s", m, respBody)
+			}
+			lastIdx = lastIdx + 1 + idx
+		}
+	}
+	checkEventOrder([]string{
+		"event: content_block_start",
+		"event: content_block_delta",
+		"event: content_block_stop",
+		"event: message_delta",
+		"event: message_stop",
+	})
+}
