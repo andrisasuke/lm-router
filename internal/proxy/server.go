@@ -1276,7 +1276,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
 		return
 	}
-	log.Printf("[anthropic-api] inbound /v1/messages body=%s", formatInboundBody(body))
+	log.Printf("[anthropic-api] inbound /v1/messages %s", summarizeInboundBody(body))
 	responsesBody, model, stream, err := anthropicMessagesToResponsesBody(body)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
@@ -1322,12 +1322,29 @@ func estimateAnthropicTokens(body []byte) int {
 	return n
 }
 
-func formatInboundBody(body []byte) string {
-	const limit = 8 * 1024
-	if len(body) > limit {
-		return string(body[:limit]) + " (truncated)"
+func summarizeInboundBody(body []byte) string {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return fmt.Sprintf("size=%d parse_error=%v", len(body), err)
 	}
-	return string(body)
+	model, _ := raw["model"].(string)
+	stream, _ := raw["stream"].(bool)
+	msgs, _ := raw["messages"].([]any)
+	tools, _ := raw["tools"].([]any)
+	thinking := "none"
+	if t, ok := raw["thinking"].(map[string]any); ok {
+		typ, _ := t["type"].(string)
+		budget := 0
+		switch n := t["budget_tokens"].(type) {
+		case float64:
+			budget = int(n)
+		case int:
+			budget = n
+		}
+		thinking = fmt.Sprintf("type=%s,budget=%d", typ, budget)
+	}
+	return fmt.Sprintf("size=%d model=%q stream=%t messages=%d tools=%d thinking=%s",
+		len(body), model, stream, len(msgs), len(tools), thinking)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
