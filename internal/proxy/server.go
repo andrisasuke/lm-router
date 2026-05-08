@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -50,6 +51,10 @@ func New(cfg ServerConfig) http.Handler {
 	mux.HandleFunc("/v1/models", s.models)
 	mux.HandleFunc("/v1/responses", s.responses)
 	mux.HandleFunc("/v1/chat/completions", s.chatCompletions)
+	mux.HandleFunc("/v1/messages", s.messages)
+	mux.HandleFunc("/v1/v1/messages", s.messages)
+	mux.HandleFunc("/v1/messages/count_tokens", s.countAnthropicTokens)
+	mux.HandleFunc("/v1/v1/messages/count_tokens", s.countAnthropicTokens)
 	logger := cfg.Logger
 	if logger == nil {
 		logger = stdLogger{}
@@ -104,11 +109,17 @@ func (s *Server) authOK(r *http.Request) bool {
 	if !s.requireKey {
 		return true
 	}
-	authHeader := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return false
+	ctx := r.Context()
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		key := strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+		if key != "" && s.store.ValidateAPIKey(ctx, key) {
+			return true
+		}
 	}
-	return s.store.ValidateAPIKey(r.Context(), strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer ")))
+	if k := strings.TrimSpace(r.Header.Get("x-api-key")); k != "" {
+		return s.store.ValidateAPIKey(ctx, k)
+	}
+	return false
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -511,6 +522,284 @@ func (s *SSEScanner) Payload() string {
 
 func (s *SSEScanner) Err() error {
 	return s.scanner.Err()
+}
+
+func writeAnthropicSSE(w io.Writer, event string, payload map[string]any) {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("writeAnthropicSSE: marshal %s: %v", event, err)
+		return
+	}
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+}
+
+func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher http.Flusher) {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+		if event["type"] == "response.output_text.delta" {
+			delta, _ := event["delta"].(string)
+			if delta != "" {
+				writeAnthropicSSE(w, "content_block_delta", map[string]any{
+					"type":  "content_block_delta",
+					"index": 0,
+					"delta": map[string]string{"type": "text_delta", "text": delta},
+				})
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("convertResponsesStreamToAnthropicSSE: scanner error: %v", err)
+		return
+	}
+	writeAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+	writeAnthropicSSE(w, "message_delta", map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
+		"usage": map[string]int{"output_tokens": 0},
+	})
+	writeAnthropicSSE(w, "message_stop", map[string]any{"type": "message_stop"})
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+func (s *Server) streamAnthropicMessages(w http.ResponseWriter, r *http.Request, body []byte, model string) {
+	result, status, err := s.openResponseStream(r.Context(), body)
+	if err != nil {
+		writeAnthropicError(w, statusOrDefault(status, http.StatusBadGateway), "api_error", err.Error())
+		return
+	}
+	defer result.Body.Close()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+
+	writeAnthropicSSE(w, "message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": "msg_lm_router", "type": "message", "role": "assistant",
+			"model": model, "content": []any{},
+			"stop_reason": nil, "stop_sequence": nil,
+			"usage": map[string]int{"input_tokens": 0, "output_tokens": 0},
+		},
+	})
+	writeAnthropicSSE(w, "content_block_start", map[string]any{
+		"type": "content_block_start", "index": 0,
+		"content_block": map[string]string{"type": "text", "text": ""},
+	})
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	convertResponsesStreamToAnthropicSSE(w, result.Body, flusher)
+}
+
+func writeAnthropicError(w http.ResponseWriter, status int, typ string, message string) {
+	writeJSON(w, status, map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    typ,
+			"message": message,
+		},
+	})
+}
+
+type anthropicMessageRequest struct {
+	Model    string `json:"model"`
+	System   any    `json:"system,omitempty"`
+	Messages []struct {
+		Role    string `json:"role"`
+		Content any    `json:"content"`
+	} `json:"messages"`
+	Stream bool `json:"stream,omitempty"`
+}
+
+func anthropicMessagesToResponsesBody(body []byte) ([]byte, string, bool, error) {
+	var req anthropicMessageRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, "", false, err
+	}
+	if strings.TrimSpace(req.Model) == "" {
+		return nil, "", false, errors.New("model is required")
+	}
+	if len(req.Messages) == 0 {
+		return nil, "", false, errors.New("messages are required")
+	}
+
+	instructions := anthropicSystemText(req.System)
+	input := make([]map[string]any, 0, len(req.Messages))
+	for _, msg := range req.Messages {
+		role := msg.Role
+		if role != "assistant" {
+			role = "user"
+		}
+		contentType := "input_text"
+		if role == "assistant" {
+			contentType = "output_text"
+		}
+		input = append(input, map[string]any{
+			"type":    "message",
+			"role":    role,
+			"content": anthropicContentToResponsesContent(msg.Content, contentType),
+		})
+	}
+
+	// Always request streaming from Codex — it is the only supported mode.
+	// The Anthropic stream flag controls whether we forward SSE or wrap as JSON.
+	out := map[string]any{
+		"model":  req.Model,
+		"input":  input,
+		"stream": true,
+		"store":  false,
+	}
+	if instructions != "" {
+		out["instructions"] = instructions
+	}
+
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		return nil, "", false, err
+	}
+	return encoded, req.Model, req.Stream, nil
+}
+
+func anthropicSystemText(raw any) string {
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			m, ok := item.(map[string]any)
+			if !ok || m["type"] != "text" {
+				continue
+			}
+			if text, ok := m["text"].(string); ok && text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, "\n"))
+	default:
+		return ""
+	}
+}
+
+func anthropicContentToResponsesContent(raw any, contentType string) []map[string]string {
+	switch v := raw.(type) {
+	case string:
+		return []map[string]string{{"type": contentType, "text": v}}
+	case []any:
+		out := make([]map[string]string, 0, len(v))
+		for _, item := range v {
+			m, ok := item.(map[string]any)
+			if !ok || m["type"] != "text" {
+				continue
+			}
+			if text, ok := m["text"].(string); ok {
+				out = append(out, map[string]string{"type": contentType, "text": text})
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	// Non-text content blocks (images, tool results) are not forwarded to Codex.
+	// They are replaced with an empty input_text placeholder.
+	return []map[string]string{{"type": contentType, "text": ""}}
+}
+
+func writeAnthropicMessageJSON(w http.ResponseWriter, model string, text string) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":            "msg_lm_router",
+		"type":          "message",
+		"role":          "assistant",
+		"model":         model,
+		"content":       []map[string]string{{"type": "text", "text": text}},
+		"stop_reason":   "end_turn",
+		"stop_sequence": nil,
+		"usage": map[string]int{
+			"input_tokens":  0,
+			"output_tokens": 0,
+		},
+	})
+}
+
+func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
+	if !s.authOK(r) {
+		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid API key")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Method not allowed")
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
+		return
+	}
+	responsesBody, model, stream, err := anthropicMessagesToResponsesBody(body)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	if stream {
+		s.streamAnthropicMessages(w, r, responsesBody, model)
+		return
+	}
+	respBody, _, status, err := s.routeResponses(r.Context(), responsesBody)
+	if err != nil {
+		writeAnthropicError(w, statusOrDefault(status, http.StatusBadGateway), "api_error", err.Error())
+		return
+	}
+	text := codex.ConvertResponsesSSEToOutput(respBody)
+	writeAnthropicMessageJSON(w, model, text)
+}
+
+func (s *Server) countAnthropicTokens(w http.ResponseWriter, r *http.Request) {
+	if !s.authOK(r) {
+		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid API key")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Method not allowed")
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
+		return
+	}
+	tokens := estimateAnthropicTokens(body)
+	writeJSON(w, http.StatusOK, map[string]int{"input_tokens": tokens})
+}
+
+func estimateAnthropicTokens(body []byte) int {
+	// Approximates token count at ~4 chars per token — not tokenizer-exact.
+	n := len(body) / 4
+	if n < 1 {
+		return 1
+	}
+	return n
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

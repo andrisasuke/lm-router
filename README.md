@@ -17,6 +17,7 @@ Today, the project is focused on the OpenAI Codex provider. The long-term shape 
 - OpenAI-compatible local API:
   - `POST /v1/responses`
   - `POST /v1/chat/completions`
+  - `POST /v1/messages`
   - `GET /v1/models`
 - Multiple Codex OAuth accounts with ordered routing priority
 - Automatic failover on retryable upstream errors such as `429` and `5xx`
@@ -253,6 +254,50 @@ const response = await client.responses.create({
 });
 
 console.log(response.output_text);
+```
+
+## Anthropic SDK Compatibility
+
+`lm-router` accepts Anthropic Messages API requests at `/v1/messages` and routes them through your OpenAI Codex connections.
+
+### Python
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://127.0.0.1:19090",
+    api_key="sk-lm-router-REPLACE_ME",
+)
+
+message = client.messages.create(
+    model="gpt-5.5",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello"}],
+)
+
+print(message.content[0].text)
+```
+
+Use the root server URL as `base_url`; do not append `/v1`.
+
+### Streaming
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://127.0.0.1:19090",
+    api_key="sk-lm-router-REPLACE_ME",
+)
+
+with client.messages.stream(
+    model="gpt-5.5",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello"}],
+) as stream:
+    for text in stream.text_stream:
+        print(text, end="")
 ```
 
 ## Routing and Failover
