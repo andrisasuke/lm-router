@@ -895,7 +895,7 @@ func anthropicMessagesToResponsesBody(body []byte) ([]byte, string, bool, error)
 	if instructions != "" {
 		out["instructions"] = instructions
 	}
-	if req.Thinking != nil && req.Thinking.Type == "enabled" {
+	if req.Thinking != nil && (req.Thinking.Type == "enabled" || req.Thinking.Type == "adaptive") {
 		out["reasoning"] = map[string]any{
 			"effort":  budgetToEffort(req.Thinking.BudgetTokens),
 			"summary": "auto",

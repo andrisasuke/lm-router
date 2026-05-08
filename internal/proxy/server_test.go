@@ -718,6 +718,47 @@ func TestAnthropicMessagesForwardsThinking(t *testing.T) {
 	}
 }
 
+func TestAnthropicMessagesForwardsAdaptiveThinking(t *testing.T) {
+	db, _, apiKey := setupAnthropicTest(t)
+
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{Store: db, Codex: codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)), RequireKey: true})
+
+	body := `{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive","budget_tokens":0}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var upstreamBody map[string]any
+	if err := json.Unmarshal(captured, &upstreamBody); err != nil {
+		t.Fatalf("parse upstream body: %v", err)
+	}
+	reasoning, ok := upstreamBody["reasoning"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected reasoning field for adaptive thinking, got %v", upstreamBody)
+	}
+	if reasoning["summary"] != "auto" {
+		t.Fatalf("expected reasoning.summary=auto, got %v", reasoning["summary"])
+	}
+	if reasoning["effort"] == nil {
+		t.Fatalf("expected reasoning.effort to be set for adaptive, got nil")
+	}
+}
+
 func TestAnthropicMessagesEmitsThinkingThenText(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir())
