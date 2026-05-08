@@ -143,6 +143,135 @@ func TestResponsesNonStreamingReturnsJSON(t *testing.T) {
 	}
 }
 
+func TestAnthropicMessagesRejectsMissingAuth(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	srv := New(ServerConfig{
+		Store:      db,
+		Codex:      codex.NewClient("http://invalid", codex.NewTokenManager(db, nil)),
+		RequireKey: true,
+	})
+
+	body := `{"model":"gpt-5.5","max_tokens":16,"messages":[{"role":"user","content":"Say pong"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json error: %v", err)
+	}
+	if resp["type"] != "error" {
+		t.Fatalf("expected top-level type=error, got %v", resp)
+	}
+	errObj, ok := resp["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected error object, got %v", resp)
+	}
+	if errObj["type"] != "authentication_error" {
+		t.Fatalf("expected authentication_error, got %v", errObj["type"])
+	}
+}
+
+func TestAnthropicMessagesAcceptsXAPIKey(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	acct := store.Account{ID: "acct_1", Provider: "openai-codex", Name: "one", Priority: 1, Enabled: true, AccessToken: "token-1", RefreshToken: "r1", ExpiresAt: time.Now().Add(time.Hour)}
+	if err := db.UpsertAccount(ctx, acct); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{
+		Store:      db,
+		Codex:      codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)),
+		RequireKey: true,
+	})
+
+	body := `{"model":"gpt-5.5","max_tokens":16,"messages":[{"role":"user","content":"Say pong"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", key.Secret)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatalf("expected not 401 with x-api-key, got 401 body=%s", rec.Body.String())
+	}
+	if rec.Code == http.StatusNotFound {
+		t.Fatalf("route not found (404), route must be registered")
+	}
+}
+
+func TestAnthropicMessagesAliasV1V1(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	acct := store.Account{ID: "acct_1", Provider: "openai-codex", Name: "one", Priority: 1, Enabled: true, AccessToken: "token-1", RefreshToken: "r1", ExpiresAt: time.Now().Add(time.Hour)}
+	if err := db.UpsertAccount(ctx, acct); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{
+		Store:      db,
+		Codex:      codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)),
+		RequireKey: true,
+	})
+
+	body := `{"model":"gpt-5.5","max_tokens":16,"messages":[{"role":"user","content":"Say pong"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", key.Secret)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusNotFound {
+		t.Fatalf("alias /v1/v1/messages returned 404, route must be registered")
+	}
+}
+
 func TestChatCompletionsStreamReturnsDone(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir())

@@ -50,6 +50,10 @@ func New(cfg ServerConfig) http.Handler {
 	mux.HandleFunc("/v1/models", s.models)
 	mux.HandleFunc("/v1/responses", s.responses)
 	mux.HandleFunc("/v1/chat/completions", s.chatCompletions)
+	mux.HandleFunc("/v1/messages", s.messages)
+	mux.HandleFunc("/v1/v1/messages", s.messages)
+	mux.HandleFunc("/v1/messages/count_tokens", s.countAnthropicTokens)
+	mux.HandleFunc("/v1/v1/messages/count_tokens", s.countAnthropicTokens)
 	logger := cfg.Logger
 	if logger == nil {
 		logger = stdLogger{}
@@ -104,11 +108,17 @@ func (s *Server) authOK(r *http.Request) bool {
 	if !s.requireKey {
 		return true
 	}
-	authHeader := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return false
+	ctx := r.Context()
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		key := strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+		if key != "" && s.store.ValidateAPIKey(ctx, key) {
+			return true
+		}
 	}
-	return s.store.ValidateAPIKey(r.Context(), strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer ")))
+	if k := strings.TrimSpace(r.Header.Get("x-api-key")); k != "" {
+		return s.store.ValidateAPIKey(ctx, k)
+	}
+	return false
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -511,6 +521,44 @@ func (s *SSEScanner) Payload() string {
 
 func (s *SSEScanner) Err() error {
 	return s.scanner.Err()
+}
+
+func writeAnthropicError(w http.ResponseWriter, status int, typ string, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    typ,
+			"message": message,
+		},
+	})
+}
+
+func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Method not allowed")
+		return
+	}
+	if !s.authOK(r) {
+		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid API key")
+		return
+	}
+	// TODO: full implementation in later tasks
+	writeAnthropicError(w, http.StatusNotImplemented, "api_error", "not yet implemented")
+}
+
+func (s *Server) countAnthropicTokens(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Method not allowed")
+		return
+	}
+	if !s.authOK(r) {
+		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid API key")
+		return
+	}
+	// TODO: full implementation in later tasks
+	writeAnthropicError(w, http.StatusNotImplemented, "api_error", "not yet implemented")
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
