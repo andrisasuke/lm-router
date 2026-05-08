@@ -533,7 +533,25 @@ func writeAnthropicSSE(w io.Writer, event string, payload map[string]any) {
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
 }
 
+type anthropicStreamState struct {
+	flusher        http.Flusher
+	nextBlockIndex int
+	thinkingOpen   bool
+	thinkingIndex  int
+	textOpen       bool
+	textIndex      int
+	inputTokens    int
+	outputTokens   int
+	cacheRead      int
+	cacheCreate    int
+	stopReason     string
+}
+
 func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher http.Flusher) {
+	state := &anthropicStreamState{
+		flusher:    flusher,
+		stopReason: "end_turn",
+	}
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -549,29 +567,120 @@ func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher h
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
 			continue
 		}
-		if event["type"] == "response.output_text.delta" {
+		switch event["type"] {
+		case "response.reasoning_summary_text.delta":
 			delta, _ := event["delta"].(string)
-			if delta != "" {
-				writeAnthropicSSE(w, "content_block_delta", map[string]any{
-					"type":  "content_block_delta",
-					"index": 0,
-					"delta": map[string]string{"type": "text_delta", "text": delta},
-				})
-				if flusher != nil {
-					flusher.Flush()
-				}
+			if delta == "" {
+				continue
 			}
+			if state.textOpen {
+				writeAnthropicSSE(w, "content_block_stop", map[string]any{
+					"type":  "content_block_stop",
+					"index": state.textIndex,
+				})
+				state.textOpen = false
+			}
+			if !state.thinkingOpen {
+				state.thinkingIndex = state.nextBlockIndex
+				state.nextBlockIndex++
+				writeAnthropicSSE(w, "content_block_start", map[string]any{
+					"type":          "content_block_start",
+					"index":         state.thinkingIndex,
+					"content_block": map[string]string{"type": "thinking", "thinking": ""},
+				})
+				state.thinkingOpen = true
+			}
+			writeAnthropicSSE(w, "content_block_delta", map[string]any{
+				"type":  "content_block_delta",
+				"index": state.thinkingIndex,
+				"delta": map[string]string{"type": "thinking_delta", "thinking": delta},
+			})
+			if flusher != nil {
+				flusher.Flush()
+			}
+		case "response.output_text.delta":
+			delta, _ := event["delta"].(string)
+			if delta == "" {
+				continue
+			}
+			if state.thinkingOpen {
+				writeAnthropicSSE(w, "content_block_stop", map[string]any{
+					"type":  "content_block_stop",
+					"index": state.thinkingIndex,
+				})
+				state.thinkingOpen = false
+			}
+			if !state.textOpen {
+				state.textIndex = state.nextBlockIndex
+				state.nextBlockIndex++
+				writeAnthropicSSE(w, "content_block_start", map[string]any{
+					"type":          "content_block_start",
+					"index":         state.textIndex,
+					"content_block": map[string]string{"type": "text", "text": ""},
+				})
+				state.textOpen = true
+			}
+			writeAnthropicSSE(w, "content_block_delta", map[string]any{
+				"type":  "content_block_delta",
+				"index": state.textIndex,
+				"delta": map[string]string{"type": "text_delta", "text": delta},
+			})
+			if flusher != nil {
+				flusher.Flush()
+			}
+		case "response.completed":
+			resp, _ := event["response"].(map[string]any)
+			if resp == nil {
+				continue
+			}
+			usage, _ := resp["usage"].(map[string]any)
+			if usage == nil {
+				continue
+			}
+			toInt := func(v any) int {
+				switch n := v.(type) {
+				case float64:
+					return int(n)
+				case int:
+					return n
+				}
+				return 0
+			}
+			state.inputTokens = toInt(usage["input_tokens"])
+			state.outputTokens = toInt(usage["output_tokens"])
+			state.cacheRead = toInt(usage["cache_read_input_tokens"])
+			state.cacheCreate = toInt(usage["cache_creation_input_tokens"])
+			// Codex response.status ("completed", "failed", …) is a lifecycle string,
+			// not an Anthropic stop_reason. Keep the "end_turn" default.
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("convertResponsesStreamToAnthropicSSE: scanner error: %v", err)
 		return
 	}
-	writeAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+	if state.thinkingOpen {
+		writeAnthropicSSE(w, "content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": state.thinkingIndex,
+		})
+	}
+	if state.textOpen {
+		writeAnthropicSSE(w, "content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": state.textIndex,
+		})
+	}
+	usageOut := map[string]int{"input_tokens": state.inputTokens, "output_tokens": state.outputTokens}
+	if state.cacheRead > 0 {
+		usageOut["cache_read_input_tokens"] = state.cacheRead
+	}
+	if state.cacheCreate > 0 {
+		usageOut["cache_creation_input_tokens"] = state.cacheCreate
+	}
 	writeAnthropicSSE(w, "message_delta", map[string]any{
 		"type":  "message_delta",
-		"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
-		"usage": map[string]int{"output_tokens": 0},
+		"delta": map[string]any{"stop_reason": state.stopReason, "stop_sequence": nil},
+		"usage": usageOut,
 	})
 	writeAnthropicSSE(w, "message_stop", map[string]any{"type": "message_stop"})
 	if flusher != nil {
@@ -602,10 +711,6 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, r *http.Request,
 			"usage": map[string]int{"input_tokens": 0, "output_tokens": 0},
 		},
 	})
-	writeAnthropicSSE(w, "content_block_start", map[string]any{
-		"type": "content_block_start", "index": 0,
-		"content_block": map[string]string{"type": "text", "text": ""},
-	})
 	if flusher != nil {
 		flusher.Flush()
 	}
@@ -623,6 +728,11 @@ func writeAnthropicError(w http.ResponseWriter, status int, typ string, message 
 	})
 }
 
+type anthropicThinkingConfig struct {
+	Type         string `json:"type,omitempty"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+}
+
 type anthropicMessageRequest struct {
 	Model    string `json:"model"`
 	System   any    `json:"system,omitempty"`
@@ -630,7 +740,21 @@ type anthropicMessageRequest struct {
 		Role    string `json:"role"`
 		Content any    `json:"content"`
 	} `json:"messages"`
-	Stream bool `json:"stream,omitempty"`
+	Stream   bool                    `json:"stream,omitempty"`
+	Thinking *anthropicThinkingConfig `json:"thinking,omitempty"`
+}
+
+func budgetToEffort(budget int) string {
+	switch {
+	case budget <= 0:
+		return "medium"
+	case budget <= 4096:
+		return "low"
+	case budget <= 8192:
+		return "medium"
+	default:
+		return "high"
+	}
 }
 
 func anthropicMessagesToResponsesBody(body []byte) ([]byte, string, bool, error) {
@@ -673,6 +797,12 @@ func anthropicMessagesToResponsesBody(body []byte) ([]byte, string, bool, error)
 	}
 	if instructions != "" {
 		out["instructions"] = instructions
+	}
+	if req.Thinking != nil && req.Thinking.Type == "enabled" {
+		out["reasoning"] = map[string]any{
+			"effort":  budgetToEffort(req.Thinking.BudgetTokens),
+			"summary": "auto",
+		}
 	}
 
 	encoded, err := json.Marshal(out)

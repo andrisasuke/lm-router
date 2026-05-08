@@ -667,3 +667,172 @@ func TestChatCompletionsStreamReturnsDone(t *testing.T) {
 		t.Fatalf("finish chunk must be emitted before DONE, got %s", rec.Body.String())
 	}
 }
+
+func TestAnthropicMessagesForwardsThinking(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil { t.Fatalf("open store: %v", err) }
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil { t.Fatalf("create key: %v", err) }
+	acct := store.Account{ID:"acct_1", Provider:"openai-codex", Name:"one", Priority:1, Enabled:true, AccessToken:"token-1", RefreshToken:"r1", ExpiresAt:time.Now().Add(time.Hour)}
+	if err := db.UpsertAccount(ctx, acct); err != nil { t.Fatalf("upsert: %v", err) }
+
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{Store:db, Codex:codex.NewClient(upstream.URL, codex.NewTokenManager(db,nil)), RequireKey:true})
+
+	body := `{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":16000}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", key.Secret)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var upstreamBody map[string]any
+	if err := json.Unmarshal(captured, &upstreamBody); err != nil {
+		t.Fatalf("parse upstream body: %v", err)
+	}
+	reasoning, ok := upstreamBody["reasoning"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected reasoning field in upstream body, got %v", upstreamBody)
+	}
+	if reasoning["effort"] != "high" {
+		t.Fatalf("expected reasoning.effort=high, got %v", reasoning["effort"])
+	}
+	if reasoning["summary"] != "auto" {
+		t.Fatalf("expected reasoning.summary=auto, got %v", reasoning["summary"])
+	}
+}
+
+func TestAnthropicMessagesEmitsThinkingThenText(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil { t.Fatalf("open store: %v", err) }
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil { t.Fatalf("create key: %v", err) }
+	acct := store.Account{ID:"acct_1", Provider:"openai-codex", Name:"one", Priority:1, Enabled:true, AccessToken:"token-1", RefreshToken:"r1", ExpiresAt:time.Now().Add(time.Hour)}
+	if err := db.UpsertAccount(ctx, acct); err != nil { t.Fatalf("upsert: %v", err) }
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking step 1\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\" step 2\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{Store:db, Codex:codex.NewClient(upstream.URL, codex.NewTokenManager(db,nil)), RequireKey:true})
+
+	body := `{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", key.Secret)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	respBody := rec.Body.String()
+	// Payload content — checked with Contains because map key order in JSON is non-deterministic.
+	for _, want := range []string{"thinking_delta", "thinking step 1", "text_delta", "answer", `"output_tokens":5`, `"input_tokens":10`} {
+		if !strings.Contains(respBody, want) {
+			t.Fatalf("expected %q in response:\n%s", want, respBody)
+		}
+	}
+	// Event sequence — use "event: X" header lines which are deterministically ordered.
+	checkEventOrder := func(markers []string) {
+		lastIdx := -1
+		for _, m := range markers {
+			idx := strings.Index(respBody[lastIdx+1:], m)
+			if idx < 0 {
+				t.Fatalf("missing event %q in response:\n%s", m, respBody)
+			}
+			lastIdx = lastIdx + 1 + idx
+		}
+	}
+	checkEventOrder([]string{
+		"event: message_start",
+		"event: content_block_start",  // thinking
+		"event: content_block_stop",   // thinking
+		"event: content_block_start",  // text
+		"event: content_block_delta",  // text
+		"event: content_block_stop",   // text
+		"event: message_delta",
+		"event: message_stop",
+	})
+	// Thinking block must appear before text block.
+	if strings.Index(respBody, "thinking_delta") > strings.Index(respBody, "text_delta") {
+		t.Fatalf("expected thinking before text:\n%s", respBody)
+	}
+}
+
+func TestAnthropicMessagesExtractsUsage(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil { t.Fatalf("open store: %v", err) }
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil { t.Fatalf("create key: %v", err) }
+	acct := store.Account{ID:"acct_1", Provider:"openai-codex", Name:"one", Priority:1, Enabled:true, AccessToken:"token-1", RefreshToken:"r1", ExpiresAt:time.Now().Add(time.Hour)}
+	if err := db.UpsertAccount(ctx, acct); err != nil { t.Fatalf("upsert: %v", err) }
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":7}}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{Store:db, Codex:codex.NewClient(upstream.URL, codex.NewTokenManager(db,nil)), RequireKey:true})
+
+	body := `{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", key.Secret)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	respBody := rec.Body.String()
+	if !strings.Contains(respBody, `"output_tokens":7`) {
+		t.Fatalf("expected output_tokens:7 in response:\n%s", respBody)
+	}
+	if !strings.Contains(respBody, `"input_tokens":42`) {
+		t.Fatalf("expected input_tokens:42 in response:\n%s", respBody)
+	}
+	if strings.Contains(respBody, `"thinking"`) {
+		t.Fatalf("expected no thinking block in response:\n%s", respBody)
+	}
+	if !strings.Contains(respBody, "message_delta") {
+		t.Fatalf("expected message_delta in response:\n%s", respBody)
+	}
+	if !strings.Contains(respBody, "message_stop") {
+		t.Fatalf("expected message_stop in response:\n%s", respBody)
+	}
+}
