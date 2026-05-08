@@ -414,6 +414,151 @@ func TestAnthropicMessagesTranslatesTextBlocks(t *testing.T) {
 	}
 }
 
+func TestAnthropicMessagesTranslatesImageBlock(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	acct := store.Account{ID: "acct_1", Provider: "openai-codex", Name: "one", Priority: 1, Enabled: true, AccessToken: "token-1", RefreshToken: "r1", ExpiresAt: time.Now().Add(time.Hour)}
+	if err := db.UpsertAccount(ctx, acct); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{
+		Store:      db,
+		Codex:      codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)),
+		RequireKey: true,
+	})
+
+	body := `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":[` +
+		`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},` +
+		`{"type":"text","text":"describe"}` +
+		`]}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", key.Secret)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var upstreamBody map[string]any
+	if err := json.Unmarshal(captured, &upstreamBody); err != nil {
+		t.Fatalf("failed to parse upstream body: %v", err)
+	}
+	input, ok := upstreamBody["input"].([]any)
+	if !ok || len(input) == 0 {
+		t.Fatalf("expected input array, got %v", upstreamBody["input"])
+	}
+	msg, ok := input[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected input[0] object, got %v", input[0])
+	}
+	content, ok := msg["content"].([]any)
+	if !ok || len(content) != 2 {
+		t.Fatalf("expected content len=2, got %v", msg["content"])
+	}
+	imgBlock, ok := content[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected content[0] object, got %v", content[0])
+	}
+	if imgBlock["type"] != "input_image" {
+		t.Fatalf("expected type=input_image, got %v", imgBlock["type"])
+	}
+	if imgBlock["image_url"] != "data:image/png;base64,AAAA" {
+		t.Fatalf("expected data url, got %v", imgBlock["image_url"])
+	}
+	textBlock, ok := content[1].(map[string]any)
+	if !ok {
+		t.Fatalf("expected content[1] object, got %v", content[1])
+	}
+	if textBlock["type"] != "input_text" || textBlock["text"] != "describe" {
+		t.Fatalf("expected input_text describe, got %v", textBlock)
+	}
+}
+
+func TestAnthropicMessagesTranslatesImageURL(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	acct := store.Account{ID: "acct_1", Provider: "openai-codex", Name: "one", Priority: 1, Enabled: true, AccessToken: "token-1", RefreshToken: "r1", ExpiresAt: time.Now().Add(time.Hour)}
+	if err := db.UpsertAccount(ctx, acct); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{
+		Store:      db,
+		Codex:      codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)),
+		RequireKey: true,
+	})
+
+	body := `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":[` +
+		`{"type":"image","source":{"type":"url","url":"https://example.com/x.png"}}` +
+		`]}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", key.Secret)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var upstreamBody map[string]any
+	if err := json.Unmarshal(captured, &upstreamBody); err != nil {
+		t.Fatalf("failed to parse upstream body: %v", err)
+	}
+	input, _ := upstreamBody["input"].([]any)
+	if len(input) == 0 {
+		t.Fatalf("expected input, got %v", upstreamBody["input"])
+	}
+	msg, _ := input[0].(map[string]any)
+	content, _ := msg["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("expected content len=1, got %v", content)
+	}
+	block, _ := content[0].(map[string]any)
+	if block["type"] != "input_image" || block["image_url"] != "https://example.com/x.png" {
+		t.Fatalf("expected image url block, got %v", block)
+	}
+}
+
 func TestAnthropicMessagesReturnsAnthropicMessageJSON(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir())

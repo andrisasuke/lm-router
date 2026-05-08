@@ -1068,6 +1068,32 @@ func anthropicMessagesToResponsesInput(msgs []anthropicMessage) []map[string]any
 					"type": contentType,
 					"text": stringVal(b["text"]),
 				})
+			case "image":
+				src, _ := b["source"].(map[string]any)
+				if src == nil {
+					continue
+				}
+				var imageURL string
+				switch stringVal(src["type"]) {
+				case "base64":
+					mediaType := stringVal(src["media_type"])
+					data := stringVal(src["data"])
+					if mediaType == "" || data == "" {
+						continue
+					}
+					imageURL = "data:" + mediaType + ";base64," + data
+				case "url":
+					imageURL = stringVal(src["url"])
+					if imageURL == "" {
+						continue
+					}
+				default:
+					continue
+				}
+				textParts = append(textParts, map[string]any{
+					"type":      "input_image",
+					"image_url": imageURL,
+				})
 			case "tool_use":
 				flushText()
 				var argsStr string
