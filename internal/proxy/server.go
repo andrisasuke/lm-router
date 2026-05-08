@@ -525,7 +525,11 @@ func (s *SSEScanner) Err() error {
 }
 
 func writeAnthropicSSE(w io.Writer, event string, payload map[string]any) {
-	b, _ := json.Marshal(payload)
+	b, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("writeAnthropicSSE: marshal %s: %v", event, err)
+		return
+	}
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
 }
 
@@ -558,6 +562,10 @@ func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher h
 				}
 			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("convertResponsesStreamToAnthropicSSE: scanner error: %v", err)
+		return
 	}
 	writeAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
 	writeAnthropicSSE(w, "message_delta", map[string]any{

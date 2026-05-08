@@ -516,11 +516,18 @@ func TestAnthropicMessagesStreamingEvents(t *testing.T) {
 		t.Fatalf("content-type=%s", ct)
 	}
 	respBody := rec.Body.String()
-	// Assert all required event types present in order
-	for _, event := range []string{"message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"} {
-		if !strings.Contains(respBody, event) {
+	// Assert all required event types present in correct order
+	events := []string{"message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"}
+	lastIdx := -1
+	for _, event := range events {
+		idx := strings.Index(respBody, event)
+		if idx < 0 {
 			t.Fatalf("missing event %q in response:\n%s", event, respBody)
 		}
+		if idx <= lastIdx {
+			t.Fatalf("event %q out of order in response:\n%s", event, respBody)
+		}
+		lastIdx = idx
 	}
 	// Assert delta contains "pong"
 	if !strings.Contains(respBody, "pong") {
