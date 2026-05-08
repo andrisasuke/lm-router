@@ -535,6 +535,93 @@ func TestAnthropicMessagesStreamingEvents(t *testing.T) {
 	}
 }
 
+func TestAnthropicCountTokens(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil { t.Fatalf("open store: %v", err) }
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil { t.Fatalf("create key: %v", err) }
+
+	srv := New(ServerConfig{Store:db, Codex:codex.NewClient("http://invalid", codex.NewTokenManager(db,nil)), RequireKey:true})
+
+	body := `{"model":"gpt-5.5","messages":[{"role":"user","content":"Hello world this is a test"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(body))
+	req.Header.Set("x-api-key", key.Secret)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	tokens, ok := resp["input_tokens"].(float64)
+	if !ok || tokens < 1 {
+		t.Fatalf("expected input_tokens >= 1, got %v", resp)
+	}
+}
+
+func TestAnthropicMessagesUsesExistingAccountFallback(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil { t.Fatalf("open store: %v", err) }
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil { t.Fatalf("create key: %v", err) }
+
+	for _, acct := range []store.Account{
+		{ID:"acct_1", Provider:"openai-codex", Name:"one", Priority:1, Enabled:true, AccessToken:"token-1", RefreshToken:"r1", ExpiresAt:time.Now().Add(time.Hour)},
+		{ID:"acct_2", Provider:"openai-codex", Name:"two", Priority:2, Enabled:true, AccessToken:"token-2", RefreshToken:"r2", ExpiresAt:time.Now().Add(time.Hour)},
+	} {
+		if err := db.UpsertAccount(ctx, acct); err != nil { t.Fatalf("upsert: %v", err) }
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer token-1" {
+			http.Error(w, `{"error":{"type":"usage_limit_reached","resets_in_seconds":60}}`, http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{Store:db, Codex:codex.NewClient(upstream.URL, codex.NewTokenManager(db,nil)), RequireKey:true})
+
+	body := `{"model":"gpt-5.5","max_tokens":16,"messages":[{"role":"user","content":"Say pong"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", key.Secret)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	content, _ := resp["content"].([]any)
+	if len(content) == 0 {
+		t.Fatalf("no content in response: %v", resp)
+	}
+	block, _ := content[0].(map[string]any)
+	text, _ := block["text"].(string)
+	if text != "pong" {
+		t.Fatalf("expected content[0].text=pong, got %q", text)
+	}
+}
+
 func TestChatCompletionsStreamReturnsDone(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir())

@@ -780,8 +780,21 @@ func (s *Server) countAnthropicTokens(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Method not allowed")
 		return
 	}
-	// TODO: full implementation in later tasks
-	writeAnthropicError(w, http.StatusNotImplemented, "api_error", "not yet implemented")
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
+		return
+	}
+	tokens := estimateAnthropicTokens(body)
+	writeJSON(w, http.StatusOK, map[string]int{"input_tokens": tokens})
+}
+
+func estimateAnthropicTokens(body []byte) int {
+	fields := strings.Fields(string(body))
+	if len(fields) < 1 {
+		return 1
+	}
+	return len(fields)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
