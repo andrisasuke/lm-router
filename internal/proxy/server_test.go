@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -227,8 +228,8 @@ func TestAnthropicMessagesAcceptsXAPIKey(t *testing.T) {
 	if rec.Code == http.StatusNotFound {
 		t.Fatalf("route not registered: status=%d", rec.Code)
 	}
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("expected 501 stub, got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -276,8 +277,206 @@ func TestAnthropicMessagesAliasV1V1(t *testing.T) {
 	if rec.Code == http.StatusNotFound {
 		t.Fatalf("alias /v1/v1/messages returned 404, route must be registered")
 	}
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("expected 501 stub, got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAnthropicMessagesTranslatesSystemAndStringContent(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	acct := store.Account{ID: "acct_1", Provider: "openai-codex", Name: "one", Priority: 1, Enabled: true, AccessToken: "token-1", RefreshToken: "r1", ExpiresAt: time.Now().Add(time.Hour)}
+	if err := db.UpsertAccount(ctx, acct); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{
+		Store:      db,
+		Codex:      codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)),
+		RequireKey: true,
+	})
+
+	body := `{"model":"claude-3-5-sonnet","system":"You are helpful","messages":[{"role":"user","content":"ping"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", key.Secret)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var upstreamBody map[string]any
+	if err := json.Unmarshal(captured, &upstreamBody); err != nil {
+		t.Fatalf("failed to parse upstream body: %v", err)
+	}
+	if upstreamBody["instructions"] != "You are helpful" {
+		t.Fatalf("expected instructions='You are helpful', got %v", upstreamBody["instructions"])
+	}
+	input, ok := upstreamBody["input"].([]any)
+	if !ok || len(input) == 0 {
+		t.Fatalf("expected input array, got %v", upstreamBody["input"])
+	}
+	firstMsg, ok := input[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected input[0] to be object, got %v", input[0])
+	}
+	if firstMsg["role"] != "user" {
+		t.Fatalf("expected role=user, got %v", firstMsg["role"])
+	}
+}
+
+func TestAnthropicMessagesTranslatesTextBlocks(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	acct := store.Account{ID: "acct_1", Provider: "openai-codex", Name: "one", Priority: 1, Enabled: true, AccessToken: "token-1", RefreshToken: "r1", ExpiresAt: time.Now().Add(time.Hour)}
+	if err := db.UpsertAccount(ctx, acct); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{
+		Store:      db,
+		Codex:      codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)),
+		RequireKey: true,
+	})
+
+	body := `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":[{"type":"text","text":"hello world"}]}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", key.Secret)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var upstreamBody map[string]any
+	if err := json.Unmarshal(captured, &upstreamBody); err != nil {
+		t.Fatalf("failed to parse upstream body: %v", err)
+	}
+	input, ok := upstreamBody["input"].([]any)
+	if !ok || len(input) == 0 {
+		t.Fatalf("expected input array, got %v", upstreamBody["input"])
+	}
+	firstMsg, ok := input[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected input[0] to be object, got %v", input[0])
+	}
+	content, ok := firstMsg["content"].([]any)
+	if !ok || len(content) == 0 {
+		t.Fatalf("expected content array, got %v", firstMsg["content"])
+	}
+	block, ok := content[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected content[0] to be object, got %v", content[0])
+	}
+	if block["text"] != "hello world" {
+		t.Fatalf("expected text='hello world', got %v", block["text"])
+	}
+}
+
+func TestAnthropicMessagesReturnsAnthropicMessageJSON(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	acct := store.Account{ID: "acct_1", Provider: "openai-codex", Name: "one", Priority: 1, Enabled: true, AccessToken: "token-1", RefreshToken: "r1", ExpiresAt: time.Now().Add(time.Hour)}
+	if err := db.UpsertAccount(ctx, acct); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{
+		Store:      db,
+		Codex:      codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)),
+		RequireKey: true,
+	})
+
+	body := `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"Say pong"}],"stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", key.Secret)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json error: %v", err)
+	}
+	if resp["type"] != "message" {
+		t.Fatalf("expected type=message, got %v", resp["type"])
+	}
+	if resp["role"] != "assistant" {
+		t.Fatalf("expected role=assistant, got %v", resp["role"])
+	}
+	content, ok := resp["content"].([]any)
+	if !ok || len(content) == 0 {
+		t.Fatalf("expected content array, got %v", resp["content"])
+	}
+	block, ok := content[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected content[0] to be object, got %v", content[0])
+	}
+	if block["type"] != "text" {
+		t.Fatalf("expected content[0].type=text, got %v", block["type"])
+	}
+	if block["text"] != "pong" {
+		t.Fatalf("expected content[0].text=pong, got %v", block["text"])
 	}
 }
 
