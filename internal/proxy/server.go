@@ -590,6 +590,7 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, r *http.Request,
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 
 	writeAnthropicSSE(w, "message_start", map[string]any{
@@ -656,11 +657,14 @@ func anthropicMessagesToResponsesBody(body []byte) ([]byte, string, bool, error)
 			contentType = "output_text"
 		}
 		input = append(input, map[string]any{
+			"type":    "message",
 			"role":    role,
 			"content": anthropicContentToResponsesContent(msg.Content, contentType),
 		})
 	}
 
+	// Always request streaming from Codex — it is the only supported mode.
+	// The Anthropic stream flag controls whether we forward SSE or wrap as JSON.
 	out := map[string]any{
 		"model":  req.Model,
 		"input":  input,
