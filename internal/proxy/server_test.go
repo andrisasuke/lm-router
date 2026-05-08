@@ -562,8 +562,8 @@ func TestAnthropicCountTokens(t *testing.T) {
 		t.Fatalf("json: %v", err)
 	}
 	tokens, ok := resp["input_tokens"].(float64)
-	if !ok || tokens < 1 {
-		t.Fatalf("expected input_tokens >= 1, got %v", resp)
+	if !ok || tokens < 5 {
+		t.Fatalf("expected input_tokens >= 5, got %v", resp)
 	}
 }
 

@@ -790,11 +790,12 @@ func (s *Server) countAnthropicTokens(w http.ResponseWriter, r *http.Request) {
 }
 
 func estimateAnthropicTokens(body []byte) int {
-	fields := strings.Fields(string(body))
-	if len(fields) < 1 {
+	// Approximates token count at ~4 chars per token — not tokenizer-exact.
+	n := len(body) / 4
+	if n < 1 {
 		return 1
 	}
-	return len(fields)
+	return n
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
