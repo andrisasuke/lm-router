@@ -588,6 +588,10 @@ func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher h
 		flusher:    flusher,
 		stopReason: "end_turn",
 	}
+	eventCounts := map[string]int{}
+	defer func() {
+		log.Printf("[anthropic-api] upstream-events %v", eventCounts)
+	}()
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -602,6 +606,9 @@ func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher h
 		var event map[string]any
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
 			continue
+		}
+		if t, ok := event["type"].(string); ok {
+			eventCounts[t]++
 		}
 		switch event["type"] {
 		case "response.reasoning_summary_text.delta",
