@@ -1,0 +1,71 @@
+name: build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Override build version
+        required: false
+        type: string
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            artifact_name: lm-router-linux-amd64
+          - goos: linux
+            goarch: arm64
+            artifact_name: lm-router-linux-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Resolve build metadata
+        id: meta
+        shell: bash
+        run: |
+          DEFAULT_VERSION=$(sed -n 's/.*Version   = "\(.*\)"/\1/p' internal/version/version.go | head -n1)
+          VERSION_INPUT="${{ github.event.inputs.version }}"
+          if [ -n "$VERSION_INPUT" ]; then
+            VERSION="$VERSION_INPUT"
+          else
+            VERSION="$DEFAULT_VERSION"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X github.com/andrisasuke/lm-router/internal/version.Version=${{ steps.meta.outputs.version }} -X github.com/andrisasuke/lm-router/internal/version.Commit=${GITHUB_SHA} -X github.com/andrisasuke/lm-router/internal/version.BuildDate=${{ steps.meta.outputs.build_date }}" \
+            -o "dist/${{ matrix.artifact_name }}" \
+            ./cmd/lm-router
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}

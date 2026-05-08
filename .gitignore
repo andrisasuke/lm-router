@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# Go build outputs
+/lm-router
+*.exe
+*.test
+*.out
+coverage.out
+
+# Editor / IDE
+.idea/
+.vscode/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Local SQLite and runtime artifacts
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.pid
+
+# Temporary files
+tmp/
+dist/
+build/
