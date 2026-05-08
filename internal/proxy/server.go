@@ -524,9 +524,7 @@ func (s *SSEScanner) Err() error {
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, typ string, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	writeJSON(w, status, map[string]any{
 		"type": "error",
 		"error": map[string]any{
 			"type":    typ,
@@ -536,12 +534,12 @@ func writeAnthropicError(w http.ResponseWriter, status int, typ string, message 
 }
 
 func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Method not allowed")
-		return
-	}
 	if !s.authOK(r) {
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid API key")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Method not allowed")
 		return
 	}
 	// TODO: full implementation in later tasks
@@ -549,12 +547,12 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) countAnthropicTokens(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Method not allowed")
-		return
-	}
 	if !s.authOK(r) {
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid API key")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Method not allowed")
 		return
 	}
 	// TODO: full implementation in later tasks

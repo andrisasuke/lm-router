@@ -222,10 +222,13 @@ func TestAnthropicMessagesAcceptsXAPIKey(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 
 	if rec.Code == http.StatusUnauthorized {
-		t.Fatalf("expected not 401 with x-api-key, got 401 body=%s", rec.Body.String())
+		t.Fatalf("x-api-key auth rejected: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	if rec.Code == http.StatusNotFound {
-		t.Fatalf("route not found (404), route must be registered")
+		t.Fatalf("route not registered: status=%d", rec.Code)
+	}
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501 stub, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -267,8 +270,14 @@ func TestAnthropicMessagesAliasV1V1(t *testing.T) {
 
 	srv.ServeHTTP(rec, req)
 
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatalf("x-api-key auth rejected: status=%d body=%s", rec.Code, rec.Body.String())
+	}
 	if rec.Code == http.StatusNotFound {
 		t.Fatalf("alias /v1/v1/messages returned 404, route must be registered")
+	}
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501 stub, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
