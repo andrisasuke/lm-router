@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +18,12 @@ import (
 	"github.com/andrisasuke/lm-router/internal/codex"
 	"github.com/andrisasuke/lm-router/internal/store"
 )
+
+func newThinkingSignature() string {
+	b := make([]byte, 24)
+	_, _ = rand.Read(b)
+	return base64.StdEncoding.EncodeToString(b)
+}
 
 type ServerConfig struct {
 	Store       *store.DB
@@ -535,21 +543,44 @@ func writeAnthropicSSE(w io.Writer, event string, payload map[string]any) {
 }
 
 type anthropicStreamState struct {
-	flusher        http.Flusher
-	nextBlockIndex int
-	thinkingOpen   bool
-	thinkingIndex  int
-	textOpen       bool
-	textIndex      int
-	toolOpen       bool
-	toolIndex      int
-	toolItemID     string
-	sawToolCall    bool
-	inputTokens    int
-	outputTokens   int
-	cacheRead      int
-	cacheCreate    int
-	stopReason     string
+	flusher           http.Flusher
+	nextBlockIndex    int
+	thinkingOpen      bool
+	thinkingIndex     int
+	thinkingSignature string
+	textOpen          bool
+	textIndex         int
+	toolOpen          bool
+	toolIndex         int
+	toolItemID        string
+	sawToolCall       bool
+	inputTokens       int
+	outputTokens      int
+	cacheRead         int
+	cacheCreate       int
+	stopReason        string
+}
+
+func closeThinkingBlock(w io.Writer, state *anthropicStreamState, flusher http.Flusher) {
+	if !state.thinkingOpen {
+		return
+	}
+	if state.thinkingSignature != "" {
+		writeAnthropicSSE(w, "content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": state.thinkingIndex,
+			"delta": map[string]string{"type": "signature_delta", "signature": state.thinkingSignature},
+		})
+	}
+	writeAnthropicSSE(w, "content_block_stop", map[string]any{
+		"type":  "content_block_stop",
+		"index": state.thinkingIndex,
+	})
+	state.thinkingOpen = false
+	state.thinkingSignature = ""
+	if flusher != nil {
+		flusher.Flush()
+	}
 }
 
 func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher http.Flusher) {
@@ -594,6 +625,7 @@ func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher h
 					"content_block": map[string]string{"type": "thinking", "thinking": ""},
 				})
 				state.thinkingOpen = true
+				state.thinkingSignature = newThinkingSignature()
 			}
 			writeAnthropicSSE(w, "content_block_delta", map[string]any{
 				"type":  "content_block_delta",
@@ -608,13 +640,7 @@ func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher h
 			if delta == "" {
 				continue
 			}
-			if state.thinkingOpen {
-				writeAnthropicSSE(w, "content_block_stop", map[string]any{
-					"type":  "content_block_stop",
-					"index": state.thinkingIndex,
-				})
-				state.thinkingOpen = false
-			}
+			closeThinkingBlock(w, state, flusher)
 			if !state.textOpen {
 				state.textIndex = state.nextBlockIndex
 				state.nextBlockIndex++
@@ -638,10 +664,7 @@ func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher h
 			if item == nil || item["type"] != "function_call" {
 				continue
 			}
-			if state.thinkingOpen {
-				writeAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": state.thinkingIndex})
-				state.thinkingOpen = false
-			}
+			closeThinkingBlock(w, state, flusher)
 			if state.textOpen {
 				writeAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": state.textIndex})
 				state.textOpen = false
@@ -739,12 +762,7 @@ func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher h
 			"index": state.toolIndex,
 		})
 	}
-	if state.thinkingOpen {
-		writeAnthropicSSE(w, "content_block_stop", map[string]any{
-			"type":  "content_block_stop",
-			"index": state.thinkingIndex,
-		})
-	}
+	closeThinkingBlock(w, state, flusher)
 	if state.textOpen {
 		writeAnthropicSSE(w, "content_block_stop", map[string]any{
 			"type":  "content_block_stop",
@@ -1027,6 +1045,10 @@ func anthropicMessagesToResponsesInput(msgs []anthropicMessage) []map[string]any
 
 		for _, b := range blocks {
 			switch b["type"] {
+			case "thinking", "redacted_thinking":
+				// Codex Responses API does not accept thinking blocks.
+				// Drop them so the rest of the message structure is preserved.
+				continue
 			case "text":
 				contentType := "input_text"
 				if m.Role == "assistant" {
@@ -1097,6 +1119,7 @@ func convertResponsesSSEToAnthropicBlocks(sse []byte) anthropicNonStreamResult {
 		StopReason: "end_turn",
 	}
 
+	var thinkingBuf strings.Builder
 	var textBuf strings.Builder
 	type pendingTool struct {
 		callID string
@@ -1130,6 +1153,9 @@ func convertResponsesSSEToAnthropicBlocks(sse []byte) anthropicNonStreamResult {
 			continue
 		}
 		switch event["type"] {
+		case "response.reasoning_summary_text.delta":
+			delta, _ := event["delta"].(string)
+			thinkingBuf.WriteString(delta)
 		case "response.output_text.delta":
 			delta, _ := event["delta"].(string)
 			textBuf.WriteString(delta)
@@ -1173,6 +1199,13 @@ func convertResponsesSSEToAnthropicBlocks(sse []byte) anthropicNonStreamResult {
 		}
 	}
 
+	if thinkingBuf.Len() > 0 {
+		result.Content = append(result.Content, map[string]any{
+			"type":      "thinking",
+			"thinking":  thinkingBuf.String(),
+			"signature": newThinkingSignature(),
+		})
+	}
 	if textBuf.Len() > 0 {
 		result.Content = append(result.Content, map[string]any{
 			"type": "text",
