@@ -559,6 +559,172 @@ func TestAnthropicMessagesTranslatesImageURL(t *testing.T) {
 	}
 }
 
+func TestAnthropicMessagesHoistsImageFromToolResult(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	acct := store.Account{ID: "acct_1", Provider: "openai-codex", Name: "one", Priority: 1, Enabled: true, AccessToken: "token-1", RefreshToken: "r1", ExpiresAt: time.Now().Add(time.Hour)}
+	if err := db.UpsertAccount(ctx, acct); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{
+		Store:      db,
+		Codex:      codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)),
+		RequireKey: true,
+	})
+
+	body := `{"model":"claude-3-5-sonnet","messages":[` +
+		`{"role":"user","content":[{"type":"text","text":"read run.png"}]},` +
+		`{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/run.png"}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[` +
+		`{"type":"text","text":"image dimensions: 100x100"},` +
+		`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}` +
+		`]}]}` +
+		`]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", key.Secret)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var upstreamBody map[string]any
+	if err := json.Unmarshal(captured, &upstreamBody); err != nil {
+		t.Fatalf("parse upstream: %v", err)
+	}
+	input, _ := upstreamBody["input"].([]any)
+	if len(input) < 4 {
+		t.Fatalf("expected >=4 input items (user, fn_call, fn_call_output, hoisted_user_image), got %d: %v", len(input), input)
+	}
+
+	// Item 2 = function_call_output with text-only output
+	fnOut, _ := input[2].(map[string]any)
+	if fnOut["type"] != "function_call_output" {
+		t.Fatalf("expected input[2] function_call_output, got %v", fnOut["type"])
+	}
+	output, _ := fnOut["output"].(string)
+	if !strings.Contains(output, "image dimensions") {
+		t.Fatalf("expected text content preserved in output, got %q", output)
+	}
+	if strings.Contains(output, "AAAA") || strings.Contains(output, "base64") {
+		t.Fatalf("expected image data stripped from output, got %q", output)
+	}
+
+	// Item 3 = synthetic user message containing input_image
+	hoisted, _ := input[3].(map[string]any)
+	if hoisted["type"] != "message" || hoisted["role"] != "user" {
+		t.Fatalf("expected input[3] user message, got %v", hoisted)
+	}
+	content, _ := hoisted["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("expected hoisted content len=1, got %v", content)
+	}
+	imgBlock, _ := content[0].(map[string]any)
+	if imgBlock["type"] != "input_image" {
+		t.Fatalf("expected type=input_image, got %v", imgBlock["type"])
+	}
+	if imgBlock["image_url"] != "data:image/png;base64,AAAA" {
+		t.Fatalf("expected data url, got %v", imgBlock["image_url"])
+	}
+}
+
+func TestAnthropicMessagesToolResultWithoutImagePassesThrough(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	acct := store.Account{ID: "acct_1", Provider: "openai-codex", Name: "one", Priority: 1, Enabled: true, AccessToken: "token-1", RefreshToken: "r1", ExpiresAt: time.Now().Add(time.Hour)}
+	if err := db.UpsertAccount(ctx, acct); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{
+		Store:      db,
+		Codex:      codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)),
+		RequireKey: true,
+	})
+
+	body := `{"model":"claude-3-5-sonnet","messages":[` +
+		`{"role":"user","content":[{"type":"text","text":"read x"}]},` +
+		`{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/x.txt"}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"hello world"}]}` +
+		`]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", key.Secret)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	var upstreamBody map[string]any
+	_ = json.Unmarshal(captured, &upstreamBody)
+	input, _ := upstreamBody["input"].([]any)
+	// No hoisted message should be added when tool_result has no image
+	for i, item := range input {
+		m, _ := item.(map[string]any)
+		if m["type"] == "message" && m["role"] == "user" {
+			content, _ := m["content"].([]any)
+			for _, c := range content {
+				cm, _ := c.(map[string]any)
+				if cm["type"] == "input_image" {
+					t.Fatalf("unexpected hoisted input_image at input[%d]: %v", i, m)
+				}
+			}
+		}
+	}
+	// function_call_output should carry "hello world"
+	for _, item := range input {
+		m, _ := item.(map[string]any)
+		if m["type"] == "function_call_output" {
+			if m["output"] != "hello world" {
+				t.Fatalf("expected output='hello world', got %v", m["output"])
+			}
+			return
+		}
+	}
+	t.Fatalf("function_call_output not found in input: %v", input)
+}
+
 func TestAnthropicMessagesReturnsAnthropicMessageJSON(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir())

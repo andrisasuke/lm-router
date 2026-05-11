@@ -985,6 +985,68 @@ func stringVal(v any) string {
 	return s
 }
 
+// extractImagesFromToolResult separates image blocks from a tool_result.content array.
+// Codex Responses API function_call_output.output is a string and cannot carry image
+// data, so image blocks must be hoisted out as a follow-up user message that contains
+// input_image blocks. Returns (input_image blocks, remaining content suitable for
+// toolResultOutput). For non-array input (string or nil) returns (nil, raw) unchanged.
+func extractImagesFromToolResult(raw any) ([]map[string]any, any) {
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil, raw
+	}
+	var images []map[string]any
+	var remaining []any
+	for _, item := range arr {
+		m, ok := item.(map[string]any)
+		if !ok {
+			remaining = append(remaining, item)
+			continue
+		}
+		if stringVal(m["type"]) != "image" {
+			remaining = append(remaining, item)
+			continue
+		}
+		src, _ := m["source"].(map[string]any)
+		if src == nil {
+			continue
+		}
+		var imageURL string
+		switch stringVal(src["type"]) {
+		case "base64":
+			mediaType := stringVal(src["media_type"])
+			data := stringVal(src["data"])
+			if mediaType == "" || data == "" {
+				continue
+			}
+			imageURL = "data:" + mediaType + ";base64," + data
+		case "url":
+			imageURL = stringVal(src["url"])
+			if imageURL == "" {
+				continue
+			}
+		default:
+			continue
+		}
+		images = append(images, map[string]any{
+			"type":      "input_image",
+			"image_url": imageURL,
+		})
+	}
+	if len(images) == 0 {
+		return nil, raw
+	}
+	hint := fmt.Sprintf("[Tool returned %d image(s). The image content follows as input_image block(s) in the next user message — treat those images as this tool's output and do not call the tool again.]", len(images))
+	if len(remaining) == 0 {
+		return images, hint
+	}
+	// Prepend hint as text block so model sees explanation before any non-image content.
+	merged := make([]any, 0, len(remaining)+1)
+	merged = append(merged, map[string]any{"type": "text", "text": hint})
+	merged = append(merged, remaining...)
+	return images, merged
+}
+
 func toolResultOutput(content any) string {
 	switch v := content.(type) {
 	case string:
@@ -1071,29 +1133,35 @@ func anthropicMessagesToResponsesInput(msgs []anthropicMessage) []map[string]any
 			case "image":
 				src, _ := b["source"].(map[string]any)
 				if src == nil {
+					log.Printf("[anthropic-api] image block dropped role=%s reason=missing_source", m.Role)
 					continue
 				}
+				srcType := stringVal(src["type"])
 				var imageURL string
-				switch stringVal(src["type"]) {
+				switch srcType {
 				case "base64":
 					mediaType := stringVal(src["media_type"])
 					data := stringVal(src["data"])
 					if mediaType == "" || data == "" {
+						log.Printf("[anthropic-api] image block dropped role=%s source_type=base64 reason=empty_media_or_data media=%q data_len=%d", m.Role, mediaType, len(data))
 						continue
 					}
 					imageURL = "data:" + mediaType + ";base64," + data
 				case "url":
 					imageURL = stringVal(src["url"])
 					if imageURL == "" {
+						log.Printf("[anthropic-api] image block dropped role=%s source_type=url reason=empty_url", m.Role)
 						continue
 					}
 				default:
+					log.Printf("[anthropic-api] image block dropped role=%s source_type=%q reason=unsupported", m.Role, srcType)
 					continue
 				}
 				textParts = append(textParts, map[string]any{
 					"type":      "input_image",
 					"image_url": imageURL,
 				})
+				log.Printf("[anthropic-api] translated image block role=%s url_prefix=%.40q url_len=%d", m.Role, imageURL, len(imageURL))
 			case "tool_use":
 				flushText()
 				var argsStr string
@@ -1113,11 +1181,20 @@ func anthropicMessagesToResponsesInput(msgs []anthropicMessage) []map[string]any
 				})
 			case "tool_result":
 				flushText()
+				images, textContent := extractImagesFromToolResult(b["content"])
 				items = append(items, map[string]any{
 					"type":    "function_call_output",
 					"call_id": stringVal(b["tool_use_id"]),
-					"output":  toolResultOutput(b["content"]),
+					"output":  toolResultOutput(textContent),
 				})
+				if len(images) > 0 {
+					items = append(items, map[string]any{
+						"type":    "message",
+						"role":    "user",
+						"content": images,
+					})
+					log.Printf("[anthropic-api] hoisted %d image(s) from tool_result tool_use_id=%s", len(images), stringVal(b["tool_use_id"]))
+				}
 			}
 		}
 		flushText()
@@ -1376,8 +1453,60 @@ func summarizeInboundBody(body []byte) string {
 		}
 		thinking = fmt.Sprintf("type=%s,budget=%d", typ, budget)
 	}
-	return fmt.Sprintf("size=%d model=%q stream=%t messages=%d tools=%d thinking=%s",
-		len(body), model, stream, len(msgs), len(tools), thinking)
+	imageBlocks := 0
+	var structure []string
+	for i, m := range msgs {
+		mm, _ := m.(map[string]any)
+		if mm == nil {
+			continue
+		}
+		role, _ := mm["role"].(string)
+		content, _ := mm["content"].([]any)
+		types := make([]string, 0, len(content))
+		for _, c := range content {
+			cm, _ := c.(map[string]any)
+			if cm == nil {
+				types = append(types, "str")
+				continue
+			}
+			t := stringVal(cm["type"])
+			if t == "image" {
+				imageBlocks++
+				src, _ := cm["source"].(map[string]any)
+				srcType := "?"
+				if src != nil {
+					srcType = stringVal(src["type"])
+				}
+				t = fmt.Sprintf("image(%s)", srcType)
+			} else if t == "tool_result" {
+				inner, _ := cm["content"].([]any)
+				innerTypes := make([]string, 0, len(inner))
+				for _, ic := range inner {
+					icm, _ := ic.(map[string]any)
+					if icm == nil {
+						innerTypes = append(innerTypes, "str")
+						continue
+					}
+					it := stringVal(icm["type"])
+					if it == "image" {
+						imageBlocks++
+						isrc, _ := icm["source"].(map[string]any)
+						isrcType := "?"
+						if isrc != nil {
+							isrcType = stringVal(isrc["type"])
+						}
+						it = fmt.Sprintf("image(%s)", isrcType)
+					}
+					innerTypes = append(innerTypes, it)
+				}
+				t = fmt.Sprintf("tool_result[%s]", strings.Join(innerTypes, ","))
+			}
+			types = append(types, t)
+		}
+		structure = append(structure, fmt.Sprintf("%d:%s=[%s]", i, role, strings.Join(types, ",")))
+	}
+	return fmt.Sprintf("size=%d model=%q stream=%t messages=%d tools=%d images=%d thinking=%s structure=%s",
+		len(body), model, stream, len(msgs), len(tools), imageBlocks, thinking, strings.Join(structure, " "))
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
