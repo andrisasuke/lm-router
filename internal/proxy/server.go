@@ -911,13 +911,14 @@ func anthropicMessagesToResponsesBody(body []byte) ([]byte, string, bool, error)
 	if len(req.Tools) > 0 {
 		tools := make([]map[string]any, 0, len(req.Tools))
 		for _, t := range req.Tools {
+			description := augmentToolDescription(t.Name, t.Description)
 			tool := map[string]any{
 				"type":        "function",
 				"name":        t.Name,
-				"description": t.Description,
+				"description": description,
 			}
 			if t.InputSchema != nil {
-				tool["parameters"] = t.InputSchema
+				tool["parameters"] = sanitizeToolSchema(t.Name, t.InputSchema)
 			} else {
 				tool["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
 			}
@@ -983,6 +984,79 @@ func translateToolChoice(tc any) any {
 func stringVal(v any) string {
 	s, _ := v.(string)
 	return s
+}
+
+// sanitizeToolSchema removes parameters that Codex models reliably misuse. The OpenAI
+// Responses API tends to populate every defined property with a default value (often
+// an empty string) even when the property is optional and conditional, which causes
+// strict-validation tools to reject the call. Returning a deep-copy keeps the original
+// schema untouched (it may be reused for other purposes).
+func sanitizeToolSchema(name string, schema map[string]any) map[string]any {
+	stripProps, ok := map[string][]string{
+		// Read.pages is only valid for .pdf files. Codex passes pages="" for non-PDF
+		// reads, which makes Read tool reject the call and the model retries 5-10x.
+		"Read": {"pages"},
+	}[name]
+	if !ok || len(stripProps) == 0 {
+		return schema
+	}
+	out := make(map[string]any, len(schema))
+	for k, v := range schema {
+		if k == "properties" {
+			if props, ok := v.(map[string]any); ok {
+				newProps := make(map[string]any, len(props))
+				for pk, pv := range props {
+					skip := false
+					for _, name := range stripProps {
+						if pk == name {
+							skip = true
+							break
+						}
+					}
+					if !skip {
+						newProps[pk] = pv
+					}
+				}
+				out[k] = newProps
+				continue
+			}
+		}
+		if k == "required" {
+			if req, ok := v.([]any); ok {
+				newReq := make([]any, 0, len(req))
+				for _, item := range req {
+					s, _ := item.(string)
+					skip := false
+					for _, name := range stripProps {
+						if s == name {
+							skip = true
+							break
+						}
+					}
+					if !skip {
+						newReq = append(newReq, item)
+					}
+				}
+				out[k] = newReq
+				continue
+			}
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// augmentToolDescription appends Codex-specific guardrails to known tool descriptions.
+// Codex models often pass optional parameters even when the description marks them as
+// conditional (e.g. `pages` on Read for non-PDF files), which causes the tool to reject
+// the call and triggers wasteful retry loops. Inject an explicit prohibition into the
+// description so the model has a stronger signal before emitting a tool_use.
+func augmentToolDescription(name, description string) string {
+	switch name {
+	case "Read":
+		return description + "\n\nCODEX_GUARDRAIL: ONLY pass the `pages` parameter when `file_path` ends with `.pdf`. NEVER include `pages` for any non-PDF file (.csv, .txt, .py, .log, .json, .md, .go, etc). Passing `pages` for non-PDF files causes the tool to reject the call. If the file is not a PDF, omit `pages` entirely from the arguments."
+	}
+	return description
 }
 
 // extractImagesFromToolResult separates image blocks from a tool_result.content array.
@@ -1479,27 +1553,36 @@ func summarizeInboundBody(body []byte) string {
 				}
 				t = fmt.Sprintf("image(%s)", srcType)
 			} else if t == "tool_result" {
-				inner, _ := cm["content"].([]any)
-				innerTypes := make([]string, 0, len(inner))
-				for _, ic := range inner {
-					icm, _ := ic.(map[string]any)
-					if icm == nil {
-						innerTypes = append(innerTypes, "str")
-						continue
-					}
-					it := stringVal(icm["type"])
-					if it == "image" {
-						imageBlocks++
-						isrc, _ := icm["source"].(map[string]any)
-						isrcType := "?"
-						if isrc != nil {
-							isrcType = stringVal(isrc["type"])
+				switch inner := cm["content"].(type) {
+				case string:
+					t = fmt.Sprintf("tool_result(str:%d)", len(inner))
+				case []any:
+					innerTypes := make([]string, 0, len(inner))
+					for _, ic := range inner {
+						icm, _ := ic.(map[string]any)
+						if icm == nil {
+							innerTypes = append(innerTypes, "str")
+							continue
 						}
-						it = fmt.Sprintf("image(%s)", isrcType)
+						it := stringVal(icm["type"])
+						if it == "image" {
+							imageBlocks++
+							isrc, _ := icm["source"].(map[string]any)
+							isrcType := "?"
+							if isrc != nil {
+								isrcType = stringVal(isrc["type"])
+							}
+							it = fmt.Sprintf("image(%s)", isrcType)
+						} else if it == "text" {
+							txt, _ := icm["text"].(string)
+							it = fmt.Sprintf("text:%d", len(txt))
+						}
+						innerTypes = append(innerTypes, it)
 					}
-					innerTypes = append(innerTypes, it)
+					t = fmt.Sprintf("tool_result[%s]", strings.Join(innerTypes, ","))
+				default:
+					t = "tool_result(nil)"
 				}
-				t = fmt.Sprintf("tool_result[%s]", strings.Join(innerTypes, ","))
 			}
 			types = append(types, t)
 		}

@@ -1271,6 +1271,84 @@ func TestAnthropicMessagesForwardsTools(t *testing.T) {
 	}
 }
 
+func TestAnthropicMessagesAugmentsReadToolDescription(t *testing.T) {
+	db, _, apiKey := setupAnthropicTest(t)
+
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{Store: db, Codex: codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)), RequireKey: true})
+
+	body := `{
+		"model": "gpt-5.5",
+		"messages": [{"role": "user", "content": "read x"}],
+		"tools": [
+			{"name": "Read", "description": "Read a file.", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}, "pages": {"type": "string"}}, "required": ["file_path"]}},
+			{"name": "Bash", "description": "Run shell.", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}
+		],
+		"stream": true
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var upstreamBody map[string]any
+	if err := json.Unmarshal(captured, &upstreamBody); err != nil {
+		t.Fatalf("parse upstream: %v", err)
+	}
+	tools, _ := upstreamBody["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("expected 2 tools, got %d", len(tools))
+	}
+
+	// Read tool — description must contain the CODEX_GUARDRAIL for pages.
+	readTool, _ := tools[0].(map[string]any)
+	if readTool["name"] != "Read" {
+		t.Fatalf("expected first tool=Read, got %v", readTool["name"])
+	}
+	readDesc, _ := readTool["description"].(string)
+	if !strings.Contains(readDesc, "CODEX_GUARDRAIL") {
+		t.Fatalf("expected Read description to contain CODEX_GUARDRAIL, got %q", readDesc)
+	}
+	if !strings.Contains(readDesc, "pages") || !strings.Contains(readDesc, ".pdf") {
+		t.Fatalf("expected Read description to mention pages+.pdf, got %q", readDesc)
+	}
+	// Schema must have pages STRIPPED — Codex auto-injects empty values, breaking Read.
+	readParams, _ := readTool["parameters"].(map[string]any)
+	readProps, _ := readParams["properties"].(map[string]any)
+	if _, ok := readProps["pages"]; ok {
+		t.Fatalf("expected pages stripped from Read schema, got %v", readProps)
+	}
+	if _, ok := readProps["file_path"]; !ok {
+		t.Fatalf("expected file_path preserved in Read schema, got %v", readProps)
+	}
+
+	// Bash tool — description must be untouched (no CODEX_GUARDRAIL).
+	bashTool, _ := tools[1].(map[string]any)
+	if bashTool["name"] != "Bash" {
+		t.Fatalf("expected second tool=Bash, got %v", bashTool["name"])
+	}
+	bashDesc, _ := bashTool["description"].(string)
+	if strings.Contains(bashDesc, "CODEX_GUARDRAIL") {
+		t.Fatalf("expected Bash description untouched, got %q", bashDesc)
+	}
+	if bashDesc != "Run shell." {
+		t.Fatalf("expected Bash description=\"Run shell.\", got %q", bashDesc)
+	}
+}
+
 func TestAnthropicMessagesTranslatesToolChoiceAny(t *testing.T) {
 	db, _, apiKey := setupAnthropicTest(t)
 
