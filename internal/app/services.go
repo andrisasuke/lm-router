@@ -143,6 +143,15 @@ func (s ProviderService) Test(ctx context.Context, account store.Account, model 
 	}, nil
 }
 
+func (s ProviderService) Quota(ctx context.Context, account store.Account) (codex.QuotaInfo, error) {
+	baseURL := s.BaseURL
+	if baseURL == "" {
+		baseURL = DefaultCodexBaseURL
+	}
+	client := codex.NewClientWithLogger(baseURL, codex.NewTokenManager(s.DB, codex.OAuthRefresher{}), s.Logger, 64*1024)
+	return client.FetchQuota(ctx, account)
+}
+
 type KeyService struct {
 	DB *store.DB
 }

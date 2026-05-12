@@ -27,6 +27,7 @@ Today, the project is focused on the OpenAI Codex provider. The long-term shape 
   - renaming aliases
   - reordering priority with `Shift+Up` / `Shift+Down`
   - testing and refreshing accounts
+  - viewing per-account quota usage (5-hour and weekly windows)
   - generating local API keys
   - starting and stopping the embedded proxy
   - viewing request and upstream logs
@@ -167,6 +168,22 @@ Useful TUI behaviors:
 - `Esc` or `Backspace` to go back
 - `q` to quit from the home screen
 - `Shift+Up` / `Shift+Down` in `Providers` to reorder routing priority
+
+### Connection Detail
+
+When you select a provider from the `Providers` screen, the detail view shows:
+
+```
+Connection: <email>
+Alias:      <name>
+Status:     Active
+Priority:   1
+Expires:    2026-05-18T09:25:44+07:00
+Quota:      5h (40%) — reset 16:45
+            weekly (25%) — resets 11:45 on 19 May
+```
+
+The **Quota** line only appears after you select `Show Quota Limit`. It fires a lightweight upstream ping to fetch the current 5-hour and weekly rate-limit usage from Codex response headers. Select it again to refresh.
 
 ### Add Provider Flow
 

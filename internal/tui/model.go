@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/andrisasuke/lm-router/internal/app"
+	"github.com/andrisasuke/lm-router/internal/codex"
 	"github.com/andrisasuke/lm-router/internal/store"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -67,6 +68,10 @@ type Model struct {
 	settingEditing    bool
 	settingSelected   int
 	logFilter         string
+
+	providerQuota        *codex.QuotaInfo
+	providerQuotaErr     error
+	providerQuotaLoading bool
 }
 
 func New(ctx context.Context, db *store.DB, logger *app.RingLogger, server *app.ServerController, settings store.Settings) Model {
@@ -170,6 +175,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusLine = fmt.Sprintf("Success: provider %q connected", msg.result.Name)
 		} else {
 			m.statusLine = fmt.Sprintf("Error: provider %q failed: %s", msg.result.Name, app.HumanError(msg.result.Output))
+		}
+	case providerQuotaDoneMsg:
+		m.providerQuotaLoading = false
+		if msg.err != nil {
+			m.providerQuotaErr = msg.err
+		} else {
+			q := msg.info
+			m.providerQuota = &q
+			m.providerQuotaErr = nil
 		}
 	case loadProvidersMsg:
 		if msg.err != nil {
@@ -423,6 +437,9 @@ func (m Model) activateProviders() (tea.Model, tea.Cmd) {
 	idx := m.selected - 2
 	if idx >= 0 && idx < len(m.accounts) {
 		m.selectedAccount = idx
+		m.providerQuota = nil
+		m.providerQuotaErr = nil
+		m.providerQuotaLoading = false
 		m.push(screenProviderDetail)
 	}
 	return m, nil
@@ -447,6 +464,17 @@ func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
 			return providerTestDoneMsg{result: result, err: err}
 		}
 	case 3:
+		if m.providerQuotaLoading {
+			return m, nil
+		}
+		m.providerQuota = nil
+		m.providerQuotaErr = nil
+		m.providerQuotaLoading = true
+		return m, func() tea.Msg {
+			info, err := (app.ProviderService{DB: m.db, Logger: m.logger}).Quota(m.ctx, account)
+			return providerQuotaDoneMsg{info: info, err: err}
+		}
+	case 4:
 		refreshed, err := (app.ProviderService{DB: m.db}).Refresh(m.ctx, account.ID)
 		if err != nil {
 			m.statusLine = "Error: " + app.HumanError(err.Error())
@@ -454,7 +482,7 @@ func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
 		}
 		m.accounts[m.selectedAccount] = refreshed
 		m.statusLine = "Success: provider refreshed"
-	case 4:
+	case 5:
 		err := (app.ProviderService{DB: m.db}).SetEnabled(m.ctx, account.ID, !account.Enabled)
 		if err != nil {
 			m.statusLine = "Error: " + err.Error()
@@ -463,7 +491,7 @@ func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
 		account.Enabled = !account.Enabled
 		m.accounts[m.selectedAccount] = account
 		m.statusLine = "Success: provider updated"
-	case 5:
+	case 6:
 		if err := (app.ProviderService{DB: m.db}).Delete(m.ctx, account.ID); err != nil {
 			m.statusLine = "Error: " + err.Error()
 			return m, nil
@@ -626,7 +654,7 @@ func (m Model) itemCount() int {
 	case screenProviders:
 		return 2 + len(m.accounts)
 	case screenProviderDetail:
-		return 6
+		return 7
 	case screenKeys:
 		return 2 + len(m.keys)
 	case screenServer:
@@ -870,13 +898,30 @@ func (m Model) viewProviderDetail() string {
 		"Status:     " + app.FormatProviderStatus(account),
 		"Priority:   " + fmt.Sprintf("%d", account.Priority),
 		"Expires:    " + account.ExpiresAt.Local().Format(time.RFC3339),
-		"",
 	}
+	switch {
+	case m.providerQuotaLoading:
+		lines = append(lines, "Quota:      loading...")
+	case m.providerQuotaErr != nil:
+		lines = append(lines, "Quota:      error: "+app.HumanError(m.providerQuotaErr.Error()))
+	case m.providerQuota != nil:
+		if m.providerQuota.Primary == nil && m.providerQuota.Secondary == nil {
+			lines = append(lines, "Quota:      no data")
+		} else {
+			if s := codex.FormatQuotaWindow(m.providerQuota.Primary); s != "" {
+				lines = append(lines, "Quota:      "+s)
+			}
+			if s := codex.FormatQuotaWindow(m.providerQuota.Secondary); s != "" {
+				lines = append(lines, "            "+s)
+			}
+		}
+	}
+	lines = append(lines, "")
 	if m.aliasEditing {
 		lines = append(lines, "Edit alias:", m.aliasInput.View())
 		return strings.Join(lines, "\n")
 	}
-	lines = append(lines, renderMenu(m.selected, []string{"<- Back", "Edit Alias", "Test Connection", "Refresh Token", enableText, "Delete Connection"})...)
+	lines = append(lines, renderMenu(m.selected, []string{"<- Back", "Edit Alias", "Test Connection", "Show Quota Limit", "Refresh Token", enableText, "Delete Connection"})...)
 	return strings.Join(lines, "\n")
 }
 
@@ -1052,4 +1097,9 @@ type errMsg struct {
 
 type clearStatusMsg struct {
 	seq int
+}
+
+type providerQuotaDoneMsg struct {
+	info codex.QuotaInfo
+	err  error
 }

@@ -211,6 +211,30 @@ func (c *Client) openWithAccount(ctx context.Context, account store.Account, req
 	return result, nil
 }
 
+func (c *Client) FetchQuota(ctx context.Context, account store.Account) (QuotaInfo, error) {
+	refreshed, err := c.tokens.EnsureFresh(ctx, account.ID)
+	if err != nil {
+		return QuotaInfo{}, err
+	}
+	body, err := TransformRequest([]byte(`{"model":"gpt-5.3-codex","input":"ping","stream":false}`))
+	if err != nil {
+		return QuotaInfo{}, err
+	}
+	result, err := c.openWithAccount(ctx, refreshed, body, true)
+	if err != nil {
+		return QuotaInfo{}, err
+	}
+	if result.Body != nil {
+		_ = result.Body.Close()
+	}
+	now := time.Now()
+	info := ParseQuotaHeaders(result.Header, now)
+	if info.Primary == nil && info.Secondary == nil {
+		c.logf("[quota] no x-codex-* headers account=%s headers=%s", refreshed.ID, formatHeaders(result.Header))
+	}
+	return info, nil
+}
+
 func (c *Client) logf(format string, args ...any) {
 	if c.logger != nil {
 		c.logger.Printf(format, args...)
