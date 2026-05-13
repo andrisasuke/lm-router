@@ -214,6 +214,9 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		"input":  messagesToInput(body["messages"]),
 		"stream": false,
 	}
+	if instructions := extractSystemInstructions(body["messages"]); instructions != "" {
+		responsesBody["instructions"] = instructions
+	}
 	if stream, ok := body["stream"].(bool); ok {
 		responsesBody["stream"] = stream
 	}
@@ -362,6 +365,9 @@ func messagesToInput(raw any) []map[string]any {
 			continue
 		}
 		role, _ := msg["role"].(string)
+		if role == "system" {
+			continue
+		}
 		if role == "" {
 			role = "user"
 		}
@@ -383,6 +389,26 @@ func messagesToInput(raw any) []map[string]any {
 		out = append(out, map[string]any{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": "..."}}})
 	}
 	return out
+}
+
+func extractSystemInstructions(raw any) string {
+	items, ok := raw.([]any)
+	if !ok {
+		return ""
+	}
+	var parts []string
+	for _, item := range items {
+		msg, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); role == "system" {
+			if text := extractText(msg["content"]); text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func extractText(raw any) string {
