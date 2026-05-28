@@ -23,6 +23,7 @@ const (
 	screenHome screen = iota
 	screenProviders
 	screenAddProvider
+	screenReauthProvider
 	screenProviderDetail
 	screenKeys
 	screenServer
@@ -125,6 +126,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.screen == screenAddProvider {
 			return m.updateAddProvider(msg)
 		}
+		if m.screen == screenReauthProvider {
+			return m.updateReauthProvider(msg)
+		}
 		if m.screen == screenProviderDetail && m.aliasEditing {
 			return m.updateAliasInput(msg)
 		}
@@ -166,6 +170,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusLine = fmt.Sprintf("Success: provider %q saved", msg.account.Name)
 		m.screen = screenProviders
 		m.selected = 0
+	case reauthDoneMsg:
+		if msg.err != nil {
+			m.statusLine = "Error: " + app.HumanError(msg.err.Error())
+			return m, nil
+		}
+		if m.selectedAccount >= 0 && m.selectedAccount < len(m.accounts) {
+			m.accounts[m.selectedAccount] = msg.account
+		}
+		m.statusLine = fmt.Sprintf("Success: provider %q re-authenticated", msg.account.Name)
+		return m.back(), nil
 	case providerTestDoneMsg:
 		if msg.err != nil {
 			m.statusLine = "Error: " + app.HumanError(msg.err.Error())
@@ -227,6 +241,8 @@ func (m Model) View() string {
 		b.WriteString(m.viewProviders())
 	case screenAddProvider:
 		b.WriteString(m.viewAddProvider())
+	case screenReauthProvider:
+		b.WriteString(m.viewReauthProvider())
 	case screenProviderDetail:
 		b.WriteString(m.viewProviderDetail())
 	case screenKeys:
@@ -483,6 +499,14 @@ func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
 		m.accounts[m.selectedAccount] = refreshed
 		m.statusLine = "Success: provider refreshed"
 	case 5:
+		service := app.ProviderService{DB: m.db}
+		m.authSession = service.NewAuthSession("http://localhost:1455/auth/callback")
+		m.authURLPath, m.authURLWriteErr = m.writeAuthURL()
+		m.callbackInput.SetValue("")
+		m.callbackInput.Focus()
+		m.push(screenReauthProvider)
+		return m, textinput.Blink
+	case 6:
 		err := (app.ProviderService{DB: m.db}).SetEnabled(m.ctx, account.ID, !account.Enabled)
 		if err != nil {
 			m.statusLine = "Error: " + err.Error()
@@ -491,7 +515,7 @@ func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
 		account.Enabled = !account.Enabled
 		m.accounts[m.selectedAccount] = account
 		m.statusLine = "Success: provider updated"
-	case 6:
+	case 7:
 		if err := (app.ProviderService{DB: m.db}).Delete(m.ctx, account.ID); err != nil {
 			m.statusLine = "Error: " + err.Error()
 			return m, nil
@@ -560,7 +584,7 @@ func (m Model) activateSettings() (tea.Model, tea.Cmd) {
 		return m.back(), nil
 	}
 	switch m.selected {
-	case 1, 2, 5, 6:
+	case 1, 2, 5, 6, 7:
 		m.settingSelected = m.selected
 		m.settingInput.SetValue(m.settingValue(m.selected))
 		m.settingInput.Focus()
@@ -570,7 +594,7 @@ func (m Model) activateSettings() (tea.Model, tea.Cmd) {
 		m.settings.LogRequests = !m.settings.LogRequests
 	case 4:
 		m.settings.LogUpstream = !m.settings.LogUpstream
-	case 7:
+	case 8:
 		if err := m.db.SaveSettings(m.ctx, m.settings); err != nil {
 			m.statusLine = "Error: " + err.Error()
 		} else {
@@ -654,13 +678,15 @@ func (m Model) itemCount() int {
 	case screenProviders:
 		return 2 + len(m.accounts)
 	case screenProviderDetail:
-		return 7
+		return 8
+	case screenReauthProvider:
+		return 0
 	case screenKeys:
 		return 2 + len(m.keys)
 	case screenServer:
 		return 3
 	case screenSettings:
-		return 8
+		return 9
 	case screenLogs:
 		return 3
 	case screenCodexConfig:
@@ -690,7 +716,7 @@ func (m Model) loadKeysCmd() tea.Cmd {
 	}
 }
 
-func (m Model) applySettingInput() {
+func (m *Model) applySettingInput() {
 	value := strings.TrimSpace(m.settingInput.Value())
 	switch m.settingSelected {
 	case 1:
@@ -711,6 +737,11 @@ func (m Model) applySettingInput() {
 		if value != "" {
 			m.settings.DefaultModel = value
 		}
+	case 7:
+		var t int
+		if _, err := fmt.Sscanf(value, "%d", &t); err == nil && t > 0 {
+			m.settings.UpstreamTimeoutSeconds = t
+		}
 	}
 }
 
@@ -724,6 +755,8 @@ func (m Model) settingValue(selected int) string {
 		return fmt.Sprintf("%d", m.settings.LogBodyLimit)
 	case 6:
 		return m.settings.DefaultModel
+	case 7:
+		return fmt.Sprintf("%d", m.settings.UpstreamTimeoutSeconds)
 	default:
 		return ""
 	}
@@ -758,6 +791,11 @@ func (m Model) title() string {
 		return "OpenAI Codex (OAUTH)"
 	case screenAddProvider:
 		return "Add OpenAI Codex"
+	case screenReauthProvider:
+		if m.selectedAccount >= 0 && m.selectedAccount < len(m.accounts) {
+			return "Re-authenticate " + providerDisplayName(m.accounts[m.selectedAccount])
+		}
+		return "Re-authenticate"
 	case screenProviderDetail:
 		if m.selectedAccount >= 0 && m.selectedAccount < len(m.accounts) {
 			return providerDisplayName(m.accounts[m.selectedAccount])
@@ -786,6 +824,8 @@ func (m Model) breadcrumb() string {
 		return "LM Router > Providers"
 	case screenAddProvider:
 		return "LM Router > Providers > Add"
+	case screenReauthProvider:
+		return "LM Router > Providers > Connection > Re-authenticate"
 	case screenProviderDetail:
 		return "LM Router > Providers > Connection"
 	case screenKeys:
@@ -858,6 +898,60 @@ func (m Model) viewAddProvider() string {
 	return strings.Join(lines, "\n")
 }
 
+func (m Model) viewReauthProvider() string {
+	lines := []string{
+		"Open this URL in your browser:",
+		wrapURLForDisplay(m.authSession.AuthURL, 96),
+	}
+	if m.authURLPath != "" {
+		lines = append(lines, "Full URL saved to: "+m.authURLPath)
+	}
+	if m.authURLWriteErr != nil {
+		lines = append(lines, "Could not save URL file: "+m.authURLWriteErr.Error())
+	}
+	if m.selectedAccount >= 0 && m.selectedAccount < len(m.accounts) {
+		lines = append(lines, "",
+			"Re-authenticating: "+providerDisplayName(m.accounts[m.selectedAccount]),
+			"Existing alias and priority will be preserved.",
+		)
+	}
+	lines = append(lines,
+		"",
+		"Complete authorization in browser.",
+		"Paste callback URL:",
+		m.callbackInput.View(),
+		"",
+		"Press Esc to cancel.",
+	)
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) updateReauthProvider(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		return m.back(), nil
+	case tea.KeyEnter:
+		callbackURL := strings.TrimSpace(m.callbackInput.Value())
+		if callbackURL == "" {
+			m.statusLine = "Error: paste callback URL first"
+			return m, nil
+		}
+		if m.selectedAccount < 0 || m.selectedAccount >= len(m.accounts) {
+			m.statusLine = "Error: account not found"
+			return m, nil
+		}
+		accountID := m.accounts[m.selectedAccount].ID
+		session := m.authSession
+		return m, func() tea.Msg {
+			account, err := (app.ProviderService{DB: m.db, Logger: m.logger}).ReAuthFromCallback(m.ctx, session, accountID, callbackURL)
+			return reauthDoneMsg{account: account, err: err}
+		}
+	}
+	var cmd tea.Cmd
+	m.callbackInput, cmd = m.callbackInput.Update(msg)
+	return m, cmd
+}
+
 func (m Model) writeAuthURL() (string, error) {
 	if strings.TrimSpace(m.dataDir) == "" || strings.TrimSpace(m.authSession.AuthURL) == "" {
 		return "", nil
@@ -921,7 +1015,7 @@ func (m Model) viewProviderDetail() string {
 		lines = append(lines, "Edit alias:", m.aliasInput.View())
 		return strings.Join(lines, "\n")
 	}
-	lines = append(lines, renderMenu(m.selected, []string{"<- Back", "Edit Alias", "Test Connection", "Show Quota Limit", "Refresh Token", enableText, "Delete Connection"})...)
+	lines = append(lines, renderMenu(m.selected, []string{"<- Back", "Edit Alias", "Test Connection", "Show Quota Limit", "Refresh Token", "Re-authenticate", enableText, "Delete Connection"})...)
 	return strings.Join(lines, "\n")
 }
 
@@ -987,6 +1081,7 @@ func (m Model) viewSettings() string {
 		fmt.Sprintf("Log upstream: %t", m.settings.LogUpstream),
 		fmt.Sprintf("Body log limit: %d", m.settings.LogBodyLimit),
 		"Default model: " + m.settings.DefaultModel,
+		fmt.Sprintf("Upstream timeout (s): %d", m.settings.UpstreamTimeoutSeconds),
 		"Save",
 	}
 	if m.settingEditing {
@@ -1102,4 +1197,9 @@ type clearStatusMsg struct {
 type providerQuotaDoneMsg struct {
 	info codex.QuotaInfo
 	err  error
+}
+
+type reauthDoneMsg struct {
+	account store.Account
+	err     error
 }

@@ -92,6 +92,40 @@ func (s ProviderService) AddFromCallback(ctx context.Context, session AuthSessio
 	return account, nil
 }
 
+// ReAuthFromCallback exchanges a new OAuth callback for fresh tokens but
+// preserves the existing account's identity (id, alias, priority, enabled).
+// Clears the NeedsReauth flag. Used by the TUI Re-authenticate menu item.
+func (s ProviderService) ReAuthFromCallback(ctx context.Context, session AuthSession, accountID, callbackURL string) (store.Account, error) {
+	existing, err := s.DB.GetAccount(ctx, accountID)
+	if err != nil {
+		return store.Account{}, err
+	}
+	code, err := oauth.ParseCallbackURL(callbackURL, session.State)
+	if err != nil {
+		return store.Account{}, err
+	}
+	tokens, err := oauth.ExchangeCode(ctx, code, session.Verifier, session.RedirectURI)
+	if err != nil {
+		return store.Account{}, err
+	}
+	meta, err := oauth.DecodeIDToken(tokens.IDToken)
+	if err != nil && tokens.IDToken != "" {
+		return store.Account{}, err
+	}
+	updated := existing
+	updated.NeedsReauth = false
+	updated.AccessToken = tokens.AccessToken
+	updated.RefreshToken = tokens.RefreshToken
+	updated.ExpiresAt = oauth.ExpiryTime(tokens.ExpiresIn)
+	if metaJSON := mustJSON(meta); metaJSON != "{}" && metaJSON != "" {
+		updated.MetadataJSON = metaJSON
+	}
+	if err := s.DB.UpsertAccount(ctx, updated); err != nil {
+		return store.Account{}, err
+	}
+	return updated, nil
+}
+
 func (s ProviderService) List(ctx context.Context) ([]store.Account, error) {
 	return s.DB.ListAccounts(ctx)
 }
@@ -181,6 +215,7 @@ func NewProxyHandler(db *store.DB, settings store.Settings, logger Logger) http.
 		codexLogger = discardLogger{}
 	}
 	client := codex.NewClientWithLogger(DefaultCodexBaseURL, codex.NewTokenManager(db, codex.OAuthRefresher{}), codexLogger, bodyLimit)
+	client.SetUpstreamTimeout(settings.UpstreamTimeoutSeconds)
 	return proxy.New(proxy.ServerConfig{
 		Store:       db,
 		Codex:       client,
