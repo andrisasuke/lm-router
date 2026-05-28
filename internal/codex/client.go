@@ -78,13 +78,33 @@ func NewClientWithLogger(baseURL string, tokens *TokenManager, logger Logger, bo
 					KeepAlive: 30 * time.Second,
 				}).DialContext,
 				TLSHandshakeTimeout:   15 * time.Second,
-				ResponseHeaderTimeout: 60 * time.Second,
+				ResponseHeaderTimeout: 300 * time.Second,
 				ExpectContinueTimeout: 1 * time.Second,
 			},
 		},
 		tokens:       tokens,
 		logger:       logger,
 		logBodyLimit: bodyLimit,
+	}
+}
+
+// SetUpstreamTimeout reconfigures the HTTP client's ResponseHeaderTimeout.
+// Must be called before any requests are dispatched, since it rebuilds the
+// underlying transport. Values <= 0 are ignored.
+func (c *Client) SetUpstreamTimeout(seconds int) {
+	if seconds <= 0 {
+		return
+	}
+	c.http = &http.Client{
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   15 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ResponseHeaderTimeout: time.Duration(seconds) * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
 	}
 }
 
@@ -271,6 +291,65 @@ func ConvertResponsesSSEToOutput(sse []byte) string {
 		}
 		if eventName == "response.output_text.done" {
 			if text, ok := event["text"].(string); ok && out.Len() == 0 {
+				out.WriteString(text)
+			}
+		}
+	}
+	return out.String()
+}
+
+// ConvertResponsesSSEToItems reconstructs the full output array of a
+// non-streaming Responses API reply from the backend SSE stream.
+//
+// It collects each completed output item (message AND function_call) from
+// "response.output_item.done" events, so tool calls are preserved instead of
+// being flattened into assistant text. It also returns the final response
+// object from "response.completed" (for id/usage/status), when present.
+func ConvertResponsesSSEToItems(sse []byte) (items []map[string]any, final map[string]any) {
+	scanner := bufio.NewScanner(bytes.NewReader(sse))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			break
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			continue
+		}
+		switch typ, _ := event["type"].(string); typ {
+		case "response.output_item.done":
+			if item, ok := event["item"].(map[string]any); ok {
+				items = append(items, item)
+			}
+		case "response.completed":
+			if resp, ok := event["response"].(map[string]any); ok {
+				final = resp
+			}
+		}
+	}
+	return items, final
+}
+
+// OutputTextFromItems concatenates the text of any message/output_text items,
+// ignoring function_call items.
+func OutputTextFromItems(items []map[string]any) string {
+	var out strings.Builder
+	for _, item := range items {
+		if t, _ := item["type"].(string); t != "message" {
+			continue
+		}
+		content, _ := item["content"].([]any)
+		for _, c := range content {
+			cm, ok := c.(map[string]any)
+			if !ok {
+				continue
+			}
+			if text, ok := cm["text"].(string); ok {
 				out.WriteString(text)
 			}
 		}

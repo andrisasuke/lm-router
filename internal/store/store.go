@@ -43,22 +43,24 @@ type APIKey struct {
 }
 
 type Settings struct {
-	Host         string
-	Port         int
-	LogRequests  bool
-	LogUpstream  bool
-	LogBodyLimit int
-	DefaultModel string
+	Host                   string
+	Port                   int
+	LogRequests            bool
+	LogUpstream            bool
+	LogBodyLimit           int
+	DefaultModel           string
+	UpstreamTimeoutSeconds int
 }
 
 func DefaultSettings() Settings {
 	return Settings{
-		Host:         "127.0.0.1",
-		Port:         19090,
-		LogRequests:  true,
-		LogUpstream:  true,
-		LogBodyLimit: 64 * 1024,
-		DefaultModel: "gpt-5.3-codex",
+		Host:                   "127.0.0.1",
+		Port:                   19090,
+		LogRequests:            true,
+		LogUpstream:            true,
+		LogBodyLimit:           64 * 1024,
+		DefaultModel:           "gpt-5.3-codex",
+		UpstreamTimeoutSeconds: 300,
 	}
 }
 
@@ -168,6 +170,11 @@ func (db *DB) GetSettings(ctx context.Context) (Settings, error) {
 			if value != "" {
 				settings.DefaultModel = value
 			}
+		case "upstream_timeout_seconds":
+			var t int
+			if _, err := fmt.Sscanf(value, "%d", &t); err == nil && t > 0 {
+				settings.UpstreamTimeoutSeconds = t
+			}
 		}
 	}
 	return settings, rows.Err()
@@ -186,13 +193,17 @@ func (db *DB) SaveSettings(ctx context.Context, settings Settings) error {
 	if settings.DefaultModel == "" {
 		settings.DefaultModel = "gpt-5.3-codex"
 	}
+	if settings.UpstreamTimeoutSeconds <= 0 {
+		settings.UpstreamTimeoutSeconds = 300
+	}
 	values := map[string]string{
-		"host":           settings.Host,
-		"port":           fmt.Sprintf("%d", settings.Port),
-		"log_requests":   fmt.Sprintf("%t", settings.LogRequests),
-		"log_upstream":   fmt.Sprintf("%t", settings.LogUpstream),
-		"log_body_limit": fmt.Sprintf("%d", settings.LogBodyLimit),
-		"default_model":  settings.DefaultModel,
+		"host":                     settings.Host,
+		"port":                     fmt.Sprintf("%d", settings.Port),
+		"log_requests":             fmt.Sprintf("%t", settings.LogRequests),
+		"log_upstream":             fmt.Sprintf("%t", settings.LogUpstream),
+		"log_body_limit":           fmt.Sprintf("%d", settings.LogBodyLimit),
+		"default_model":            settings.DefaultModel,
+		"upstream_timeout_seconds": fmt.Sprintf("%d", settings.UpstreamTimeoutSeconds),
 	}
 	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
