@@ -1987,3 +1987,124 @@ func TestAnthropicMessagesStreamUsageAlwaysIncludesCacheFields(t *testing.T) {
 		}
 	}
 }
+
+func TestChatContentToCodex_textString(t *testing.T) {
+	out := chatContentToCodex("user", "hello world")
+	if len(out) != 1 {
+		t.Fatalf("expected 1 part, got %d", len(out))
+	}
+	if out[0]["type"] != "input_text" || out[0]["text"] != "hello world" {
+		t.Errorf("unexpected part: %+v", out[0])
+	}
+}
+
+func TestChatContentToCodex_assistantString(t *testing.T) {
+	out := chatContentToCodex("assistant", "ok")
+	if out[0]["type"] != "output_text" {
+		t.Errorf("assistant text should be output_text, got %v", out[0]["type"])
+	}
+}
+
+func TestChatContentToCodex_imageURLObject(t *testing.T) {
+	raw := []any{
+		map[string]any{"type": "text", "text": "what is this?"},
+		map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": "data:image/jpeg;base64,AAAA"},
+		},
+	}
+	out := chatContentToCodex("user", raw)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 parts, got %d: %+v", len(out), out)
+	}
+	if out[0]["type"] != "input_text" {
+		t.Errorf("part 0 type: %v", out[0]["type"])
+	}
+	if out[1]["type"] != "input_image" {
+		t.Errorf("part 1 type: %v", out[1]["type"])
+	}
+	if out[1]["image_url"] != "data:image/jpeg;base64,AAAA" {
+		t.Errorf("part 1 image_url: %v", out[1]["image_url"])
+	}
+}
+
+func TestChatContentToCodex_imageURLString(t *testing.T) {
+	raw := []any{
+		map[string]any{"type": "image_url", "image_url": "https://example.com/x.png"},
+	}
+	out := chatContentToCodex("user", raw)
+	if len(out) != 1 || out[0]["type"] != "input_image" {
+		t.Fatalf("expected input_image, got %+v", out)
+	}
+	if out[0]["image_url"] != "https://example.com/x.png" {
+		t.Errorf("image_url: %v", out[0]["image_url"])
+	}
+}
+
+func TestChatContentToCodex_assistantDropsImage(t *testing.T) {
+	raw := []any{
+		map[string]any{"type": "text", "text": "here"},
+		map[string]any{"type": "image_url", "image_url": "https://example.com/x.png"},
+	}
+	out := chatContentToCodex("assistant", raw)
+	if len(out) != 1 {
+		t.Fatalf("expected only text part (image dropped for assistant), got %d", len(out))
+	}
+	if out[0]["type"] != "output_text" {
+		t.Errorf("assistant content type: %v", out[0]["type"])
+	}
+}
+
+func TestMessagesToInput_textOnly(t *testing.T) {
+	raw := []any{
+		map[string]any{"role": "user", "content": "hello"},
+	}
+	out := messagesToInput(raw)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(out))
+	}
+	content := out[0]["content"].([]map[string]any)
+	if content[0]["text"] != "hello" {
+		t.Errorf("text: %v", content[0]["text"])
+	}
+}
+
+func TestMessagesToInput_withImage(t *testing.T) {
+	raw := []any{
+		map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "what is this"},
+				map[string]any{
+					"type":      "image_url",
+					"image_url": map[string]any{"url": "data:image/png;base64,XYZ"},
+				},
+			},
+		},
+	}
+	out := messagesToInput(raw)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(out))
+	}
+	content := out[0]["content"].([]map[string]any)
+	if len(content) != 2 {
+		t.Fatalf("expected 2 content parts, got %d", len(content))
+	}
+	if content[1]["type"] != "input_image" {
+		t.Errorf("image part type: %v", content[1]["type"])
+	}
+}
+
+func TestMessagesToInput_skipsSystem(t *testing.T) {
+	raw := []any{
+		map[string]any{"role": "system", "content": "you are helpful"},
+		map[string]any{"role": "user", "content": "hi"},
+	}
+	out := messagesToInput(raw)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 message (system skipped), got %d", len(out))
+	}
+	if out[0]["role"] != "user" {
+		t.Errorf("expected user role, got %v", out[0]["role"])
+	}
+}

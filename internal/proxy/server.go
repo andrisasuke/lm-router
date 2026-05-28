@@ -217,6 +217,12 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if instructions := extractSystemInstructions(body["messages"]); instructions != "" {
 		responsesBody["instructions"] = instructions
 	}
+	if tools := chatToolsToResponsesTools(body["tools"]); tools != nil {
+		responsesBody["tools"] = tools
+	}
+	if tc, ok := body["tool_choice"]; ok {
+		responsesBody["tool_choice"] = tc
+	}
 	if stream, ok := body["stream"].(bool); ok {
 		responsesBody["stream"] = stream
 	}
@@ -233,16 +239,76 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, statusOrDefault(status, http.StatusBadGateway), "proxy_error", err.Error())
 		return
 	}
-	text := codex.ConvertResponsesSSEToOutput(respBody)
-	writeJSON(w, http.StatusOK, map[string]any{
+	items, final := codex.ConvertResponsesSSEToItems(respBody)
+	message := map[string]any{"role": "assistant"}
+	finishReason := "stop"
+
+	var toolCalls []map[string]any
+	for _, item := range items {
+		if t, _ := item["type"].(string); t != "function_call" {
+			continue
+		}
+		callID, _ := item["call_id"].(string)
+		if callID == "" {
+			callID, _ = item["id"].(string)
+		}
+		name, _ := item["name"].(string)
+		args, _ := item["arguments"].(string)
+		toolCalls = append(toolCalls, map[string]any{
+			"id":   callID,
+			"type": "function",
+			"function": map[string]any{
+				"name":      name,
+				"arguments": args,
+			},
+		})
+	}
+
+	if len(toolCalls) > 0 {
+		message["tool_calls"] = toolCalls
+		message["content"] = nil
+		finishReason = "tool_calls"
+	} else if len(items) > 0 {
+		message["content"] = codex.OutputTextFromItems(items)
+	} else {
+		message["content"] = codex.ConvertResponsesSSEToOutput(respBody)
+	}
+
+	completion := map[string]any{
 		"id":      "chatcmpl-lm-router",
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
 		"model":   body["model"],
 		"choices": []map[string]any{
-			{"index": 0, "message": map[string]any{"role": "assistant", "content": text}, "finish_reason": "stop"},
+			{"index": 0, "message": message, "finish_reason": finishReason},
 		},
-	})
+	}
+	if usage := chatUsageFromResponses(final); usage != nil {
+		completion["usage"] = usage
+	}
+	writeJSON(w, http.StatusOK, completion)
+}
+
+// chatUsageFromResponses maps a Responses API usage object
+// (input_tokens/output_tokens/total_tokens) to the Chat Completions shape
+// (prompt_tokens/completion_tokens/total_tokens). Returns nil when absent.
+func chatUsageFromResponses(final map[string]any) map[string]any {
+	if final == nil {
+		return nil
+	}
+	usage, ok := final["usage"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	num := func(k string) float64 {
+		v, _ := usage[k].(float64)
+		return v
+	}
+	return map[string]any{
+		"prompt_tokens":     num("input_tokens"),
+		"completion_tokens": num("output_tokens"),
+		"total_tokens":      num("total_tokens"),
+	}
 }
 
 func (s *Server) routeResponses(ctx context.Context, body []byte) ([]byte, string, int, error) {
@@ -371,24 +437,135 @@ func messagesToInput(raw any) []map[string]any {
 		if role == "" {
 			role = "user"
 		}
-		text := extractText(msg["content"])
-		contentType := "input_text"
+
+		// Tool result: Responses API uses a function_call_output item, not a
+		// message with role "tool" (which the backend rejects).
+		if role == "tool" {
+			callID, _ := msg["tool_call_id"].(string)
+			out = append(out, map[string]any{
+				"type":    "function_call_output",
+				"call_id": callID,
+				"output":  contentToString(msg["content"]),
+			})
+			continue
+		}
+
+		// Assistant tool calls: emit a function_call item per call so the
+		// backend sees the prior tool invocation.
 		if role == "assistant" {
-			contentType = "output_text"
+			if tcs, ok := msg["tool_calls"].([]any); ok {
+				for _, t := range tcs {
+					tc, ok := t.(map[string]any)
+					if !ok {
+						continue
+					}
+					fn, _ := tc["function"].(map[string]any)
+					callID, _ := tc["id"].(string)
+					name, _ := fn["name"].(string)
+					args, _ := fn["arguments"].(string)
+					out = append(out, map[string]any{
+						"type":      "function_call",
+						"call_id":   callID,
+						"name":      name,
+						"arguments": args,
+					})
+				}
+			}
+		}
+
+		content := chatContentToCodex(role, msg["content"])
+		if len(content) == 0 {
+			continue
 		}
 		out = append(out, map[string]any{
-			"type": "message",
-			"role": role,
-			"content": []map[string]any{{
-				"type": contentType,
-				"text": text,
-			}},
+			"type":    "message",
+			"role":    role,
+			"content": content,
 		})
 	}
 	if len(out) == 0 {
 		out = append(out, map[string]any{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": "..."}}})
 	}
 	return out
+}
+
+// contentToString flattens a Chat Completions content value (string or array
+// of text blocks) into a plain string, for function_call_output payloads.
+func contentToString(raw any) string {
+	switch v := raw.(type) {
+	case string:
+		return v
+	case []any:
+		var b strings.Builder
+		for _, item := range v {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if text, ok := m["text"].(string); ok {
+				b.WriteString(text)
+			}
+		}
+		return b.String()
+	}
+	return ""
+}
+
+// chatContentToCodex translates an OpenAI Chat Completions content value into
+// the Codex Responses API content array. Supports text and image_url blocks.
+// Codex format requires input_text / input_image for user, output_text for
+// assistant. Image blocks on assistant role are dropped (Codex does not accept
+// them as model output).
+func chatContentToCodex(role string, raw any) []map[string]any {
+	textType := "input_text"
+	if role == "assistant" {
+		textType = "output_text"
+	}
+	switch v := raw.(type) {
+	case string:
+		if v == "" {
+			return nil
+		}
+		return []map[string]any{{"type": textType, "text": v}}
+	case []any:
+		out := make([]map[string]any, 0, len(v))
+		for _, item := range v {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			blockType, _ := m["type"].(string)
+			switch blockType {
+			case "text", "input_text", "output_text":
+				if text, _ := m["text"].(string); text != "" {
+					out = append(out, map[string]any{"type": textType, "text": text})
+				}
+			case "image_url":
+				var url string
+				switch iv := m["image_url"].(type) {
+				case string:
+					url = iv
+				case map[string]any:
+					url, _ = iv["url"].(string)
+				}
+				if url != "" && role != "assistant" {
+					out = append(out, map[string]any{
+						"type":      "input_image",
+						"image_url": url,
+					})
+				}
+			case "input_image":
+				if url, _ := m["image_url"].(string); url != "" && role != "assistant" {
+					out = append(out, map[string]any{
+						"type":      "input_image",
+						"image_url": url,
+					})
+				}
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 func extractSystemInstructions(raw any) string {
@@ -453,29 +630,71 @@ func chatSSEFromResponsesSSE(body []byte) []byte {
 	return []byte("data: " + string(payload) + "\n\n" + "data: " + string(donePayload) + "\n\n" + "data: [DONE]\n\n")
 }
 
+// chatToolsToResponsesTools converts Chat Completions tool definitions
+// ([{type:function, function:{name,...}}]) into the flat Responses API form
+// ([{type:function, name, description, parameters}]). Returns nil when absent.
+func chatToolsToResponsesTools(raw any) []map[string]any {
+	list, ok := raw.([]any)
+	if !ok || len(list) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(list))
+	for _, t := range list {
+		tm, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, ok := tm["function"].(map[string]any)
+		if !ok {
+			// Already flat (Responses form) — pass through.
+			out = append(out, tm)
+			continue
+		}
+		flat := map[string]any{"type": "function"}
+		for _, k := range []string{"name", "description", "parameters"} {
+			if v, ok := fn[k]; ok {
+				flat[k] = v
+			}
+		}
+		out = append(out, flat)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func responsesJSONFromSSE(model any, body []byte) map[string]any {
-	text := codex.ConvertResponsesSSEToOutput(body)
-	return map[string]any{
-		"id":         "resp_lm_router",
-		"object":     "response",
-		"created_at": time.Now().Unix(),
-		"status":     "completed",
-		"model":      model,
-		"output": []map[string]any{
+	items, final := codex.ConvertResponsesSSEToItems(body)
+
+	// Fallback: no structured items recovered — preserve old text behavior.
+	if len(items) == 0 {
+		text := codex.ConvertResponsesSSEToOutput(body)
+		items = []map[string]any{
 			{
 				"id":   "msg_lm_router",
 				"type": "message",
 				"role": "assistant",
 				"content": []map[string]any{
-					{
-						"type": "output_text",
-						"text": text,
-					},
+					{"type": "output_text", "text": text},
 				},
 			},
-		},
-		"output_text": text,
+		}
 	}
+
+	resp := final
+	if resp == nil {
+		resp = map[string]any{
+			"id":         "resp_lm_router",
+			"object":     "response",
+			"created_at": time.Now().Unix(),
+			"status":     "completed",
+			"model":      model,
+		}
+	}
+	resp["output"] = items
+	resp["output_text"] = codex.OutputTextFromItems(items)
+	return resp
 }
 
 func convertResponsesStreamToChatSSE(w io.Writer, r io.Reader) error {
