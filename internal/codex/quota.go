@@ -17,24 +17,35 @@ type QuotaWindow struct {
 }
 
 type QuotaInfo struct {
-	FetchedAt time.Time
-	Primary   *QuotaWindow // 5h rolling window
-	Secondary *QuotaWindow // weekly window
+	FetchedAt  time.Time
+	Primary    *QuotaWindow // 5h rolling window
+	Secondary  *QuotaWindow // weekly window
+	HeaderKeys []string     // populated when both windows are nil; lists x-* response header keys for debugging
 }
 
 func ParseQuotaHeaders(h http.Header, now time.Time) QuotaInfo {
-	return QuotaInfo{
+	info := QuotaInfo{
 		FetchedAt: now,
 		Primary:   parseQuotaWindow(h, "x-codex-primary", now),
 		Secondary: parseQuotaWindow(h, "x-codex-secondary", now),
 	}
+	if info.Primary == nil && info.Secondary == nil {
+		for k := range h {
+			lk := strings.ToLower(k)
+			if strings.HasPrefix(lk, "x-") {
+				info.HeaderKeys = append(info.HeaderKeys, lk)
+			}
+		}
+	}
+	return info
 }
 
 func parseQuotaWindow(h http.Header, prefix string, now time.Time) *QuotaWindow {
 	usedStr := h.Get(prefix + "-used-percent")
 	windowStr := h.Get(prefix + "-window-minutes")
 	resetStr := h.Get(prefix + "-reset-after-seconds")
-	if usedStr == "" && windowStr == "" && resetStr == "" {
+	resetAtStr := h.Get(prefix + "-reset-at")
+	if usedStr == "" && windowStr == "" && resetStr == "" && resetAtStr == "" {
 		return nil
 	}
 	w := &QuotaWindow{}
@@ -44,7 +55,10 @@ func parseQuotaWindow(h http.Header, prefix string, now time.Time) *QuotaWindow 
 	if v, err := strconv.Atoi(windowStr); err == nil {
 		w.WindowMinutes = v
 	}
-	if v, err := strconv.Atoi(resetStr); err == nil {
+	if v, err := strconv.ParseInt(resetAtStr, 10, 64); err == nil && v > 0 {
+		w.ResetAt = time.Unix(v, 0)
+		w.ResetAfterSecs = int(w.ResetAt.Sub(now).Seconds())
+	} else if v, err := strconv.Atoi(resetStr); err == nil {
 		w.ResetAfterSecs = v
 		w.ResetAt = now.Add(time.Duration(v) * time.Second)
 	}

@@ -236,7 +236,7 @@ func (c *Client) FetchQuota(ctx context.Context, account store.Account) (QuotaIn
 	if err != nil {
 		return QuotaInfo{}, err
 	}
-	body, err := TransformRequest([]byte(`{"model":"gpt-5.3-codex","input":"ping","stream":false}`))
+	body, err := TransformRequest([]byte(`{"model":"gpt-5.5","input":"ping","stream":false}`))
 	if err != nil {
 		return QuotaInfo{}, err
 	}

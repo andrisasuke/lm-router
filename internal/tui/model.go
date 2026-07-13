@@ -882,7 +882,7 @@ func (m Model) viewAddProvider() string {
 		wrapURLForDisplay(m.authSession.AuthURL, 96),
 	}
 	if m.authURLPath != "" {
-		lines = append(lines, "Full URL saved to: "+m.authURLPath)
+		lines = append(lines, "", "Full URL saved to: "+m.authURLPath)
 	}
 	if m.authURLWriteErr != nil {
 		lines = append(lines, "Could not save URL file: "+m.authURLWriteErr.Error())
@@ -904,7 +904,7 @@ func (m Model) viewReauthProvider() string {
 		wrapURLForDisplay(m.authSession.AuthURL, 96),
 	}
 	if m.authURLPath != "" {
-		lines = append(lines, "Full URL saved to: "+m.authURLPath)
+		lines = append(lines, "", "Full URL saved to: "+m.authURLPath)
 	}
 	if m.authURLWriteErr != nil {
 		lines = append(lines, "Could not save URL file: "+m.authURLWriteErr.Error())
@@ -1000,7 +1000,10 @@ func (m Model) viewProviderDetail() string {
 		lines = append(lines, "Quota:      error: "+app.HumanError(m.providerQuotaErr.Error()))
 	case m.providerQuota != nil:
 		if m.providerQuota.Primary == nil && m.providerQuota.Secondary == nil {
-			lines = append(lines, "Quota:      no data")
+			lines = append(lines, "Quota:      no data (no x-codex-*-used-percent header)")
+			if keys := m.providerQuota.HeaderKeys; len(keys) > 0 {
+				lines = append(lines, "            x-* headers seen: "+strings.Join(keys, ", "))
+			}
 		} else {
 			if s := codex.FormatQuotaWindow(m.providerQuota.Primary); s != "" {
 				lines = append(lines, "Quota:      "+s)

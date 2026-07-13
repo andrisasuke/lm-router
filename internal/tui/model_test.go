@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/andrisasuke/lm-router/internal/app"
+	"github.com/andrisasuke/lm-router/internal/codex"
 	"github.com/andrisasuke/lm-router/internal/store"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -86,6 +87,47 @@ func TestAddProviderWritesFullAuthURLToDataDir(t *testing.T) {
 	}
 	if !strings.Contains(model.View(), "Full URL saved to: "+model.authURLPath) {
 		t.Fatalf("saved path missing from view: %s", model.View())
+	}
+}
+
+func TestAuthViewsSeparateSavedURLWithBlankLine(t *testing.T) {
+	model := NewTestModel()
+	model.authSession.AuthURL = "https://example.com/authorize"
+	model.authURLPath = "/tmp/lm-router-auth-url.txt"
+	want := "https://example.com/authorize\n\nFull URL saved to: /tmp/lm-router-auth-url.txt"
+
+	for name, view := range map[string]string{
+		"add provider":    model.viewAddProvider(),
+		"reauth provider": model.viewReauthProvider(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(view, want) {
+				t.Fatalf("saved URL should be separated by a blank line:\n%s", view)
+			}
+		})
+	}
+}
+
+func TestProviderDetailShowsQuotaHeaderDiagnostics(t *testing.T) {
+	model := NewTestModel()
+	model.accounts = []store.Account{{
+		ID:        "acct_1",
+		Name:      "main",
+		Enabled:   true,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}}
+	model.screen = screenProviderDetail
+	model.selectedAccount = 0
+	model.providerQuota = &codex.QuotaInfo{
+		HeaderKeys: []string{"x-request-id", "x-ratelimit-limit"},
+	}
+
+	view := model.View()
+	if !strings.Contains(view, "Quota:      no data (no x-codex-*-used-percent header)") {
+		t.Fatalf("missing quota diagnostic: %s", view)
+	}
+	if !strings.Contains(view, "x-* headers seen: x-request-id, x-ratelimit-limit") {
+		t.Fatalf("missing observed header keys: %s", view)
 	}
 }
 

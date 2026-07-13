@@ -2,6 +2,8 @@ package codex
 
 import (
 	"net/http"
+	"slices"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -68,6 +70,43 @@ func TestParseQuotaHeaders_malformed(t *testing.T) {
 	}
 	if info.Primary.WindowMinutes != 0 {
 		t.Errorf("malformed WindowMinutes should be 0, got %v", info.Primary.WindowMinutes)
+	}
+}
+
+func TestParseQuotaHeaders_resetAt(t *testing.T) {
+	now := time.Date(2026, 5, 12, 10, 0, 0, 0, time.UTC)
+	resetAt := now.Add(90 * time.Minute)
+	h := http.Header{}
+	h.Set("x-codex-primary-used-percent", "40")
+	h.Set("x-codex-primary-reset-at", strconv.FormatInt(resetAt.Unix(), 10))
+	h.Set("x-codex-primary-reset-after-seconds", "60")
+
+	info := ParseQuotaHeaders(h, now)
+	if info.Primary == nil {
+		t.Fatal("expected primary window")
+	}
+	if !info.Primary.ResetAt.Equal(resetAt) {
+		t.Errorf("primary ResetAt: got %v, want %v", info.Primary.ResetAt, resetAt)
+	}
+	if info.Primary.ResetAfterSecs != 90*60 {
+		t.Errorf("primary ResetAfterSecs: got %d, want %d", info.Primary.ResetAfterSecs, 90*60)
+	}
+}
+
+func TestParseQuotaHeaders_collectsXHeaderKeysWhenQuotaMissing(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Request-Id", "req_123")
+	h.Set("X-Ratelimit-Limit", "100")
+	h.Set("Content-Type", "application/json")
+
+	info := ParseQuotaHeaders(h, time.Now())
+	if info.Primary != nil || info.Secondary != nil {
+		t.Fatal("expected quota windows to be nil")
+	}
+	slices.Sort(info.HeaderKeys)
+	want := []string{"x-ratelimit-limit", "x-request-id"}
+	if !slices.Equal(info.HeaderKeys, want) {
+		t.Errorf("HeaderKeys: got %v, want %v", info.HeaderKeys, want)
 	}
 }
 

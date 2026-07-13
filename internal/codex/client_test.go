@@ -1,6 +1,60 @@
 package codex
 
-import "testing"
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/andrisasuke/lm-router/internal/store"
+)
+
+func TestFetchQuotaUsesGPT55ProbeModel(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	account := store.Account{
+		ID:           "acct_1",
+		Provider:     "openai-codex",
+		Name:         "main",
+		Enabled:      true,
+		AccessToken:  "access-token",
+		RefreshToken: "refresh-token",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	if err := db.UpsertAccount(ctx, account); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	requestBody := make(chan []byte, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requestBody <- body
+		w.Header().Set("x-codex-primary-used-percent", "10")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	client := NewClient(upstream.URL, NewTokenManager(db, nil))
+	if _, err := client.FetchQuota(ctx, account); err != nil {
+		t.Fatalf("fetch quota: %v", err)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(<-requestBody, &body); err != nil {
+		t.Fatalf("decode request body: %v", err)
+	}
+	if got := body["model"]; got != "gpt-5.5" {
+		t.Errorf("probe model: got %v, want gpt-5.5", got)
+	}
+}
 
 // SSE sample mirroring a real backend reply that emits a function_call.
 const functionCallSSE = `event: response.output_item.added
