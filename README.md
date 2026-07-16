@@ -125,6 +125,8 @@ print(response.output_text)
 go run ./cmd/lm-router tui
 ```
 
+![LM Router Terminal UI](./docs/images/lm-router-terminal-ui.png)
+
 Optional:
 
 ```bash
