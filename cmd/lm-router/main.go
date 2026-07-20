@@ -18,9 +18,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/andrisasuke/lm-router/internal/anthropic"
 	"github.com/andrisasuke/lm-router/internal/app"
 	"github.com/andrisasuke/lm-router/internal/codex"
-	"github.com/andrisasuke/lm-router/internal/oauth"
 	"github.com/andrisasuke/lm-router/internal/proxy"
 	"github.com/andrisasuke/lm-router/internal/store"
 	"github.com/andrisasuke/lm-router/internal/tui"
@@ -46,6 +46,8 @@ func main() {
 		runKeys(os.Args[2:])
 	case "codex":
 		runCodex(os.Args[2:])
+	case "claude":
+		runClaude(os.Args[2:])
 	case "version":
 		runVersion()
 	default:
@@ -71,9 +73,11 @@ func runServe(args []string) {
 	}
 	defer db.Close()
 
+	tokens := app.NewProviderTokenManager(db)
+	claudeClient := anthropic.NewClient(anthropic.DefaultMessagesURL, anthropic.DefaultUsageURL, tokens, nil)
 	srv := &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", *host, *port),
-		Handler:           proxy.New(proxy.ServerConfig{Store: db, Codex: codex.NewClient(defaultCodexBaseURL, codex.NewTokenManager(db, codex.OAuthRefresher{})), RequireKey: true, LogRequests: true}),
+		Handler:           proxy.New(proxy.ServerConfig{Store: db, Codex: codex.NewClient(defaultCodexBaseURL, tokens), Anthropic: claudeClient, RequireKey: true, LogRequests: true}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	log.Printf("lm-router listening on %s", srv.Addr)
@@ -119,46 +123,59 @@ func runAuth(args []string) {
 }
 
 func runAuthAdd(args []string) {
+	provider := store.ProviderOpenAICodex
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		if args[0] != "openai-codex" {
-			exitErrorf("unsupported provider %q", args[0])
+		canonical, err := store.CanonicalProvider(args[0])
+		if err != nil {
+			exitError(err)
 		}
+		provider = canonical
 		args = args[1:]
 	}
 	fs := flag.NewFlagSet("auth add", flag.ExitOnError)
-	name := fs.String("name", "openai-codex", "")
+	name := fs.String("name", "", "")
 	dataDir := fs.String("data-dir", defaultDataDir(), "")
-	redirectURI := fs.String("redirect-uri", "http://localhost:1455/auth/callback", "")
+	defaultRedirect := "http://localhost:1455/auth/callback"
+	if provider == store.ProviderAnthropicClaude {
+		defaultRedirect = "https://console.anthropic.com/oauth/code/callback"
+	}
+	redirectURI := fs.String("redirect-uri", defaultRedirect, "")
+	acceptRisk := fs.Bool("accept-risk", false, "")
 	testAfterAdd := fs.Bool("test", false, "")
 	testModel := fs.String("test-model", "gpt-5.3-codex", "")
 	testBaseURL := fs.String("test-base-url", defaultCodexBaseURL, "")
 	fs.Parse(args)
+	if *name == "" {
+		*name = provider
+	}
+	if provider == store.ProviderAnthropicClaude && !*acceptRisk {
+		fmt.Println("WARNING: Using Claude subscription OAuth through a router is not an officially licensed Anthropic API flow and may put the account at risk.")
+		fmt.Println("Automatic fallback across subscriptions may be treated as combining or bypassing capacity limits and does not prevent provider restrictions.")
+		fmt.Print("Type 'I understand' to continue: ")
+		confirmation, err := readPromptLine(os.Stdin)
+		if err != nil {
+			exitError(err)
+		}
+		if !strings.EqualFold(strings.TrimSpace(confirmation), "I understand") {
+			exitErrorf("risk confirmation was not accepted (use --accept-risk for non-interactive use)")
+		}
+	}
 
-	state := mustRandomBase64URLString(32)
-	verifier := mustRandomBase64URLString(32)
-	challenge := pkceChallenge(verifier)
-	flow := oauth.NewCodexFlow(oauth.Config{
-		RedirectURI:   *redirectURI,
-		State:         state,
-		CodeChallenge: challenge,
-	})
-
-	fmt.Println(flow.AuthURL())
-	fmt.Print("Paste callback URL: ")
+	service := app.ProviderService{}
+	session := service.NewAuthSessionForProvider(provider, *redirectURI)
+	fmt.Println(session.AuthURL)
+	if err := os.MkdirAll(*dataDir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not create OAuth URL directory: %v\n", err)
+	} else if err := os.WriteFile(filepath.Join(*dataDir, provider+"-auth-url.txt"), []byte(session.AuthURL+"\n"), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not save OAuth URL: %v\n", err)
+	}
+	prompt := "Paste callback URL: "
+	if provider == store.ProviderAnthropicClaude {
+		prompt = "Paste callback URL or code#state: "
+	}
+	fmt.Print(prompt)
 	callbackURL, err := readPromptLine(os.Stdin)
 	if err != nil {
-		exitError(err)
-	}
-	code, err := oauth.ParseCallbackURL(callbackURL, state)
-	if err != nil {
-		exitError(err)
-	}
-	tokens, err := oauth.ExchangeCode(context.Background(), code, verifier, *redirectURI)
-	if err != nil {
-		exitError(err)
-	}
-	meta, err := oauth.DecodeIDToken(tokens.IDToken)
-	if err != nil && tokens.IDToken != "" {
 		exitError(err)
 	}
 
@@ -168,18 +185,9 @@ func runAuthAdd(args []string) {
 		exitError(err)
 	}
 	defer db.Close()
-	account := store.Account{
-		ID:           "acct_" + mustRandomString(8),
-		Provider:     "openai-codex",
-		Name:         *name,
-		Priority:     nextPriority(db, ctx),
-		Enabled:      true,
-		AccessToken:  tokens.AccessToken,
-		RefreshToken: tokens.RefreshToken,
-		ExpiresAt:    oauth.ExpiryTime(tokens.ExpiresIn),
-		MetadataJSON: mustJSON(meta),
-	}
-	if err := db.UpsertAccount(ctx, account); err != nil {
+	service.DB = db
+	account, err := service.AddFromCallback(ctx, session, *name, callbackURL)
+	if err != nil {
 		exitError(err)
 	}
 	fmt.Printf("Success: provider %q saved (%s)\n", account.Name, account.ID)
@@ -195,6 +203,7 @@ func runAuthAdd(args []string) {
 func runAuthList(args []string) {
 	fs := flag.NewFlagSet("auth list", flag.ExitOnError)
 	dataDir := fs.String("data-dir", defaultDataDir(), "")
+	provider := fs.String("provider", "", "")
 	fs.Parse(args)
 
 	ctx := context.Background()
@@ -203,7 +212,12 @@ func runAuthList(args []string) {
 		exitError(err)
 	}
 	defer db.Close()
-	accounts, err := db.ListAccounts(ctx)
+	var accounts []store.Account
+	if strings.TrimSpace(*provider) == "" {
+		accounts, err = db.ListAccounts(ctx)
+	} else {
+		accounts, err = db.ListAccountsByProvider(ctx, *provider)
+	}
 	if err != nil {
 		exitError(err)
 	}
@@ -275,9 +289,14 @@ func runAuthMove(args []string) {
 func runAuthRefresh(args []string) {
 	fs := flag.NewFlagSet("auth refresh", flag.ExitOnError)
 	dataDir := fs.String("data-dir", defaultDataDir(), "")
+	name := fs.String("name", "", "")
+	provider := fs.String("provider", "", "")
 	fs.Parse(args)
-	if fs.NArg() != 1 {
-		exitErrorf("usage: lm-router auth refresh <account-id>")
+	if fs.NArg() != 1 && *name == "" {
+		exitErrorf("usage: lm-router auth refresh <account-id> OR --provider <provider> --name <alias>")
+	}
+	if *name != "" && *provider == "" {
+		exitErrorf("--provider is required when using --name")
 	}
 	ctx := context.Background()
 	db, err := store.Open(ctx, *dataDir)
@@ -285,8 +304,11 @@ func runAuthRefresh(args []string) {
 		exitError(err)
 	}
 	defer db.Close()
-	manager := codex.NewTokenManager(db, codex.OAuthRefresher{})
-	account, err := manager.RefreshNow(ctx, fs.Arg(0))
+	account, err := resolveAccount(ctx, db, fs, *provider, *name)
+	if err != nil {
+		exitError(err)
+	}
+	account, err = (app.ProviderService{DB: db}).Refresh(ctx, account.ID)
 	if err != nil {
 		exitError(err)
 	}
@@ -297,11 +319,16 @@ func runAuthTest(args []string) {
 	fs := flag.NewFlagSet("auth test", flag.ExitOnError)
 	dataDir := fs.String("data-dir", defaultDataDir(), "")
 	name := fs.String("name", "", "")
+	provider := fs.String("provider", "", "")
 	model := fs.String("model", "gpt-5.3-codex", "")
 	baseURL := fs.String("base-url", defaultCodexBaseURL, "")
+	usageURL := fs.String("usage-url", anthropic.DefaultUsageURL, "")
 	fs.Parse(args)
 	if fs.NArg() != 1 && *name == "" {
-		exitErrorf("usage: lm-router auth test <account-id> OR lm-router auth test --name <account-name>")
+		exitErrorf("usage: lm-router auth test <account-id> OR --provider <provider> --name <alias>")
+	}
+	if *name != "" && *provider == "" {
+		exitErrorf("--provider is required when using --name")
 	}
 	ctx := context.Background()
 	db, err := store.Open(ctx, *dataDir)
@@ -309,19 +336,33 @@ func runAuthTest(args []string) {
 		exitError(err)
 	}
 	defer db.Close()
-	account, err := resolveAccountForTest(ctx, db, fs, *name)
+	account, err := resolveAccount(ctx, db, fs, *provider, *name)
 	if err != nil {
 		exitError(err)
 	}
-	result, err := testStoredAccount(ctx, db, account, *model, *baseURL)
+	result, err := testStoredAccountWithUsage(ctx, db, account, *model, *baseURL, *usageURL)
 	if err != nil {
 		exitError(err)
 	}
 	printTestResult(result)
 }
 
+func resolveAccount(ctx context.Context, db *store.DB, fs *flag.FlagSet, provider, name string) (store.Account, error) {
+	if name != "" {
+		return db.GetAccountByProviderAndName(ctx, provider, name)
+	}
+	return db.GetAccount(ctx, fs.Arg(0))
+}
+
 func resolveAccountForTest(ctx context.Context, db *store.DB, fs *flag.FlagSet, name string) (store.Account, error) {
 	if name != "" {
+		provider := ""
+		if found := fs.Lookup("provider"); found != nil {
+			provider = found.Value.String()
+		}
+		if provider != "" {
+			return db.GetAccountByProviderAndName(ctx, provider, name)
+		}
 		return db.GetAccountByName(ctx, name)
 	}
 	return db.GetAccount(ctx, fs.Arg(0))
@@ -336,26 +377,20 @@ type providerTestResult struct {
 }
 
 func testStoredAccount(ctx context.Context, db *store.DB, account store.Account, model, baseURL string) (providerTestResult, error) {
-	client := codex.NewClient(baseURL, codex.NewTokenManager(db, codex.OAuthRefresher{}))
-	body := mustJSONBytes(map[string]any{
-		"model":  model,
-		"input":  "ping",
-		"stream": false,
-	})
-	result, err := client.ExecuteResponses(ctx, codex.ExecuteParams{Account: account, Body: body})
+	return testStoredAccountWithUsage(ctx, db, account, model, baseURL, anthropic.DefaultUsageURL)
+}
+
+func testStoredAccountWithUsage(ctx context.Context, db *store.DB, account store.Account, model, baseURL, usageURL string) (providerTestResult, error) {
+	result, err := (app.ProviderService{DB: db, BaseURL: baseURL, AnthropicUsageURL: usageURL}).Test(ctx, account, model)
 	if err != nil {
 		return providerTestResult{}, err
 	}
-	output := string(result.Body)
-	if strings.Contains(result.Header.Get("Content-Type"), "text/event-stream") {
-		output = codex.ConvertResponsesSSEToOutput(result.Body)
-	}
 	return providerTestResult{
-		AccountID: account.ID,
-		Name:      account.Name,
+		AccountID: result.AccountID,
+		Name:      result.Name,
 		Status:    result.Status,
-		OK:        result.Status >= 200 && result.Status < 300,
-		Output:    output,
+		OK:        result.OK,
+		Output:    result.Output,
 	}, nil
 }
 
@@ -554,8 +589,21 @@ func runCodex(args []string) {
 	usage()
 }
 
+func runClaude(args []string) {
+	if len(args) >= 1 && args[0] == "print-config" {
+		fs := flag.NewFlagSet("claude print-config", flag.ExitOnError)
+		model := fs.String("model", "", "")
+		port := fs.Int("port", 19090, "")
+		apiKey := fs.String("api-key", "sk-lm-router-REPLACE_ME", "")
+		fs.Parse(args[1:])
+		fmt.Print(app.ClaudeConfigText(*port, *apiKey, *model))
+		return
+	}
+	usage()
+}
+
 func usage() {
-	fmt.Println("usage: lm-router <serve|tui|auth|keys|codex|version>")
+	fmt.Println("usage: lm-router <serve|tui|auth|keys|codex|claude|version>")
 }
 
 func versionText(version, commit, buildDate string) string {

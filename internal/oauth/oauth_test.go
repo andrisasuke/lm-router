@@ -1,7 +1,11 @@
 package oauth
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -68,6 +72,79 @@ func TestIsUnrecoverableRefreshError(t *testing.T) {
 	}
 	if IsUnrecoverableRefreshError(errors.New(`{"error":"server_error"}`)) {
 		t.Fatal("did not expect server_error to be unrecoverable")
+	}
+}
+
+func TestAnthropicAuthURLAndCallbackFormats(t *testing.T) {
+	flow := NewAnthropicFlow(Config{RedirectURI: "https://console.anthropic.com/oauth/code/callback", State: "state123", CodeChallenge: "challenge456"})
+	u, err := url.Parse(flow.AuthURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := u.Query()
+	assertEqual(t, u.Scheme+"://"+u.Host+u.Path, AnthropicAuthorizeURL)
+	assertEqual(t, q.Get("client_id"), AnthropicClientID)
+	assertEqual(t, q.Get("scope"), AnthropicScope)
+	assertEqual(t, q.Get("code"), "true")
+	assertEqual(t, q.Get("code_challenge_method"), "S256")
+	assertEqual(t, q.Get("state"), "state123")
+
+	for _, raw := range []string{
+		"auth-code#state123",
+		"https://console.anthropic.com/oauth/code/callback?code=auth-code&state=state123",
+	} {
+		code, err := ParseAnthropicCallback(raw, "state123")
+		if err != nil || code != "auth-code" {
+			t.Fatalf("parse %q got=%q err=%v", raw, code, err)
+		}
+	}
+	if _, err := ParseAnthropicCallback("auth-code#wrong", "state123"); err == nil {
+		t.Fatal("expected state mismatch")
+	}
+}
+
+func TestAnthropicTokenRequestUsesJSONAndReadsRotatedRefreshToken(t *testing.T) {
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("content type=%q", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "new-access", "refresh_token": "rotated-refresh", "expires_in": 7200, "scope": AnthropicScope,
+		})
+	}))
+	defer server.Close()
+
+	tokens, err := DoAnthropicTokenRequest(context.Background(), server.Client(), server.URL, map[string]any{
+		"grant_type": "refresh_token", "refresh_token": "old-refresh", "client_id": AnthropicClientID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if captured["grant_type"] != "refresh_token" || captured["client_id"] != AnthropicClientID {
+		t.Fatalf("payload=%v", captured)
+	}
+	if tokens.RefreshToken != "rotated-refresh" || tokens.ExpiresIn != 7200 || tokens.Scope != AnthropicScope {
+		t.Fatalf("tokens=%+v", tokens)
+	}
+}
+
+func TestAnthropicExchangeAndRefreshPayloads(t *testing.T) {
+	exchange := AnthropicExchangePayload("code", "state", "verifier", "https://callback")
+	for key, want := range map[string]string{
+		"code": "code", "state": "state", "code_verifier": "verifier", "redirect_uri": "https://callback",
+		"grant_type": "authorization_code", "client_id": AnthropicClientID,
+	} {
+		if got := exchange[key]; got != want {
+			t.Fatalf("exchange[%s]=%v want %s", key, got, want)
+		}
+	}
+	refresh := AnthropicRefreshPayload("refresh")
+	if refresh["grant_type"] != "refresh_token" || refresh["refresh_token"] != "refresh" || refresh["client_id"] != AnthropicClientID {
+		t.Fatalf("refresh=%v", refresh)
 	}
 }
 

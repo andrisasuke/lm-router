@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/andrisasuke/lm-router/internal/anthropic"
 	"github.com/andrisasuke/lm-router/internal/app"
 	"github.com/andrisasuke/lm-router/internal/codex"
 	"github.com/andrisasuke/lm-router/internal/store"
@@ -30,6 +31,9 @@ const (
 	screenSettings
 	screenLogs
 	screenCodexConfig
+	screenProviderTypes
+	screenClaudeRisk
+	screenClaudeConfig
 )
 
 type addProviderField int
@@ -54,6 +58,8 @@ type Model struct {
 	statusSeq  int
 
 	accounts          []store.Account
+	selectedProvider  string
+	providerLoadSeq   uint64
 	keys              []store.APIKey
 	selectedAccount   int
 	authSession       app.AuthSession
@@ -69,8 +75,11 @@ type Model struct {
 	settingEditing    bool
 	settingSelected   int
 	logFilter         string
+	riskForReauth     bool
 
 	providerQuota        *codex.QuotaInfo
+	claudeQuota          *anthropic.UsageInfo
+	claudeQuotaRetryAt   map[string]time.Time
 	providerQuotaErr     error
 	providerQuotaLoading bool
 }
@@ -94,18 +103,19 @@ func NewWithDataDir(ctx context.Context, db *store.DB, logger *app.RingLogger, s
 	settingInput := textinput.New()
 	settingInput.Width = 40
 	return Model{
-		ctx:               ctx,
-		db:                db,
-		logger:            logger,
-		server:            server,
-		settings:          settings,
-		screen:            screenHome,
-		dataDir:           dataDir,
-		providerNameInput: nameInput,
-		callbackInput:     cb,
-		aliasInput:        aliasInput,
-		settingInput:      settingInput,
-		logFilter:         "all",
+		ctx:                ctx,
+		db:                 db,
+		logger:             logger,
+		server:             server,
+		settings:           settings,
+		screen:             screenHome,
+		dataDir:            dataDir,
+		providerNameInput:  nameInput,
+		callbackInput:      cb,
+		aliasInput:         aliasInput,
+		settingInput:       settingInput,
+		logFilter:          "all",
+		claudeQuotaRetryAt: make(map[string]time.Time),
 	}
 }
 
@@ -139,7 +149,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC:
 			return m, tea.Quit
 		case tea.KeyEsc, tea.KeyBackspace:
-			return m.back(), nil
+			return m.navigateBack()
 		case tea.KeyShiftUp:
 			if m.screen == screenProviders {
 				return m.reorderSelectedProvider(-1)
@@ -169,6 +179,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.accounts = append(m.accounts, msg.account)
 		m.statusLine = fmt.Sprintf("Success: provider %q saved", msg.account.Name)
 		m.screen = screenProviders
+		if len(m.stack) > 0 && m.stack[len(m.stack)-1] == screenProviders {
+			m.stack = m.stack[:len(m.stack)-1]
+		}
 		m.selected = 0
 	case reauthDoneMsg:
 		if msg.err != nil {
@@ -194,12 +207,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.providerQuotaLoading = false
 		if msg.err != nil {
 			m.providerQuotaErr = msg.err
+		} else if msg.claude != nil {
+			q := *msg.claude
+			m.claudeQuota = &q
+			if !q.RetryAt.IsZero() && msg.accountID != "" {
+				if m.claudeQuotaRetryAt == nil {
+					m.claudeQuotaRetryAt = make(map[string]time.Time)
+				}
+				m.claudeQuotaRetryAt[msg.accountID] = q.RetryAt
+			} else if msg.accountID != "" {
+				delete(m.claudeQuotaRetryAt, msg.accountID)
+			}
+			m.providerQuota = nil
+			m.providerQuotaErr = nil
 		} else {
 			q := msg.info
 			m.providerQuota = &q
+			m.claudeQuota = nil
 			m.providerQuotaErr = nil
 		}
 	case loadProvidersMsg:
+		if msg.seq != m.providerLoadSeq || msg.provider != m.selectedProvider {
+			break
+		}
 		if msg.err != nil {
 			m.statusLine = "Error: " + msg.err.Error()
 		} else {
@@ -239,6 +269,10 @@ func (m Model) View() string {
 		b.WriteString(m.viewHome())
 	case screenProviders:
 		b.WriteString(m.viewProviders())
+	case screenProviderTypes:
+		b.WriteString(m.viewProviderTypes())
+	case screenClaudeRisk:
+		b.WriteString(m.viewClaudeRisk())
 	case screenAddProvider:
 		b.WriteString(m.viewAddProvider())
 	case screenReauthProvider:
@@ -255,6 +289,8 @@ func (m Model) View() string {
 		b.WriteString(m.viewLogs())
 	case screenCodexConfig:
 		b.WriteString(m.viewCodexConfig())
+	case screenClaudeConfig:
+		b.WriteString(m.viewClaudeConfig())
 	}
 	if m.statusLine != "" {
 		b.WriteString("\n\n")
@@ -332,7 +368,7 @@ func (m Model) validateAliasName(name, currentID string) error {
 		if currentID != "" && account.ID == currentID {
 			continue
 		}
-		if strings.EqualFold(account.Name, name) {
+		if account.Provider == m.selectedProvider && strings.EqualFold(account.Name, name) {
 			return fmt.Errorf("connection alias %q already exists", name)
 		}
 	}
@@ -391,6 +427,10 @@ func (m Model) activate() (tea.Model, tea.Cmd) {
 		return m.activateHome()
 	case screenProviders:
 		return m.activateProviders()
+	case screenProviderTypes:
+		return m.activateProviderTypes()
+	case screenClaudeRisk:
+		return m.activateClaudeRisk()
 	case screenProviderDetail:
 		return m.activateProviderDetail()
 	case screenKeys:
@@ -410,6 +450,8 @@ func (m Model) activate() (tea.Model, tea.Cmd) {
 		m.logger.Clear()
 	case screenCodexConfig:
 		return m.back(), nil
+	case screenClaudeConfig:
+		return m.back(), nil
 	}
 	return m, nil
 }
@@ -417,8 +459,7 @@ func (m Model) activate() (tea.Model, tea.Cmd) {
 func (m Model) activateHome() (tea.Model, tea.Cmd) {
 	switch m.selected {
 	case 0:
-		m.push(screenProviders)
-		return m, m.loadProvidersCmd()
+		m.push(screenProviderTypes)
 	case 1:
 		m.push(screenKeys)
 		return m, m.loadKeysCmd()
@@ -431,34 +472,80 @@ func (m Model) activateHome() (tea.Model, tea.Cmd) {
 	case 5:
 		m.push(screenCodexConfig)
 	case 6:
+		m.push(screenClaudeConfig)
+	case 7:
 		return m, tea.Quit
 	}
 	return m, nil
 }
 
-func (m Model) activateProviders() (tea.Model, tea.Cmd) {
+func (m Model) activateProviderTypes() (tea.Model, tea.Cmd) {
+	if m.selected == 0 {
+		return m.navigateBack()
+	}
+	if m.selected == 1 {
+		m.selectedProvider = store.ProviderOpenAICodex
+	} else {
+		m.selectedProvider = store.ProviderAnthropicClaude
+	}
+	m.accounts = nil
+	m.selectedAccount = -1
+	m.providerLoadSeq++
+	m.push(screenProviders)
+	return m, m.loadProvidersCmd()
+}
+
+func (m Model) activateClaudeRisk() (tea.Model, tea.Cmd) {
 	if m.selected == 0 {
 		return m.back(), nil
 	}
+	reauth := m.riskForReauth
+	m = m.back()
+	return m.beginProviderAuth(reauth)
+}
+
+func (m Model) activateProviders() (tea.Model, tea.Cmd) {
+	if m.selected == 0 {
+		return m.navigateBack()
+	}
 	if m.selected == 1 {
-		service := app.ProviderService{DB: m.db}
-		m.authSession = service.NewAuthSession("http://localhost:1455/auth/callback")
-		m.authURLPath, m.authURLWriteErr = m.writeAuthURL()
-		m.providerNameInput.SetValue("")
-		m.callbackInput.SetValue("")
-		m.focusAddProviderField(addProviderNameField)
-		m.push(screenAddProvider)
-		return m, textinput.Blink
+		if m.selectedProvider == store.ProviderAnthropicClaude {
+			m.riskForReauth = false
+			m.push(screenClaudeRisk)
+			return m, nil
+		}
+		return m.beginProviderAuth(false)
 	}
 	idx := m.selected - 2
 	if idx >= 0 && idx < len(m.accounts) {
 		m.selectedAccount = idx
 		m.providerQuota = nil
+		m.claudeQuota = nil
 		m.providerQuotaErr = nil
 		m.providerQuotaLoading = false
 		m.push(screenProviderDetail)
 	}
 	return m, nil
+}
+
+func (m Model) beginProviderAuth(reauth bool) (tea.Model, tea.Cmd) {
+	service := app.ProviderService{DB: m.db}
+	redirectURI := "http://localhost:1455/auth/callback"
+	if m.selectedProvider == store.ProviderAnthropicClaude {
+		redirectURI = "https://console.anthropic.com/oauth/code/callback"
+	}
+	m.authSession = service.NewAuthSessionForProvider(m.selectedProvider, redirectURI)
+	m.authURLPath, m.authURLWriteErr = m.writeAuthURL()
+	m.callbackInput.SetValue("")
+	if reauth {
+		m.callbackInput.Focus()
+		m.push(screenReauthProvider)
+		return m, textinput.Blink
+	}
+	m.providerNameInput.SetValue("")
+	m.focusAddProviderField(addProviderNameField)
+	m.push(screenAddProvider)
+	return m, textinput.Blink
 }
 
 func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
@@ -483,9 +570,21 @@ func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
 		if m.providerQuotaLoading {
 			return m, nil
 		}
+		if account.Provider == store.ProviderAnthropicClaude {
+			retryAt := m.claudeQuotaRetryAt[account.ID]
+			if retryAt.After(time.Now()) {
+				return m.setTimedStatus("Claude quota check is cooling down until " + retryAt.Local().Format("15:04:05"))
+			}
+		}
 		m.providerQuota = nil
 		m.providerQuotaErr = nil
 		m.providerQuotaLoading = true
+		if account.Provider == store.ProviderAnthropicClaude {
+			return m, func() tea.Msg {
+				info, err := (app.ProviderService{DB: m.db, Logger: m.logger}).ClaudeQuota(m.ctx, account)
+				return providerQuotaDoneMsg{accountID: account.ID, claude: &info, err: err}
+			}
+		}
 		return m, func() tea.Msg {
 			info, err := (app.ProviderService{DB: m.db, Logger: m.logger}).Quota(m.ctx, account)
 			return providerQuotaDoneMsg{info: info, err: err}
@@ -499,13 +598,13 @@ func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
 		m.accounts[m.selectedAccount] = refreshed
 		m.statusLine = "Success: provider refreshed"
 	case 5:
-		service := app.ProviderService{DB: m.db}
-		m.authSession = service.NewAuthSession("http://localhost:1455/auth/callback")
-		m.authURLPath, m.authURLWriteErr = m.writeAuthURL()
-		m.callbackInput.SetValue("")
-		m.callbackInput.Focus()
-		m.push(screenReauthProvider)
-		return m, textinput.Blink
+		m.selectedProvider = account.Provider
+		if account.Provider == store.ProviderAnthropicClaude {
+			m.riskForReauth = true
+			m.push(screenClaudeRisk)
+			return m, nil
+		}
+		return m.beginProviderAuth(true)
 	case 6:
 		err := (app.ProviderService{DB: m.db}).SetEnabled(m.ctx, account.ID, !account.Enabled)
 		if err != nil {
@@ -622,6 +721,26 @@ func (m Model) back() Model {
 	return m
 }
 
+// navigateBack applies provider-pool cleanup consistently for both the
+// explicit Back rows and keyboard navigation. It also invalidates in-flight
+// loads so a delayed result cannot repopulate the next screen with stale rows.
+func (m Model) navigateBack() (tea.Model, tea.Cmd) {
+	leaving := m.screen
+	m = m.back()
+	switch leaving {
+	case screenProviders:
+		m.selectedProvider = ""
+		m.accounts = nil
+		m.selectedAccount = -1
+		m.providerLoadSeq++
+	case screenProviderTypes:
+		m.selectedProvider = ""
+		m.providerLoadSeq++
+		return m, m.loadProvidersCmd()
+	}
+	return m, nil
+}
+
 func (m *Model) move(delta int) {
 	count := m.itemCount()
 	if count == 0 {
@@ -647,12 +766,18 @@ func (m Model) reorderSelectedProvider(delta int) (Model, tea.Cmd) {
 	current.Priority = otherPriority
 	other.Priority = currentPriority
 	if m.db != nil {
-		if err := m.db.SetAccountPriority(m.ctx, current.ID, current.Priority); err != nil {
+		provider := m.selectedProvider
+		if provider == "" {
+			provider = current.Provider
+		}
+		swapped, err := m.db.SwapAccountPrioritiesCAS(m.ctx, provider,
+			current.ID, currentPriority, other.ID, otherPriority)
+		if err != nil {
 			m.statusLine = "Error: " + err.Error()
 			return m, nil
 		}
-		if err := m.db.SetAccountPriority(m.ctx, other.ID, other.Priority); err != nil {
-			m.statusLine = "Error: " + err.Error()
+		if !swapped {
+			m.statusLine = "Error: provider priorities changed; reload and retry"
 			return m, nil
 		}
 	}
@@ -674,9 +799,13 @@ func (m Model) setTimedStatus(message string) (Model, tea.Cmd) {
 func (m Model) itemCount() int {
 	switch m.screen {
 	case screenHome:
-		return 7
+		return 8
+	case screenProviderTypes:
+		return 3
 	case screenProviders:
 		return 2 + len(m.accounts)
+	case screenClaudeRisk:
+		return 2
 	case screenProviderDetail:
 		return 8
 	case screenReauthProvider:
@@ -691,18 +820,28 @@ func (m Model) itemCount() int {
 		return 3
 	case screenCodexConfig:
 		return 1
+	case screenClaudeConfig:
+		return 1
 	default:
 		return 0
 	}
 }
 
 func (m Model) loadProvidersCmd() tea.Cmd {
+	seq := m.providerLoadSeq
+	provider := m.selectedProvider
 	return func() tea.Msg {
 		if m.db == nil {
-			return loadProvidersMsg{}
+			return loadProvidersMsg{provider: provider, seq: seq}
 		}
-		accounts, err := (app.ProviderService{DB: m.db}).List(m.ctx)
-		return loadProvidersMsg{accounts: accounts, err: err}
+		var accounts []store.Account
+		var err error
+		if provider == "" {
+			accounts, err = (app.ProviderService{DB: m.db}).List(m.ctx)
+		} else {
+			accounts, err = (app.ProviderService{DB: m.db}).ListProvider(m.ctx, provider)
+		}
+		return loadProvidersMsg{provider: provider, seq: seq, accounts: accounts, err: err}
 	}
 }
 
@@ -787,10 +926,14 @@ func (m Model) activeProviderCount() int {
 
 func (m Model) title() string {
 	switch m.screen {
+	case screenProviderTypes:
+		return "Providers"
 	case screenProviders:
-		return "OpenAI Codex (OAUTH)"
+		return providerTitle(m.selectedProvider) + " (OAUTH)"
 	case screenAddProvider:
-		return "Add OpenAI Codex"
+		return "Add " + providerTitle(m.selectedProvider)
+	case screenClaudeRisk:
+		return "Anthropic Claude Risk Warning"
 	case screenReauthProvider:
 		if m.selectedAccount >= 0 && m.selectedAccount < len(m.accounts) {
 			return "Re-authenticate " + providerDisplayName(m.accounts[m.selectedAccount])
@@ -811,6 +954,8 @@ func (m Model) title() string {
 		return "Logs"
 	case screenCodexConfig:
 		return "Codex Config"
+	case screenClaudeConfig:
+		return "Claude Config"
 	default:
 		return "LM Router Terminal UI"
 	}
@@ -820,10 +965,14 @@ func (m Model) breadcrumb() string {
 	switch m.screen {
 	case screenHome:
 		return "LM Router"
-	case screenProviders:
+	case screenProviderTypes:
 		return "LM Router > Providers"
+	case screenProviders:
+		return "LM Router > Providers > " + providerTitle(m.selectedProvider)
 	case screenAddProvider:
-		return "LM Router > Providers > Add"
+		return "LM Router > Providers > " + providerTitle(m.selectedProvider) + " > Add"
+	case screenClaudeRisk:
+		return "LM Router > Providers > Anthropic Claude > Risk"
 	case screenReauthProvider:
 		return "LM Router > Providers > Connection > Re-authenticate"
 	case screenProviderDetail:
@@ -838,6 +987,8 @@ func (m Model) breadcrumb() string {
 		return "LM Router > Logs"
 	case screenCodexConfig:
 		return "LM Router > Codex Config"
+	case screenClaudeConfig:
+		return "LM Router > Claude Config"
 	default:
 		return "LM Router"
 	}
@@ -856,15 +1007,19 @@ func (m Model) viewHome() string {
 		"Key:      " + m.currentAPIKeyPrefix(),
 		"",
 	}
-	lines = append(lines, renderMenu(m.selected, []string{"Providers", "API Keys", "Server", "Settings", "Logs", "Codex Config", "Quit"})...)
+	lines = append(lines, renderMenu(m.selected, []string{"Providers", "API Keys", "Server", "Settings", "Logs", "Codex Config", "Claude Config", "Quit"})...)
 	return strings.Join(lines, "\n")
+}
+
+func (m Model) viewProviderTypes() string {
+	return strings.Join(renderMenu(m.selected, []string{"<- Back", "OpenAI Codex", "Anthropic Claude"}), "\n")
 }
 
 func (m Model) viewProviders() string {
 	lines := []string{
-		"Provider: OpenAI Codex",
-		"Default model: " + m.settings.DefaultModel,
-		"Model routing: pass-through",
+		"Provider: " + providerTitle(m.selectedProvider),
+		"Default model: " + providerDefaultModel(m.selectedProvider, m.settings.DefaultModel),
+		"Model routing: " + providerRouting(m.selectedProvider),
 		"Reorder: Shift+Up / Shift+Down",
 		"",
 	}
@@ -874,6 +1029,43 @@ func (m Model) viewProviders() string {
 	}
 	lines = append(lines, renderMenu(m.selected, items)...)
 	return strings.Join(lines, "\n")
+}
+
+func (m Model) viewClaudeRisk() string {
+	lines := []string{
+		"Claude subscriptions and the Anthropic API are separate products.",
+		"Using Claude subscription OAuth through a router is not an officially",
+		"licensed Anthropic API flow and may put the connected account at risk.",
+		"Automatic fallback combines capacity across subscriptions and may be",
+		"treated as bypassing limits; it cannot prevent provider restrictions.",
+		"",
+	}
+	lines = append(lines, renderMenu(m.selected, []string{"Cancel", "I understand, continue"})...)
+	return strings.Join(lines, "\n")
+}
+
+func providerTitle(provider string) string {
+	if provider == store.ProviderAnthropicClaude {
+		return "Anthropic Claude"
+	}
+	return "OpenAI Codex"
+}
+
+func providerRouting(provider string) string {
+	if provider == store.ProviderAnthropicClaude {
+		return "claude* via native Messages API"
+	}
+	return "gpt* via Codex Responses"
+}
+
+func providerDefaultModel(provider, configured string) string {
+	if provider == store.ProviderAnthropicClaude {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(configured)), "claude") {
+			return configured
+		}
+		return app.DefaultClaudeModel
+	}
+	return configured
 }
 
 func (m Model) viewAddProvider() string {
@@ -887,12 +1079,16 @@ func (m Model) viewAddProvider() string {
 	if m.authURLWriteErr != nil {
 		lines = append(lines, "Could not save URL file: "+m.authURLWriteErr.Error())
 	}
+	callbackPrompt := "Paste callback URL:"
+	if m.authSession.Provider == store.ProviderAnthropicClaude {
+		callbackPrompt = "Paste callback URL or code#state:"
+	}
 	lines = append(lines,
 		"",
 		"Complete authorization in browser.",
 		"Connection name:",
 		m.providerNameInput.View(),
-		"Paste callback URL:",
+		callbackPrompt,
 		m.callbackInput.View(),
 	)
 	return strings.Join(lines, "\n")
@@ -915,10 +1111,14 @@ func (m Model) viewReauthProvider() string {
 			"Existing alias and priority will be preserved.",
 		)
 	}
+	callbackPrompt := "Paste callback URL:"
+	if m.authSession.Provider == store.ProviderAnthropicClaude {
+		callbackPrompt = "Paste callback URL or code#state:"
+	}
 	lines = append(lines,
 		"",
 		"Complete authorization in browser.",
-		"Paste callback URL:",
+		callbackPrompt,
 		m.callbackInput.View(),
 		"",
 		"Press Esc to cancel.",
@@ -959,7 +1159,11 @@ func (m Model) writeAuthURL() (string, error) {
 	if err := os.MkdirAll(m.dataDir, 0o700); err != nil {
 		return "", err
 	}
-	path := filepath.Join(m.dataDir, "openai-codex-auth-url.txt")
+	filename := "openai-codex-auth-url.txt"
+	if m.authSession.Provider == store.ProviderAnthropicClaude {
+		filename = "anthropic-claude-auth-url.txt"
+	}
+	path := filepath.Join(m.dataDir, filename)
 	return path, os.WriteFile(path, []byte(m.authSession.AuthURL+"\n"), 0o600)
 }
 
@@ -998,6 +1202,24 @@ func (m Model) viewProviderDetail() string {
 		lines = append(lines, "Quota:      loading...")
 	case m.providerQuotaErr != nil:
 		lines = append(lines, "Quota:      error: "+app.HumanError(m.providerQuotaErr.Error()))
+	case m.claudeQuota != nil:
+		if !m.claudeQuota.Available {
+			lines = append(lines, "Quota:      connected; temporarily unavailable")
+		} else if len(m.claudeQuota.Windows) == 0 {
+			lines = append(lines, "Quota:      no usage windows returned")
+		} else {
+			for i, window := range m.claudeQuota.Windows {
+				prefix := "            "
+				if i == 0 {
+					prefix = "Quota:      "
+				}
+				reset := ""
+				if !window.ResetsAt.IsZero() {
+					reset = " — resets " + window.ResetsAt.Local().Format("2 Jan 15:04")
+				}
+				lines = append(lines, fmt.Sprintf("%s%s (%.0f%%)%s", prefix, window.Name, window.Utilization, reset))
+			}
+		}
 	case m.providerQuota != nil:
 		if m.providerQuota.Primary == nil && m.providerQuota.Secondary == nil {
 			lines = append(lines, "Quota:      no data (no x-codex-*-used-percent header)")
@@ -1133,6 +1355,18 @@ func (m Model) viewCodexConfig() string {
 	return app.CodexConfigText(m.settings.Port, key, m.settings.DefaultModel) + "\n" + strings.Join(renderMenu(m.selected, []string{"<- Back"}), "\n")
 }
 
+func (m Model) viewClaudeConfig() string {
+	key := "sk-lm-router-REPLACE_ME"
+	if len(m.keys) > 0 {
+		key = m.keys[0].Prefix + "-REPLACE_WITH_FULL_SECRET"
+	}
+	model := app.DefaultClaudeModel
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(m.settings.DefaultModel)), "claude") {
+		model = m.settings.DefaultModel
+	}
+	return app.ClaudeConfigText(m.settings.Port, key, model) + "\n" + strings.Join(renderMenu(m.selected, []string{"<- Back"}), "\n")
+}
+
 func renderMenu(selected int, items []string) []string {
 	out := make([]string, 0, len(items))
 	for i, item := range items {
@@ -1175,6 +1409,8 @@ type providerTestDoneMsg struct {
 }
 
 type loadProvidersMsg struct {
+	provider string
+	seq      uint64
 	accounts []store.Account
 	err      error
 }
@@ -1198,8 +1434,10 @@ type clearStatusMsg struct {
 }
 
 type providerQuotaDoneMsg struct {
-	info codex.QuotaInfo
-	err  error
+	accountID string
+	info      codex.QuotaInfo
+	claude    *anthropic.UsageInfo
+	err       error
 }
 
 type reauthDoneMsg struct {
