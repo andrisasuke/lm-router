@@ -26,10 +26,12 @@ func (f RefreshFunc) Refresh(ctx context.Context, refreshToken string) (TokenSet
 }
 
 type TokenManager struct {
-	db        *store.DB
-	refresher Refresher
-	mu        sync.Mutex
-	locks     map[string]*sync.Mutex
+	db          *store.DB
+	refresher   Refresher
+	refreshers  map[string]Refresher
+	refreshLead map[string]time.Duration
+	mu          sync.Mutex
+	locks       map[string]*sync.Mutex
 }
 
 func NewTokenManager(db *store.DB, refresher Refresher) *TokenManager {
@@ -40,21 +42,31 @@ func NewTokenManager(db *store.DB, refresher Refresher) *TokenManager {
 	}
 }
 
+// NewProviderTokenManager dispatches refreshes by the account's canonical
+// provider ID. It keeps the existing per-account lock semantics while allowing
+// each provider to define its own proactive refresh window.
+func NewProviderTokenManager(db *store.DB, refreshers map[string]Refresher, refreshLead map[string]time.Duration) *TokenManager {
+	return &TokenManager{
+		db:          db,
+		refreshers:  refreshers,
+		refreshLead: refreshLead,
+		locks:       make(map[string]*sync.Mutex),
+	}
+}
+
 func (m *TokenManager) EnsureFresh(ctx context.Context, accountID string) (store.Account, error) {
 	account, err := m.db.MustGetAccount(ctx, accountID)
 	if err != nil {
 		return store.Account{}, err
 	}
-	if !needsRefresh(account) || m.refresher == nil {
+	refresher := m.refresherFor(account.Provider)
+	if !needsRefresh(account, m.leadFor(account.Provider)) || refresher == nil {
 		return account, nil
 	}
 	return m.refreshLocked(ctx, accountID, false)
 }
 
 func (m *TokenManager) RefreshNow(ctx context.Context, accountID string) (store.Account, error) {
-	if m.refresher == nil {
-		return m.db.MustGetAccount(ctx, accountID)
-	}
 	return m.refreshLocked(ctx, accountID, true)
 }
 
@@ -67,11 +79,15 @@ func (m *TokenManager) refreshLocked(ctx context.Context, accountID string, forc
 	if err != nil {
 		return store.Account{}, err
 	}
-	if !force && !needsRefresh(account) {
+	refresher := m.refresherFor(account.Provider)
+	if refresher == nil {
+		return account, nil
+	}
+	if !force && !needsRefresh(account, m.leadFor(account.Provider)) {
 		return account, nil
 	}
 
-	tokenSet, err := m.refresher.Refresh(ctx, account.RefreshToken)
+	tokenSet, err := refresher.Refresh(ctx, account.RefreshToken)
 	if err != nil {
 		if err == ErrNeedsReauth || oauth.IsUnrecoverableRefreshError(err) {
 			_ = m.db.MarkNeedsReauth(ctx, account.ID)
@@ -91,11 +107,34 @@ func (m *TokenManager) MarkNeedsReauth(ctx context.Context, accountID string) er
 	return m.db.MarkNeedsReauth(ctx, accountID)
 }
 
-func needsRefresh(account store.Account) bool {
+func (m *TokenManager) SetCooldown(ctx context.Context, accountID string, until time.Time) error {
+	return m.db.SetCooldown(ctx, accountID, until)
+}
+
+func needsRefresh(account store.Account, lead time.Duration) bool {
 	if account.ExpiresAt.IsZero() {
 		return false
 	}
-	return time.Until(account.ExpiresAt) < 5*time.Minute
+	if lead <= 0 {
+		lead = 5 * time.Minute
+	}
+	return time.Until(account.ExpiresAt) < lead
+}
+
+func (m *TokenManager) refresherFor(provider string) Refresher {
+	if m.refreshers != nil {
+		if refresher := m.refreshers[provider]; refresher != nil {
+			return refresher
+		}
+	}
+	return m.refresher
+}
+
+func (m *TokenManager) leadFor(provider string) time.Duration {
+	if lead := m.refreshLead[provider]; lead > 0 {
+		return lead
+	}
+	return 5 * time.Minute
 }
 
 func (m *TokenManager) accountLock(id string) *sync.Mutex {

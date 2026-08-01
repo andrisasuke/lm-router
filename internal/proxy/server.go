@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/andrisasuke/lm-router/internal/anthropic"
 	"github.com/andrisasuke/lm-router/internal/codex"
 	"github.com/andrisasuke/lm-router/internal/store"
 )
@@ -28,6 +29,7 @@ func newThinkingSignature() string {
 type ServerConfig struct {
 	Store       *store.DB
 	Codex       *codex.Client
+	Anthropic   *anthropic.Client
 	RequireKey  bool
 	Logger      Logger
 	LogRequests bool
@@ -46,6 +48,7 @@ func (stdLogger) Printf(format string, args ...any) {
 type Server struct {
 	store      *store.DB
 	codex      *codex.Client
+	anthropic  *anthropic.Client
 	requireKey bool
 }
 
@@ -53,6 +56,7 @@ func New(cfg ServerConfig) http.Handler {
 	s := &Server{
 		store:      cfg.Store,
 		codex:      cfg.Codex,
+		anthropic:  cfg.Anthropic,
 		requireKey: cfg.RequireKey,
 	}
 	mux := http.NewServeMux()
@@ -146,6 +150,15 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 			{"id": "gpt-5.3-codex", "object": "model", "owned_by": "openai"},
 			{"id": "gpt-5.3-codex-high", "object": "model", "owned_by": "openai"},
 			{"id": "gpt-5.2-codex", "object": "model", "owned_by": "openai"},
+			{"id": "claude-fable-5", "object": "model", "owned_by": "anthropic"},
+			{"id": "claude-sonnet-5", "object": "model", "owned_by": "anthropic"},
+			{"id": "claude-opus-4-8", "object": "model", "owned_by": "anthropic"},
+			{"id": "claude-opus-4-7", "object": "model", "owned_by": "anthropic"},
+			{"id": "claude-opus-4-6", "object": "model", "owned_by": "anthropic"},
+			{"id": "claude-sonnet-4-6", "object": "model", "owned_by": "anthropic"},
+			{"id": "claude-opus-4-5-20251101", "object": "model", "owned_by": "anthropic"},
+			{"id": "claude-sonnet-4-5-20250929", "object": "model", "owned_by": "anthropic"},
+			{"id": "claude-haiku-4-5-20251001", "object": "model", "owned_by": "anthropic"},
 		},
 	})
 }
@@ -167,6 +180,15 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	var reqBody map[string]any
 	if err := json.Unmarshal(body, &reqBody); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	provider, _, err := providerForModel(reqBody["model"])
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	if provider != store.ProviderOpenAICodex {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "claude models are only supported through /v1/messages")
 		return
 	}
 	if stream, _ := reqBody["stream"].(bool); stream {
@@ -207,6 +229,15 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var body map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	provider, _, err := providerForModel(body["model"])
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	if provider != store.ProviderOpenAICodex {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "claude models are only supported through /v1/messages")
 		return
 	}
 	responsesBody := map[string]any{
@@ -1706,6 +1737,41 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("[anthropic-api] inbound /v1/messages %s", summarizeInboundBody(body))
+	model, err := anthropic.ModelFromBody(body)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	provider, _, err := providerForModel(model)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	if provider == store.ProviderAnthropicClaude {
+		var envelope struct {
+			Stream bool `json:"stream"`
+		}
+		_ = json.Unmarshal(body, &envelope)
+		if envelope.Stream {
+			s.streamNativeAnthropic(w, r, body)
+			return
+		}
+		result, err := s.routeAnthropic(r.Context(), body, r.Header, false)
+		if err != nil {
+			if result.Status > 0 && result.Header != nil {
+				copyAnthropicResponseHeaders(w.Header(), result.Header)
+				w.WriteHeader(result.Status)
+				_, _ = w.Write(result.Body)
+				return
+			}
+			writeAnthropicError(w, statusOrDefault(result.Status, http.StatusBadGateway), "api_error", err.Error())
+			return
+		}
+		copyAnthropicResponseHeaders(w.Header(), result.Header)
+		w.WriteHeader(result.Status)
+		_, _ = w.Write(result.Body)
+		return
+	}
 	responsesBody, model, stream, err := anthropicMessagesToResponsesBody(body)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
@@ -1738,6 +1804,33 @@ func (s *Server) countAnthropicTokens(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
 		return
 	}
+	model, err := anthropic.ModelFromBody(body)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	provider, _, err := providerForModel(model)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	if provider == store.ProviderAnthropicClaude {
+		result, err := s.routeAnthropic(r.Context(), body, r.Header, true)
+		if err != nil {
+			if result.Status > 0 && result.Header != nil {
+				copyAnthropicResponseHeaders(w.Header(), result.Header)
+				w.WriteHeader(result.Status)
+				_, _ = w.Write(result.Body)
+				return
+			}
+			writeAnthropicError(w, statusOrDefault(result.Status, http.StatusBadGateway), "api_error", err.Error())
+			return
+		}
+		copyAnthropicResponseHeaders(w.Header(), result.Header)
+		w.WriteHeader(result.Status)
+		_, _ = w.Write(result.Body)
+		return
+	}
 	tokens := estimateAnthropicTokens(body)
 	writeJSON(w, http.StatusOK, map[string]int{"input_tokens": tokens})
 }
@@ -1749,6 +1842,209 @@ func estimateAnthropicTokens(body []byte) int {
 		return 1
 	}
 	return n
+}
+
+func providerForModel(raw any) (string, string, error) {
+	model, ok := raw.(string)
+	if !ok || strings.TrimSpace(model) == "" {
+		return "", "", errors.New("model is required")
+	}
+	model = strings.TrimSpace(model)
+	lower := strings.ToLower(model)
+	switch {
+	case strings.HasPrefix(lower, "gpt"):
+		return store.ProviderOpenAICodex, model, nil
+	case strings.HasPrefix(lower, "claude"):
+		return store.ProviderAnthropicClaude, model, nil
+	default:
+		return "", model, fmt.Errorf("unsupported model/provider for model %q", model)
+	}
+}
+
+func (s *Server) routeAnthropic(ctx context.Context, body []byte, header http.Header, countTokens bool) (anthropic.ExecuteResult, error) {
+	if s.anthropic == nil {
+		return anthropic.ExecuteResult{Status: http.StatusBadGateway}, errors.New("anthropic upstream is not configured")
+	}
+	accounts, err := s.store.ListRoutableAccounts(ctx, store.ProviderAnthropicClaude)
+	if err != nil {
+		return anthropic.ExecuteResult{Status: http.StatusInternalServerError}, err
+	}
+	if len(accounts) == 0 {
+		return anthropic.ExecuteResult{Status: http.StatusBadGateway}, errors.New("no routable anthropic-claude accounts")
+	}
+	var last anthropic.ExecuteResult
+	var lastErr error
+	var firstTried *store.Account
+	for _, account := range accounts {
+		if !codex.IsAccountAvailable(account) {
+			continue
+		}
+		if firstTried == nil {
+			first := account
+			firstTried = &first
+		}
+		params := anthropic.ExecuteParams{Account: account, Body: body, Header: header}
+		var result anthropic.ExecuteResult
+		if countTokens {
+			result, err = s.anthropic.ExecuteCountTokens(ctx, params)
+		} else {
+			result, err = s.anthropic.ExecuteMessages(ctx, params)
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return result, ctx.Err()
+			}
+			recordAnthropicFailure(ctx, s.store, account, result.CooldownUntil)
+			lastErr = err
+			last = result
+			if last.Status == 0 {
+				last.Status = http.StatusBadGateway
+			}
+			last.Retryable = true
+			continue
+		}
+		last = result
+		if result.Status >= 200 && result.Status < 300 {
+			recordAnthropicSuccess(ctx, s.store, account, firstTried, !countTokens)
+			return result, nil
+		}
+		lastErr = errors.New(string(result.Body))
+		if !result.Retryable {
+			break
+		}
+		recordAnthropicFailure(ctx, s.store, account, result.CooldownUntil)
+	}
+	if lastErr == nil {
+		lastErr = errors.New("all anthropic-claude accounts unavailable")
+	}
+	return last, lastErr
+}
+
+func (s *Server) openAnthropicStream(ctx context.Context, body []byte, header http.Header) (anthropic.StreamResult, error) {
+	if s.anthropic == nil {
+		return anthropic.StreamResult{Status: http.StatusBadGateway}, errors.New("anthropic upstream is not configured")
+	}
+	accounts, err := s.store.ListRoutableAccounts(ctx, store.ProviderAnthropicClaude)
+	if err != nil {
+		return anthropic.StreamResult{Status: http.StatusInternalServerError}, err
+	}
+	if len(accounts) == 0 {
+		return anthropic.StreamResult{Status: http.StatusBadGateway}, errors.New("no routable anthropic-claude accounts")
+	}
+	var lastErr error
+	var lastResult anthropic.StreamResult
+	var firstTried *store.Account
+	for _, account := range accounts {
+		if !codex.IsAccountAvailable(account) {
+			continue
+		}
+		if firstTried == nil {
+			first := account
+			firstTried = &first
+		}
+		result, err := s.anthropic.OpenMessagesStream(ctx, anthropic.ExecuteParams{Account: account, Body: body, Header: header})
+		if err != nil {
+			if ctx.Err() != nil {
+				return result, ctx.Err()
+			}
+			recordAnthropicFailure(ctx, s.store, account, result.CooldownUntil)
+			lastErr = err
+			lastResult = result
+			if lastResult.Status == 0 {
+				lastResult.Status = http.StatusBadGateway
+			}
+			lastResult.Retryable = true
+			continue
+		}
+		if result.Status >= 200 && result.Status < 300 {
+			recordAnthropicSuccess(ctx, s.store, account, firstTried, true)
+			return result, nil
+		}
+		lastResult = result
+		lastErr = errors.New(string(result.ErrorBody))
+		if !result.Retryable {
+			break
+		}
+		recordAnthropicFailure(ctx, s.store, account, result.CooldownUntil)
+	}
+	if lastErr == nil {
+		lastErr = errors.New("all anthropic-claude accounts unavailable")
+	}
+	return lastResult, lastErr
+}
+
+func recordAnthropicFailure(ctx context.Context, db *store.DB, account store.Account, cooldownHint time.Time) {
+	if _, err := db.RecordRetryableFailure(ctx, account.ID, time.Now(), cooldownHint); err != nil {
+		log.Printf("[anthropic-api] persist failure account=%s error=%s", account.ID, err)
+	}
+}
+
+func recordAnthropicSuccess(ctx context.Context, db *store.DB, account store.Account, firstTried *store.Account, promote bool) {
+	if err := db.ResetFailureState(ctx, account.ID); err != nil {
+		log.Printf("[anthropic-api] reset failure account=%s error=%s", account.ID, err)
+	}
+	if !promote || firstTried == nil || firstTried.ID == account.ID {
+		return
+	}
+	if _, err := db.SwapAccountPrioritiesCAS(ctx, store.ProviderAnthropicClaude,
+		firstTried.ID, firstTried.Priority, account.ID, account.Priority); err != nil {
+		log.Printf("[anthropic-api] promote fallback account=%s first=%s error=%s", account.ID, firstTried.ID, err)
+	}
+}
+
+func (s *Server) streamNativeAnthropic(w http.ResponseWriter, r *http.Request, body []byte) {
+	result, err := s.openAnthropicStream(r.Context(), body, r.Header)
+	if err != nil {
+		if result.Status > 0 && result.Header != nil {
+			copyAnthropicResponseHeaders(w.Header(), result.Header)
+			w.WriteHeader(result.Status)
+			_, _ = w.Write(result.ErrorBody)
+			return
+		}
+		writeAnthropicError(w, statusOrDefault(result.Status, http.StatusBadGateway), "api_error", err.Error())
+		return
+	}
+	defer result.Body.Close()
+	copyAnthropicResponseHeaders(w.Header(), result.Header)
+	w.WriteHeader(result.Status)
+	if err := copyStreamWithFlush(w, result.Body); err != nil {
+		log.Printf("[anthropic-api] downstream stream ended error=%s", err)
+	}
+}
+
+func copyStreamWithFlush(w http.ResponseWriter, src io.Reader) error {
+	buffer := make([]byte, 32*1024)
+	for {
+		n, readErr := src.Read(buffer)
+		if n > 0 {
+			if _, err := w.Write(buffer[:n]); err != nil {
+				return err
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
+		}
+	}
+}
+
+func copyAnthropicResponseHeaders(dst, src http.Header) {
+	for key, values := range src {
+		lower := strings.ToLower(key)
+		allowed := lower == "content-type" || lower == "request-id" || lower == "x-request-id" || lower == "retry-after" ||
+			strings.HasPrefix(lower, "anthropic-") || strings.HasPrefix(lower, "x-ratelimit-")
+		if !allowed {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
 }
 
 func summarizeInboundBody(body []byte) string {

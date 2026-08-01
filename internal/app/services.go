@@ -12,21 +12,28 @@ import (
 	"strings"
 	"time"
 
+	"github.com/andrisasuke/lm-router/internal/anthropic"
 	"github.com/andrisasuke/lm-router/internal/codex"
 	"github.com/andrisasuke/lm-router/internal/oauth"
 	"github.com/andrisasuke/lm-router/internal/proxy"
 	"github.com/andrisasuke/lm-router/internal/store"
 )
 
-const DefaultCodexBaseURL = "https://chatgpt.com/backend-api/codex/responses"
+const (
+	DefaultCodexBaseURL = "https://chatgpt.com/backend-api/codex/responses"
+	DefaultClaudeModel  = "claude-opus-4-8"
+)
 
 type ProviderService struct {
-	DB      *store.DB
-	BaseURL string
-	Logger  Logger
+	DB                   *store.DB
+	BaseURL              string
+	AnthropicMessagesURL string
+	AnthropicUsageURL    string
+	Logger               Logger
 }
 
 type AuthSession struct {
+	Provider    string
 	State       string
 	Verifier    string
 	RedirectURI string
@@ -42,49 +49,59 @@ type ProviderTestResult struct {
 }
 
 func (s ProviderService) NewAuthSession(redirectURI string) AuthSession {
-	if redirectURI == "" {
+	return s.NewAuthSessionForProvider(store.ProviderOpenAICodex, redirectURI)
+}
+
+func (s ProviderService) NewAuthSessionForProvider(provider, redirectURI string) AuthSession {
+	provider, err := store.CanonicalProvider(provider)
+	if err != nil {
+		provider = store.ProviderOpenAICodex
+	}
+	if redirectURI == "" && provider == store.ProviderAnthropicClaude {
+		redirectURI = "https://console.anthropic.com/oauth/code/callback"
+	} else if redirectURI == "" {
 		redirectURI = "http://localhost:1455/auth/callback"
 	}
 	state := randomBase64URLString(32)
 	verifier := randomBase64URLString(32)
-	flow := oauth.NewCodexFlow(oauth.Config{
+	cfg := oauth.Config{
 		RedirectURI:   redirectURI,
 		State:         state,
 		CodeChallenge: pkceChallenge(verifier),
-	})
-	return AuthSession{State: state, Verifier: verifier, RedirectURI: redirectURI, AuthURL: flow.AuthURL()}
+	}
+	authURL := oauth.NewCodexFlow(cfg).AuthURL()
+	if provider == store.ProviderAnthropicClaude {
+		authURL = oauth.NewAnthropicFlow(cfg).AuthURL()
+	}
+	return AuthSession{Provider: provider, State: state, Verifier: verifier, RedirectURI: redirectURI, AuthURL: authURL}
 }
 
 func (s ProviderService) AddFromCallback(ctx context.Context, session AuthSession, name, callbackURL string) (store.Account, error) {
+	provider, err := store.CanonicalProvider(session.Provider)
+	if err != nil {
+		return store.Account{}, err
+	}
 	if strings.TrimSpace(name) == "" {
-		name = "openai-codex"
+		name = provider
 	}
-	code, err := oauth.ParseCallbackURL(callbackURL, session.State)
+	tokens, metadata, err := exchangeProviderCallback(ctx, provider, session, callbackURL)
 	if err != nil {
 		return store.Account{}, err
 	}
-	tokens, err := oauth.ExchangeCode(ctx, code, session.Verifier, session.RedirectURI)
-	if err != nil {
-		return store.Account{}, err
-	}
-	meta, err := oauth.DecodeIDToken(tokens.IDToken)
-	if err != nil && tokens.IDToken != "" {
-		return store.Account{}, err
-	}
-	priority, err := s.DB.NextPriority(ctx)
+	priority, err := s.DB.NextPriorityForProvider(ctx, provider)
 	if err != nil {
 		return store.Account{}, err
 	}
 	account := store.Account{
 		ID:           "acct_" + randomHexString(8),
-		Provider:     "openai-codex",
+		Provider:     provider,
 		Name:         name,
 		Priority:     priority,
 		Enabled:      true,
 		AccessToken:  tokens.AccessToken,
 		RefreshToken: tokens.RefreshToken,
 		ExpiresAt:    oauth.ExpiryTime(tokens.ExpiresIn),
-		MetadataJSON: mustJSON(meta),
+		MetadataJSON: mustJSON(metadata),
 	}
 	if err := s.DB.UpsertAccount(ctx, account); err != nil {
 		return store.Account{}, err
@@ -100,16 +117,8 @@ func (s ProviderService) ReAuthFromCallback(ctx context.Context, session AuthSes
 	if err != nil {
 		return store.Account{}, err
 	}
-	code, err := oauth.ParseCallbackURL(callbackURL, session.State)
+	tokens, metadata, err := exchangeProviderCallback(ctx, existing.Provider, session, callbackURL)
 	if err != nil {
-		return store.Account{}, err
-	}
-	tokens, err := oauth.ExchangeCode(ctx, code, session.Verifier, session.RedirectURI)
-	if err != nil {
-		return store.Account{}, err
-	}
-	meta, err := oauth.DecodeIDToken(tokens.IDToken)
-	if err != nil && tokens.IDToken != "" {
 		return store.Account{}, err
 	}
 	updated := existing
@@ -117,7 +126,7 @@ func (s ProviderService) ReAuthFromCallback(ctx context.Context, session AuthSes
 	updated.AccessToken = tokens.AccessToken
 	updated.RefreshToken = tokens.RefreshToken
 	updated.ExpiresAt = oauth.ExpiryTime(tokens.ExpiresIn)
-	if metaJSON := mustJSON(meta); metaJSON != "{}" && metaJSON != "" {
+	if metaJSON := mustJSON(metadata); metaJSON != "{}" && metaJSON != "" {
 		updated.MetadataJSON = metaJSON
 	}
 	if err := s.DB.UpsertAccount(ctx, updated); err != nil {
@@ -128,6 +137,10 @@ func (s ProviderService) ReAuthFromCallback(ctx context.Context, session AuthSes
 
 func (s ProviderService) List(ctx context.Context) ([]store.Account, error) {
 	return s.DB.ListAccounts(ctx)
+}
+
+func (s ProviderService) ListProvider(ctx context.Context, provider string) ([]store.Account, error) {
+	return s.DB.ListAccountsByProvider(ctx, provider)
 }
 
 func (s ProviderService) Delete(ctx context.Context, id string) error {
@@ -147,10 +160,22 @@ func (s ProviderService) SetEnabled(ctx context.Context, id string, enabled bool
 }
 
 func (s ProviderService) Refresh(ctx context.Context, id string) (store.Account, error) {
-	return codex.NewTokenManager(s.DB, codex.OAuthRefresher{}).RefreshNow(ctx, id)
+	return NewProviderTokenManager(s.DB).RefreshNow(ctx, id)
 }
 
 func (s ProviderService) Test(ctx context.Context, account store.Account, model string) (ProviderTestResult, error) {
+	if account.Provider == store.ProviderAnthropicClaude {
+		client := anthropic.NewClient(s.AnthropicMessagesURL, s.AnthropicUsageURL, NewProviderTokenManager(s.DB), s.Logger)
+		info, err := client.FetchUsage(ctx, account)
+		if err != nil {
+			return ProviderTestResult{}, err
+		}
+		output := "OAuth usage available"
+		if !info.Available {
+			output = "connected; quota temporarily unavailable"
+		}
+		return ProviderTestResult{AccountID: account.ID, Name: account.Name, Status: info.Status, OK: info.Connected, Output: output}, nil
+	}
 	if model == "" {
 		model = "gpt-5.3-codex"
 	}
@@ -158,7 +183,7 @@ func (s ProviderService) Test(ctx context.Context, account store.Account, model 
 	if baseURL == "" {
 		baseURL = DefaultCodexBaseURL
 	}
-	client := codex.NewClientWithLogger(baseURL, codex.NewTokenManager(s.DB, codex.OAuthRefresher{}), s.Logger, 64*1024)
+	client := codex.NewClientWithLogger(baseURL, NewProviderTokenManager(s.DB), s.Logger, 64*1024)
 	body := []byte(mustJSON(map[string]any{"model": model, "input": "ping", "stream": false}))
 	result, err := client.ExecuteResponses(ctx, codex.ExecuteParams{Account: account, Body: body})
 	if err != nil {
@@ -182,8 +207,57 @@ func (s ProviderService) Quota(ctx context.Context, account store.Account) (code
 	if baseURL == "" {
 		baseURL = DefaultCodexBaseURL
 	}
-	client := codex.NewClientWithLogger(baseURL, codex.NewTokenManager(s.DB, codex.OAuthRefresher{}), s.Logger, 64*1024)
+	client := codex.NewClientWithLogger(baseURL, NewProviderTokenManager(s.DB), s.Logger, 64*1024)
 	return client.FetchQuota(ctx, account)
+}
+
+func (s ProviderService) ClaudeQuota(ctx context.Context, account store.Account) (anthropic.UsageInfo, error) {
+	client := anthropic.NewClient(s.AnthropicMessagesURL, s.AnthropicUsageURL, NewProviderTokenManager(s.DB), s.Logger)
+	return client.FetchUsage(ctx, account)
+}
+
+func exchangeProviderCallback(ctx context.Context, provider string, session AuthSession, callback string) (oauth.TokenResponse, any, error) {
+	provider, err := store.CanonicalProvider(provider)
+	if err != nil {
+		return oauth.TokenResponse{}, nil, err
+	}
+	if session.Provider != "" && session.Provider != provider {
+		return oauth.TokenResponse{}, nil, fmt.Errorf("oauth session is for %s, not %s", session.Provider, provider)
+	}
+	if provider == store.ProviderAnthropicClaude {
+		code, err := oauth.ParseAnthropicCallback(callback, session.State)
+		if err != nil {
+			return oauth.TokenResponse{}, nil, err
+		}
+		tokens, err := oauth.ExchangeAnthropicCode(ctx, code, session.State, session.Verifier, session.RedirectURI)
+		if err != nil {
+			return oauth.TokenResponse{}, nil, err
+		}
+		return tokens, map[string]any{"scope": tokens.Scope}, nil
+	}
+	code, err := oauth.ParseCallbackURL(callback, session.State)
+	if err != nil {
+		return oauth.TokenResponse{}, nil, err
+	}
+	tokens, err := oauth.ExchangeCode(ctx, code, session.Verifier, session.RedirectURI)
+	if err != nil {
+		return oauth.TokenResponse{}, nil, err
+	}
+	meta, err := oauth.DecodeIDToken(tokens.IDToken)
+	if err != nil && tokens.IDToken != "" {
+		return oauth.TokenResponse{}, nil, err
+	}
+	return tokens, meta, nil
+}
+
+func NewProviderTokenManager(db *store.DB) *codex.TokenManager {
+	return codex.NewProviderTokenManager(db, map[string]codex.Refresher{
+		store.ProviderOpenAICodex:     codex.OAuthRefresher{},
+		store.ProviderAnthropicClaude: anthropic.OAuthRefresher{},
+	}, map[string]time.Duration{
+		store.ProviderOpenAICodex:     5 * time.Minute,
+		store.ProviderAnthropicClaude: anthropic.ClaudeRefreshLead,
+	})
 }
 
 type KeyService struct {
@@ -214,11 +288,15 @@ func NewProxyHandler(db *store.DB, settings store.Settings, logger Logger) http.
 	if !settings.LogUpstream {
 		codexLogger = discardLogger{}
 	}
-	client := codex.NewClientWithLogger(DefaultCodexBaseURL, codex.NewTokenManager(db, codex.OAuthRefresher{}), codexLogger, bodyLimit)
+	tokens := NewProviderTokenManager(db)
+	client := codex.NewClientWithLogger(DefaultCodexBaseURL, tokens, codexLogger, bodyLimit)
 	client.SetUpstreamTimeout(settings.UpstreamTimeoutSeconds)
+	claudeClient := anthropic.NewClient(anthropic.DefaultMessagesURL, anthropic.DefaultUsageURL, tokens, codexLogger)
+	claudeClient.SetUpstreamTimeout(settings.UpstreamTimeoutSeconds)
 	return proxy.New(proxy.ServerConfig{
 		Store:       db,
 		Codex:       client,
+		Anthropic:   claudeClient,
 		RequireKey:  true,
 		Logger:      logger,
 		LogRequests: settings.LogRequests,
@@ -237,6 +315,23 @@ func CodexConfigText(port int, apiKey, model string) string {
 	}
 	return fmt.Sprintf("model = %q\nmodel_provider = %q\n\n[model_providers.lm-router]\nname = %q\nbase_url = %q\nwire_api = %q\n\n[agents.subagent]\nmodel = %q\n\n{\n  \"auth_mode\": \"apikey\",\n  \"OPENAI_API_KEY\": %q\n}\n",
 		model, "lm-router", "LM Router", fmt.Sprintf("http://127.0.0.1:%d/v1", port), "responses", model, apiKey)
+}
+
+func ClaudeConfigText(port int, apiKey, model string) string {
+	if port <= 0 {
+		port = 19090
+	}
+	if apiKey == "" {
+		apiKey = "sk-lm-router-REPLACE_ME"
+	}
+	lines := []string{
+		fmt.Sprintf("ANTHROPIC_BASE_URL=http://127.0.0.1:%d", port),
+		"ANTHROPIC_AUTH_TOKEN=" + apiKey,
+	}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "claude") {
+		lines = append(lines, "ANTHROPIC_MODEL="+strings.TrimSpace(model))
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 func HumanError(raw string) string {

@@ -8,9 +8,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -20,18 +22,36 @@ type DB struct {
 	sql *sql.DB
 }
 
+const (
+	ProviderOpenAICodex     = "openai-codex"
+	ProviderAnthropicClaude = "anthropic-claude"
+)
+
+func CanonicalProvider(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case ProviderOpenAICodex, "codex":
+		return ProviderOpenAICodex, nil
+	case ProviderAnthropicClaude, "claude":
+		return ProviderAnthropicClaude, nil
+	default:
+		return "", fmt.Errorf("unsupported provider %q", raw)
+	}
+}
+
 type Account struct {
-	ID            string
-	Provider      string
-	Name          string
-	Priority      int
-	Enabled       bool
-	NeedsReauth   bool
-	AccessToken   string
-	RefreshToken  string
-	ExpiresAt     time.Time
-	CooldownUntil sql.NullTime
-	MetadataJSON  string
+	ID                  string
+	Provider            string
+	Name                string
+	Priority            int
+	Enabled             bool
+	NeedsReauth         bool
+	AccessToken         string
+	RefreshToken        string
+	ExpiresAt           time.Time
+	ConsecutiveFailures int
+	LastFailureAt       sql.NullTime
+	CooldownUntil       sql.NullTime
+	MetadataJSON        string
 }
 
 type APIKey struct {
@@ -79,6 +99,11 @@ func Open(ctx context.Context, dir string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	// SQLite PRAGMAs such as busy_timeout are connection-local. A single shared
+	// connection keeps them effective and serializes the small state updates
+	// used by concurrent routing decisions.
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
 	db := &DB{sql: sqlDB}
 	if err := db.init(ctx); err != nil {
 		_ = sqlDB.Close()
@@ -112,6 +137,8 @@ func (db *DB) init(ctx context.Context) error {
 			access_token text not null default '',
 			refresh_token text not null default '',
 			expires_at text not null default '',
+			consecutive_failures integer not null default 0,
+			last_failure_at text,
 			cooldown_until text,
 			metadata_json text not null default '{}'
 		);`,
@@ -132,7 +159,136 @@ func (db *DB) init(ctx context.Context) error {
 			return err
 		}
 	}
-	return nil
+	for _, migration := range []struct {
+		name       string
+		definition string
+	}{
+		{name: "consecutive_failures", definition: "integer not null default 0"},
+		{name: "last_failure_at", definition: "text"},
+		{name: "cooldown_until", definition: "text"},
+	} {
+		if err := db.ensureColumn(ctx, "accounts", migration.name, migration.definition); err != nil {
+			return err
+		}
+	}
+	return db.migrateLegacyAccountAliases(ctx)
+}
+
+func (db *DB) ensureColumn(ctx context.Context, table, name, definition string) error {
+	rows, err := db.sql.QueryContext(ctx, "pragma table_info("+table+")")
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid int
+		var columnName, columnType string
+		var notNull, primaryKey int
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &columnName, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if columnName == name {
+			found = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = db.sql.ExecContext(ctx, fmt.Sprintf("alter table %s add column %s %s", table, name, definition))
+	return err
+}
+
+// migrateLegacyAccountAliases makes aliases unique within each provider before
+// the provider-scoped uniqueness rule is enforced. Older databases allowed
+// duplicates (the CLI commonly created several accounts named "openai-codex"),
+// which otherwise prevents a later re-authentication from saving fresh tokens.
+func (db *DB) migrateLegacyAccountAliases(ctx context.Context) error {
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	type aliasRow struct {
+		id       string
+		provider string
+		name     string
+	}
+	rows, err := tx.QueryContext(ctx, `
+		select id, provider, name
+		from accounts
+		order by provider asc, lower(trim(name)) asc, priority asc, id asc
+	`)
+	if err != nil {
+		return err
+	}
+	var accounts []aliasRow
+	for rows.Next() {
+		var account aliasRow
+		if err := rows.Scan(&account.id, &account.provider, &account.name); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		accounts = append(accounts, account)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	used := make(map[string]map[string]bool)
+	for _, account := range accounts {
+		base := strings.TrimSpace(account.name)
+		if base == "" {
+			base = account.provider
+		}
+		if used[account.provider] == nil {
+			used[account.provider] = make(map[string]bool)
+		}
+		used[account.provider][strings.ToLower(base)] = true
+	}
+
+	kept := make(map[string]map[string]bool)
+	for _, account := range accounts {
+		base := strings.TrimSpace(account.name)
+		if base == "" {
+			base = account.provider
+		}
+		if kept[account.provider] == nil {
+			kept[account.provider] = make(map[string]bool)
+		}
+		key := strings.ToLower(base)
+		name := base
+		if kept[account.provider][key] {
+			for suffix := 2; ; suffix++ {
+				candidate := fmt.Sprintf("%s-%d", base, suffix)
+				candidateKey := strings.ToLower(candidate)
+				if !used[account.provider][candidateKey] {
+					name = candidate
+					used[account.provider][candidateKey] = true
+					break
+				}
+			}
+		} else {
+			kept[account.provider][key] = true
+		}
+		if name != account.name {
+			if _, err := tx.ExecContext(ctx, `update accounts set name = ? where id = ?`, name, account.id); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		create unique index if not exists accounts_provider_name_nocase
+		on accounts(provider, name collate nocase)
+	`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (db *DB) GetSettings(ctx context.Context) (Settings, error) {
@@ -227,11 +383,24 @@ func (db *DB) SaveSettings(ctx context.Context, settings Settings) error {
 }
 
 func (db *DB) UpsertAccount(ctx context.Context, account Account) error {
-	_, err := db.sql.ExecContext(ctx, `
+	provider, err := CanonicalProvider(account.Provider)
+	if err != nil {
+		return err
+	}
+	account.Provider = provider
+	account.Name = strings.TrimSpace(account.Name)
+	if account.Name == "" {
+		return errors.New("connection alias is required")
+	}
+	if err := db.ensureAccountNameAvailable(ctx, account.Provider, account.Name, account.ID); err != nil {
+		return err
+	}
+	_, err = db.sql.ExecContext(ctx, `
 		insert into accounts (
 			id, provider, name, priority, enabled, needs_reauth, access_token,
-			refresh_token, expires_at, cooldown_until, metadata_json
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			refresh_token, expires_at, consecutive_failures, last_failure_at,
+			cooldown_until, metadata_json
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(id) do update set
 			provider=excluded.provider,
 			name=excluded.name,
@@ -241,6 +410,8 @@ func (db *DB) UpsertAccount(ctx context.Context, account Account) error {
 			access_token=excluded.access_token,
 			refresh_token=excluded.refresh_token,
 			expires_at=excluded.expires_at,
+			consecutive_failures=excluded.consecutive_failures,
+			last_failure_at=excluded.last_failure_at,
 			cooldown_until=excluded.cooldown_until,
 			metadata_json=excluded.metadata_json
 	`,
@@ -253,6 +424,8 @@ func (db *DB) UpsertAccount(ctx context.Context, account Account) error {
 		account.AccessToken,
 		account.RefreshToken,
 		account.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		account.ConsecutiveFailures,
+		nullTimeValue(account.LastFailureAt),
 		nullTimeValue(account.CooldownUntil),
 		defaultString(account.MetadataJSON, "{}"),
 	)
@@ -262,7 +435,8 @@ func (db *DB) UpsertAccount(ctx context.Context, account Account) error {
 func (db *DB) GetAccount(ctx context.Context, id string) (Account, error) {
 	row := db.sql.QueryRowContext(ctx, `
 		select id, provider, name, priority, enabled, needs_reauth, access_token,
-			refresh_token, expires_at, cooldown_until, metadata_json
+			refresh_token, expires_at, consecutive_failures, last_failure_at,
+			cooldown_until, metadata_json
 		from accounts where id = ?
 	`, id)
 	return scanAccount(row)
@@ -271,7 +445,8 @@ func (db *DB) GetAccount(ctx context.Context, id string) (Account, error) {
 func (db *DB) GetAccountByName(ctx context.Context, name string) (Account, error) {
 	row := db.sql.QueryRowContext(ctx, `
 		select id, provider, name, priority, enabled, needs_reauth, access_token,
-			refresh_token, expires_at, cooldown_until, metadata_json
+			refresh_token, expires_at, consecutive_failures, last_failure_at,
+			cooldown_until, metadata_json
 		from accounts where name = ?
 		order by priority asc
 		limit 1
@@ -279,7 +454,27 @@ func (db *DB) GetAccountByName(ctx context.Context, name string) (Account, error
 	return scanAccount(row)
 }
 
+func (db *DB) GetAccountByProviderAndName(ctx context.Context, provider, name string) (Account, error) {
+	provider, err := CanonicalProvider(provider)
+	if err != nil {
+		return Account{}, err
+	}
+	row := db.sql.QueryRowContext(ctx, `
+		select id, provider, name, priority, enabled, needs_reauth, access_token,
+			refresh_token, expires_at, consecutive_failures, last_failure_at,
+			cooldown_until, metadata_json
+		from accounts where provider = ? and lower(name) = lower(?)
+		order by priority asc
+		limit 1
+	`, provider, strings.TrimSpace(name))
+	return scanAccount(row)
+}
+
 func (db *DB) ListRoutableAccounts(ctx context.Context, provider string) ([]Account, error) {
+	provider, err := CanonicalProvider(provider)
+	if err != nil {
+		return nil, err
+	}
 	return db.listAccounts(ctx, `where provider = ? and enabled = 1 and needs_reauth = 0`, provider)
 }
 
@@ -287,10 +482,19 @@ func (db *DB) ListAccounts(ctx context.Context) ([]Account, error) {
 	return db.listAccounts(ctx, ``, nil)
 }
 
+func (db *DB) ListAccountsByProvider(ctx context.Context, provider string) ([]Account, error) {
+	provider, err := CanonicalProvider(provider)
+	if err != nil {
+		return nil, err
+	}
+	return db.listAccounts(ctx, `where provider = ?`, provider)
+}
+
 func (db *DB) listAccounts(ctx context.Context, where string, arg any) ([]Account, error) {
 	query := `
 		select id, provider, name, priority, enabled, needs_reauth, access_token,
-			refresh_token, expires_at, cooldown_until, metadata_json
+			refresh_token, expires_at, consecutive_failures, last_failure_at,
+			cooldown_until, metadata_json
 		from accounts
 	`
 	if where != "" {
@@ -319,6 +523,9 @@ func (db *DB) listAccounts(ctx context.Context, where string, arg any) ([]Accoun
 		accounts = append(accounts, account)
 	}
 	sort.Slice(accounts, func(i, j int) bool {
+		if accounts[i].Priority == accounts[j].Priority {
+			return accounts[i].ID < accounts[j].ID
+		}
 		return accounts[i].Priority < accounts[j].Priority
 	})
 	return accounts, rows.Err()
@@ -330,7 +537,18 @@ func (db *DB) DeleteAccount(ctx context.Context, id string) error {
 }
 
 func (db *DB) RenameAccount(ctx context.Context, id, name string) error {
-	_, err := db.sql.ExecContext(ctx, `update accounts set name = ? where id = ?`, name, id)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("connection alias is required")
+	}
+	account, err := db.MustGetAccount(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := db.ensureAccountNameAvailable(ctx, account.Provider, name, id); err != nil {
+		return err
+	}
+	_, err = db.sql.ExecContext(ctx, `update accounts set name = ? where id = ?`, name, id)
 	return err
 }
 
@@ -379,9 +597,136 @@ func (db *DB) NextPriority(ctx context.Context) (int, error) {
 	return int(next.Int64), nil
 }
 
+func (db *DB) NextPriorityForProvider(ctx context.Context, provider string) (int, error) {
+	provider, err := CanonicalProvider(provider)
+	if err != nil {
+		return 0, err
+	}
+	var next sql.NullInt64
+	if err := db.sql.QueryRowContext(ctx, `select coalesce(max(priority), 0) + 1 from accounts where provider = ?`, provider).Scan(&next); err != nil {
+		return 0, err
+	}
+	return int(next.Int64), nil
+}
+
+func (db *DB) ensureAccountNameAvailable(ctx context.Context, provider, name, excludeID string) error {
+	var count int
+	err := db.sql.QueryRowContext(ctx, `
+		select count(1) from accounts
+		where provider = ? and lower(name) = lower(?) and id <> ?
+	`, provider, strings.TrimSpace(name), excludeID).Scan(&count)
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return fmt.Errorf("connection alias %q already exists for provider %s", name, provider)
+	}
+	return nil
+}
+
 func (db *DB) SetCooldown(ctx context.Context, id string, until time.Time) error {
 	_, err := db.sql.ExecContext(ctx, `update accounts set cooldown_until = ? where id = ?`, until.UTC().Format(time.RFC3339Nano), id)
 	return err
+}
+
+// RecordRetryableFailure persists the account's retry state. A future
+// cooldownHint (for example Retry-After) wins; otherwise an exponential
+// backoff with jitter is calculated from the new consecutive failure count.
+func (db *DB) RecordRetryableFailure(ctx context.Context, id string, now, cooldownHint time.Time) (time.Time, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var failures int
+	if err := tx.QueryRowContext(ctx, `select consecutive_failures from accounts where id = ?`, id).Scan(&failures); err != nil {
+		return time.Time{}, err
+	}
+	failures++
+	until := cooldownHint.UTC()
+	if !until.After(now) {
+		until = now.Add(retryBackoff(failures))
+	}
+	if _, err := tx.ExecContext(ctx, `
+		update accounts
+		set consecutive_failures = ?, last_failure_at = ?, cooldown_until = ?
+		where id = ?
+	`, failures, now.Format(time.RFC3339Nano), until.Format(time.RFC3339Nano), id); err != nil {
+		return time.Time{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return time.Time{}, err
+	}
+	return until, nil
+}
+
+func retryBackoff(failures int) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	base := 2 * time.Second
+	for i := 1; i < failures && base < 5*time.Minute; i++ {
+		base *= 2
+		if base > 5*time.Minute {
+			base = 5 * time.Minute
+		}
+	}
+	// Add up to 25% positive jitter while preserving the documented two-second
+	// minimum and five-minute maximum.
+	jitter, err := rand.Int(rand.Reader, big.NewInt(251))
+	if err == nil {
+		base = time.Duration(float64(base) * (1 + float64(jitter.Int64())/1000))
+	}
+	if base > 5*time.Minute {
+		return 5 * time.Minute
+	}
+	return base
+}
+
+func (db *DB) ResetFailureState(ctx context.Context, id string) error {
+	_, err := db.sql.ExecContext(ctx, `
+		update accounts
+		set consecutive_failures = 0, last_failure_at = null, cooldown_until = null
+		where id = ?
+	`, id)
+	return err
+}
+
+// SwapAccountPrioritiesCAS swaps two priorities only when both rows still
+// have the values observed by the caller. The single statement prevents two
+// concurrent successful fallbacks from swapping the accounts back.
+func (db *DB) SwapAccountPrioritiesCAS(ctx context.Context, provider, firstID string, firstPriority int, successID string, successPriority int) (bool, error) {
+	provider, err := CanonicalProvider(provider)
+	if err != nil {
+		return false, err
+	}
+	if firstID == successID {
+		return false, nil
+	}
+	result, err := db.sql.ExecContext(ctx, `
+		update accounts
+		set priority = case id when ? then ? when ? then ? end
+		where provider = ? and id in (?, ?)
+		  and exists (
+			select 1
+			from accounts first_account, accounts success_account
+			where first_account.id = ? and first_account.provider = ? and first_account.priority = ?
+			  and success_account.id = ? and success_account.provider = ? and success_account.priority = ?
+		  )
+	`, firstID, successPriority, successID, firstPriority,
+		provider, firstID, successID,
+		firstID, provider, firstPriority, successID, provider, successPriority)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows == 2, err
 }
 
 func (db *DB) MarkNeedsReauth(ctx context.Context, id string) error {
@@ -447,6 +792,7 @@ func scanAccount(scanner accountScanner) (Account, error) {
 	var enabled int
 	var needsReauth int
 	var expiresAt string
+	var lastFailure sql.NullString
 	var cooldown sql.NullString
 	err := scanner.Scan(
 		&account.ID,
@@ -458,6 +804,8 @@ func scanAccount(scanner accountScanner) (Account, error) {
 		&account.AccessToken,
 		&account.RefreshToken,
 		&expiresAt,
+		&account.ConsecutiveFailures,
+		&lastFailure,
 		&cooldown,
 		&account.MetadataJSON,
 	)
@@ -478,6 +826,13 @@ func scanAccount(scanner accountScanner) (Account, error) {
 			return Account{}, err
 		}
 		account.CooldownUntil = sql.NullTime{Time: tm, Valid: true}
+	}
+	if lastFailure.Valid && lastFailure.String != "" {
+		tm, err := time.Parse(time.RFC3339Nano, lastFailure.String)
+		if err != nil {
+			return Account{}, err
+		}
+		account.LastFailureAt = sql.NullTime{Time: tm, Valid: true}
 	}
 	return account, nil
 }

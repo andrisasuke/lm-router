@@ -34,6 +34,7 @@ type TokenResponse struct {
 	RefreshToken string `json:"refresh_token"`
 	IDToken      string `json:"id_token"`
 	ExpiresIn    int64  `json:"expires_in"`
+	Scope        string `json:"scope"`
 }
 
 type AccountMetadata struct {
@@ -104,12 +105,12 @@ func IsUnrecoverableRefreshError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
+	msg := strings.ToLower(err.Error())
 	for _, code := range []string{
-		`"refresh_token_reused"`,
-		`"invalid_grant"`,
-		`"token_expired"`,
-		`"invalid_token"`,
+		"refresh_token_reused",
+		"invalid_grant",
+		"token_expired",
+		"invalid_token",
 	} {
 		if strings.Contains(msg, code) {
 			return true

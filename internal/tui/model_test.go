@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrisasuke/lm-router/internal/anthropic"
 	"github.com/andrisasuke/lm-router/internal/app"
 	"github.com/andrisasuke/lm-router/internal/codex"
 	"github.com/andrisasuke/lm-router/internal/store"
@@ -31,7 +32,7 @@ func TestHomeNavigationMovesSelectionAndOpensProviders(t *testing.T) {
 
 	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = next.(Model)
-	if model.screen != screenProviders {
+	if model.screen != screenProviderTypes {
 		t.Fatalf("screen=%v", model.screen)
 	}
 }
@@ -48,11 +49,176 @@ func TestProvidersViewShowsDefaultModelAndPassThroughRouting(t *testing.T) {
 	if !strings.Contains(view, "Default model: gpt-5.3-codex") {
 		t.Fatalf("default model missing: %s", view)
 	}
-	if !strings.Contains(view, "Model routing: pass-through") {
-		t.Fatalf("pass-through routing label missing: %s", view)
+	if !strings.Contains(view, "Model routing: gpt* via Codex Responses") {
+		t.Fatalf("prefix routing label missing: %s", view)
 	}
 	if strings.Contains(view, "Alias: cx") || strings.Contains(view, "cx/") || strings.Contains(view, "Models:") {
 		t.Fatalf("unexpected legacy model display in view: %s", view)
+	}
+}
+
+func TestProviderTypeSelectionOpensFilteredClaudePool(t *testing.T) {
+	model := NewTestModel()
+	model.screen = screenProviderTypes
+	model.selected = 2
+
+	next, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(Model)
+	if model.screen != screenProviders || model.selectedProvider != store.ProviderAnthropicClaude {
+		t.Fatalf("screen=%v provider=%q", model.screen, model.selectedProvider)
+	}
+	view := model.View()
+	if !strings.Contains(view, "Provider: Anthropic Claude") ||
+		!strings.Contains(view, "Default model: claude-opus-4-8") ||
+		!strings.Contains(view, "claude* via native Messages API") {
+		t.Fatalf("view=%s", view)
+	}
+}
+
+func TestProviderTypeSelectionClearsRowsAndIgnoresStaleLoads(t *testing.T) {
+	model := NewTestModel()
+	model.screen = screenProviderTypes
+	model.selected = 2
+	model.providerLoadSeq = 7
+	model.accounts = []store.Account{{ID: "codex", Provider: store.ProviderOpenAICodex, Name: "old"}}
+
+	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(Model)
+	if cmd == nil || model.screen != screenProviders || len(model.accounts) != 0 {
+		t.Fatalf("screen=%v accounts=%+v cmd_nil=%t", model.screen, model.accounts, cmd == nil)
+	}
+	currentSeq := model.providerLoadSeq
+	next, _ = model.Update(loadProvidersMsg{
+		provider: store.ProviderOpenAICodex,
+		seq:      currentSeq - 1,
+		accounts: []store.Account{{ID: "stale", Provider: store.ProviderOpenAICodex}},
+	})
+	model = next.(Model)
+	if len(model.accounts) != 0 {
+		t.Fatalf("stale provider load was applied: %+v", model.accounts)
+	}
+
+	next, _ = model.Update(loadProvidersMsg{
+		provider: store.ProviderAnthropicClaude,
+		seq:      currentSeq,
+		accounts: []store.Account{{ID: "claude", Provider: store.ProviderAnthropicClaude}},
+	})
+	model = next.(Model)
+	if len(model.accounts) != 1 || model.accounts[0].ID != "claude" {
+		t.Fatalf("current provider load was not applied: %+v", model.accounts)
+	}
+}
+
+func TestKeyboardBackResetsProviderPoolAndReloadsHomeAccounts(t *testing.T) {
+	model := NewTestModel()
+	model.screen = screenProviders
+	model.stack = []screen{screenHome, screenProviderTypes}
+	model.selectedProvider = store.ProviderAnthropicClaude
+	model.providerLoadSeq = 4
+	model.accounts = []store.Account{{ID: "claude", Provider: store.ProviderAnthropicClaude}}
+
+	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = next.(Model)
+	if cmd != nil || model.screen != screenProviderTypes || model.selectedProvider != "" || len(model.accounts) != 0 {
+		t.Fatalf("provider exit screen=%v provider=%q accounts=%+v", model.screen, model.selectedProvider, model.accounts)
+	}
+	invalidatedSeq := model.providerLoadSeq
+
+	next, cmd = model.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	model = next.(Model)
+	if cmd == nil || model.screen != screenHome || model.selectedProvider != "" || model.providerLoadSeq <= invalidatedSeq {
+		t.Fatalf("home exit screen=%v provider=%q seq=%d cmd_nil=%t", model.screen, model.selectedProvider, model.providerLoadSeq, cmd == nil)
+	}
+	next, _ = model.Update(loadProvidersMsg{
+		seq: model.providerLoadSeq,
+		accounts: []store.Account{
+			{ID: "codex", Provider: store.ProviderOpenAICodex},
+			{ID: "claude", Provider: store.ProviderAnthropicClaude},
+		},
+	})
+	model = next.(Model)
+	if len(model.accounts) != 2 {
+		t.Fatalf("home accounts were not restored: %+v", model.accounts)
+	}
+}
+
+func TestClaudeAddRequiresRiskConfirmationAndWritesProviderAuthURL(t *testing.T) {
+	dataDir := t.TempDir()
+	model := NewWithDataDir(context.Background(), nil, app.NewRingLogger(10, nil), app.NewServerController(app.ServerControllerConfig{}), store.DefaultSettings(), dataDir)
+	model.screen = screenProviders
+	model.selectedProvider = store.ProviderAnthropicClaude
+	model.selected = 1
+
+	next, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(Model)
+	if model.screen != screenClaudeRisk || !strings.Contains(model.View(), "I understand, continue") || !strings.Contains(model.View(), "combines capacity") {
+		t.Fatalf("risk screen missing: %s", model.View())
+	}
+	model.selected = 1
+	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(Model)
+	if model.screen != screenAddProvider || model.authSession.Provider != store.ProviderAnthropicClaude {
+		t.Fatalf("screen=%v session=%+v", model.screen, model.authSession)
+	}
+	wantPath := filepath.Join(dataDir, "anthropic-claude-auth-url.txt")
+	if model.authURLPath != wantPath {
+		t.Fatalf("path=%s want=%s", model.authURLPath, wantPath)
+	}
+}
+
+func TestClaudeQuota429UsesSeparateThreeMinuteUICooldown(t *testing.T) {
+	model := NewTestModel()
+	model.screen = screenProviderDetail
+	model.selected = 3
+	model.selectedAccount = 0
+	model.accounts = []store.Account{{ID: "claude", Provider: store.ProviderAnthropicClaude, Name: "main"}}
+	quota := anthropic.UsageInfo{
+		Connected: true,
+		Available: false,
+		Status:    429,
+		RetryAt:   time.Now().Add(anthropic.UsageRetryCooldown),
+	}
+	next, _ := model.Update(providerQuotaDoneMsg{accountID: "claude", claude: &quota})
+	model = next.(Model)
+	model.claudeQuota = nil // Simulate leaving and re-entering the detail page.
+	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(Model)
+	if cmd == nil || model.providerQuotaLoading || !strings.Contains(model.statusLine, "quota check is cooling down") {
+		t.Fatalf("loading=%t status=%q", model.providerQuotaLoading, model.statusLine)
+	}
+	if model.accounts[0].CooldownUntil.Valid {
+		t.Fatal("quota cooldown leaked into inference account state")
+	}
+}
+
+func TestAliasValidationAllowsSameNameAcrossProviders(t *testing.T) {
+	model := NewTestModel()
+	model.selectedProvider = store.ProviderAnthropicClaude
+	model.accounts = []store.Account{{ID: "codex", Provider: store.ProviderOpenAICodex, Name: "main"}}
+	if err := model.validateAliasName("MAIN", ""); err != nil {
+		t.Fatalf("cross-provider alias should be allowed: %v", err)
+	}
+}
+
+func TestClaudeConfigViewPrintsEnvironmentWithoutEditingFiles(t *testing.T) {
+	model := NewTestModel()
+	model.screen = screenClaudeConfig
+	view := model.View()
+	if !strings.Contains(view, "ANTHROPIC_BASE_URL=http://127.0.0.1:19090") ||
+		!strings.Contains(view, "ANTHROPIC_AUTH_TOKEN=") ||
+		!strings.Contains(view, "ANTHROPIC_MODEL=claude-opus-4-8") {
+		t.Fatalf("view=%s", view)
+	}
+}
+
+func TestCompletedProviderAddReturnsToSingleProviderListLevel(t *testing.T) {
+	model := NewTestModel()
+	model.screen = screenAddProvider
+	model.stack = []screen{screenProviderTypes, screenProviders}
+	next, _ := model.Update(addProviderDoneMsg{account: store.Account{ID: "claude", Provider: store.ProviderAnthropicClaude, Name: "main"}})
+	model = next.(Model)
+	if model.screen != screenProviders || len(model.stack) != 1 || model.stack[0] != screenProviderTypes {
+		t.Fatalf("screen=%v stack=%v", model.screen, model.stack)
 	}
 }
 

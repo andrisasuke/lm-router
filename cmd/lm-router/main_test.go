@@ -1,6 +1,14 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"flag"
+	"strings"
+	"testing"
+
+	"github.com/andrisasuke/lm-router/internal/app"
+	"github.com/andrisasuke/lm-router/internal/store"
+)
 
 func TestVersionTextIncludesVersionCommitAndBuildDate(t *testing.T) {
 	got := versionText("0.0.1", "abc123", "2026-05-08T00:00:00Z")
@@ -55,6 +63,44 @@ func TestHumanErrorExtractsDetail(t *testing.T) {
 	want := "Instructions are required"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestClaudeConfigTextIncludesOptionalClaudeModel(t *testing.T) {
+	got := app.ClaudeConfigText(19091, "sk-local", "claude-opus-4-6")
+	for _, want := range []string{
+		"ANTHROPIC_BASE_URL=http://127.0.0.1:19091",
+		"ANTHROPIC_AUTH_TOKEN=sk-local",
+		"ANTHROPIC_MODEL=claude-opus-4-6",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("config %q missing %q", got, want)
+		}
+	}
+	if got := app.ClaudeConfigText(19090, "sk-local", "gpt-5.3-codex"); strings.Contains(got, "ANTHROPIC_MODEL") {
+		t.Fatalf("non-Claude model should not be printed: %q", got)
+	}
+}
+
+func TestResolveAccountNameIsScopedByProvider(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, account := range []store.Account{
+		{ID: "codex", Provider: store.ProviderOpenAICodex, Name: "main", Enabled: true},
+		{ID: "claude", Provider: store.ProviderAnthropicClaude, Name: "main", Enabled: true},
+	} {
+		if err := db.UpsertAccount(ctx, account); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	got, err := resolveAccount(ctx, db, fs, "claude", "main")
+	if err != nil || got.ID != "claude" {
+		t.Fatalf("got=%+v err=%v", got, err)
 	}
 }
 

@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -63,6 +64,72 @@ func TestTokenRefreshIsAtomicPerAccount(t *testing.T) {
 
 	if calls != 1 {
 		t.Fatalf("refresh calls = %d, want 1", calls)
+	}
+}
+
+func TestProviderTokenManagerUsesProviderRefreshLeadAndRefresher(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, account := range []store.Account{
+		{ID: "codex", Provider: store.ProviderOpenAICodex, Name: "main", Enabled: true, AccessToken: "codex-old", RefreshToken: "codex-refresh", ExpiresAt: time.Now().Add(2 * time.Hour)},
+		{ID: "claude", Provider: store.ProviderAnthropicClaude, Name: "main", Enabled: true, AccessToken: "claude-old", RefreshToken: "claude-refresh", ExpiresAt: time.Now().Add(2 * time.Hour)},
+	} {
+		if err := db.UpsertAccount(ctx, account); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var codexCalls, claudeCalls int
+	manager := NewProviderTokenManager(db, map[string]Refresher{
+		store.ProviderOpenAICodex: RefreshFunc(func(context.Context, string) (TokenSet, error) {
+			codexCalls++
+			return TokenSet{AccessToken: "codex-new", ExpiresAt: time.Now().Add(time.Hour)}, nil
+		}),
+		store.ProviderAnthropicClaude: RefreshFunc(func(context.Context, string) (TokenSet, error) {
+			claudeCalls++
+			return TokenSet{AccessToken: "claude-new", RefreshToken: "claude-rotated", ExpiresAt: time.Now().Add(8 * time.Hour)}, nil
+		}),
+	}, map[string]time.Duration{
+		store.ProviderOpenAICodex:     5 * time.Minute,
+		store.ProviderAnthropicClaude: 4 * time.Hour,
+	})
+
+	if got, err := manager.EnsureFresh(ctx, "codex"); err != nil || got.AccessToken != "codex-old" {
+		t.Fatalf("codex got=%+v err=%v", got, err)
+	}
+	got, err := manager.EnsureFresh(ctx, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if codexCalls != 0 || claudeCalls != 1 || got.AccessToken != "claude-new" || got.RefreshToken != "claude-rotated" {
+		t.Fatalf("calls codex=%d claude=%d account=%+v", codexCalls, claudeCalls, got)
+	}
+}
+
+func TestProviderTokenManagerMarksPermanentClaudeRefreshFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.UpsertAccount(ctx, store.Account{ID: "claude", Provider: store.ProviderAnthropicClaude, Name: "main", Enabled: true, RefreshToken: "bad", ExpiresAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewProviderTokenManager(db, map[string]Refresher{
+		store.ProviderAnthropicClaude: RefreshFunc(func(context.Context, string) (TokenSet, error) {
+			return TokenSet{}, errors.New(`{"error":"invalid_grant"}`)
+		}),
+	}, nil)
+	if _, err := manager.EnsureFresh(ctx, "claude"); err == nil {
+		t.Fatal("expected refresh failure")
+	}
+	got, _ := db.GetAccount(ctx, "claude")
+	if !got.NeedsReauth {
+		t.Fatal("expected needs reauth")
 	}
 }
 

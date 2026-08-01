@@ -1,8 +1,11 @@
 # LM Router
 
-`lm-router` turns multiple OpenAI Codex OAuth accounts into one local, OpenAI-compatible API endpoint.
+`lm-router` turns multiple OpenAI Codex and Anthropic Claude subscription OAuth connections into one local API endpoint.
 
-It provides ordered account routing, automatic failover, local API-key authentication, a terminal UI, and SQLite persistence. The project currently focuses on OpenAI Codex accounts.
+It provides model-prefix routing, provider-scoped priority and failover, local API-key authentication, a terminal UI, and SQLite persistence.
+
+> [!WARNING]
+> Claude subscriptions and the Anthropic API are separate products. Routing Claude subscription OAuth through a third-party router is not an officially licensed Anthropic API flow, may violate provider terms, and may put the connected account at risk. Automatic fallback across subscriptions can be viewed as combining or bypassing account capacity limits; it does not guarantee protection from provider restrictions. You must explicitly accept this risk before connecting an Anthropic Claude account.
 
 ## Features
 
@@ -10,18 +13,19 @@ It provides ordered account routing, automatic failover, local API-key authentic
   - `POST /v1/responses`
   - `POST /v1/chat/completions`
   - `GET /v1/models`
-- Anthropic-compatible `POST /v1/messages`
-- Multiple Codex accounts with configurable priority
+- Anthropic-compatible `POST /v1/messages` and `POST /v1/messages/count_tokens`
+- Native Claude Messages pass-through, including streaming, thinking, tools, prompt caching, and Claude Code headers
+- Multiple Codex and Claude connections with independent provider-scoped priority
 - Failover on retryable errors such as `429` and upstream `5xx`
-- Account testing, token refresh, and quota display
+- Provider-specific OAuth refresh, account testing, and quota display
 - CLI and terminal UI for providers, API keys, settings, and logs
 - Sensitive authorization headers are redacted from logs
 
 ## Requirements
 
 - Go 1.25+
-- A browser for the Codex OAuth flow
-- At least one OpenAI Codex account
+- A browser for OAuth
+- At least one supported Codex or Claude account
 
 ## Quick Start
 
@@ -32,6 +36,14 @@ go run ./cmd/lm-router auth add openai-codex --name main --test
 ```
 
 Open the printed OAuth URL, authorize the account, and paste the callback URL into the terminal.
+
+To add a Claude connection, read the warning above and run:
+
+```bash
+go run ./cmd/lm-router auth add anthropic-claude --name main
+```
+
+The CLI accepts `claude` as an input alias but stores `anthropic-claude`. Type the risk confirmation when prompted, then paste either the callback URL or the `code#state` value. For explicitly approved non-interactive use, pass `--accept-risk`. The OAuth URL is saved to `~/.lm-router/anthropic-claude-auth-url.txt`.
 
 Create a local API key:
 
@@ -92,6 +104,30 @@ Start a new Codex session:
 codex
 ```
 
+## Use with Claude Code
+
+Keep the router running and set Claude Code to the local endpoint:
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:19090"
+export ANTHROPIC_AUTH_TOKEN="sk-lm-router-REPLACE_ME"
+# Optional; it must retain the claude prefix:
+export ANTHROPIC_MODEL="claude-sonnet-4-6"
+
+claude
+```
+
+You can print the same environment configuration without modifying user files:
+
+```bash
+go run ./cmd/lm-router claude print-config \
+  --port 19090 \
+  --api-key sk-lm-router-REPLACE_ME \
+  --model claude-sonnet-4-6
+```
+
+`ANTHROPIC_AUTH_TOKEN` is the local `lm-router` API key, not the upstream OAuth token. The router replaces it with the selected provider token and never forwards the local key upstream.
+
 ## Client URLs
 
 | Client | Base URL | API |
@@ -136,9 +172,9 @@ go run ./cmd/lm-router tui \
   --port 19090
 ```
 
-The TUI manages providers, routing priority, API keys, the server, settings, logs, and Codex configuration. Provider details can fetch current 5-hour and weekly quota windows.
+The TUI starts with `Providers > OpenAI Codex` or `Providers > Anthropic Claude`, then shows only that provider's connections. Both providers support alias editing, connection tests, quota, refresh, re-authentication, enable/disable, deletion, and Shift+Up/Down reordering. Claude OAuth is gated by a risk confirmation page. The home screen includes read-only Codex and Claude configuration views.
 
-Long OAuth URLs are also saved to `~/.lm-router/openai-codex-auth-url.txt` to avoid terminal clipping.
+Long OAuth URLs are saved to `~/.lm-router/openai-codex-auth-url.txt` or `~/.lm-router/anthropic-claude-auth-url.txt` to avoid terminal clipping.
 
 ## CLI Reference
 
@@ -150,9 +186,14 @@ go run ./cmd/lm-router tui
 
 # Providers
 go run ./cmd/lm-router auth add openai-codex --name main
+go run ./cmd/lm-router auth add anthropic-claude --name main
+go run ./cmd/lm-router auth add claude --name backup --accept-risk
 go run ./cmd/lm-router auth list
-go run ./cmd/lm-router auth test --name main
+go run ./cmd/lm-router auth list --provider anthropic-claude
+go run ./cmd/lm-router auth test --provider openai-codex --name main
+go run ./cmd/lm-router auth test --provider anthropic-claude --name main
 go run ./cmd/lm-router auth refresh <account-id>
+go run ./cmd/lm-router auth refresh --provider anthropic-claude --name main
 go run ./cmd/lm-router auth enable <account-id>
 go run ./cmd/lm-router auth disable <account-id>
 go run ./cmd/lm-router auth move <account-id> --priority 1
@@ -167,18 +208,42 @@ go run ./cmd/lm-router keys revoke <key-id>
 go run ./cmd/lm-router codex print-config \
   --port 19090 \
   --api-key sk-lm-router-REPLACE_ME
+
+# Claude Code config helper
+go run ./cmd/lm-router claude print-config \
+  --port 19090 \
+  --api-key sk-lm-router-REPLACE_ME \
+  --model claude-sonnet-4-6
 ```
 
 The config helper prints authentication material; treat its output as sensitive. Prefer the environment-variable setup above if you want to preserve an existing Codex login.
 
-## Routing and Local Data
+## Model Routing, Failover, and Quota
 
-For each request, the router tries enabled accounts in priority order. Retryable failures move to the next available account; non-retryable request errors stop immediately.
+Routing uses the trimmed model prefix case-insensitively:
+
+| Endpoint | `gpt*` | `claude*` | Other prefix |
+| --- | --- | --- | --- |
+| `/v1/messages` | Translate to Codex Responses | Native Anthropic Messages | `400` |
+| `/v1/messages/count_tokens` | Local estimate | Native Anthropic token count | `400` |
+| `/v1/responses` | Codex Responses | `400`; use `/v1/messages` | `400` |
+| `/v1/chat/completions` | Translate to Codex Responses | `400`; use `/v1/messages` | `400` |
+
+The Claude model list returned by `/v1/models` is informational. Any `claude*` model is passed through, so newly released model names do not require a router update.
+
+For each request, the router tries enabled connections in priority order within the selected provider. Network errors, `429`, `5xx`, and persistent `401/403` after one refresh-and-retry can move to the next connection. Other `4xx` request errors stop immediately. `Retry-After` and rate-limit reset headers create per-account cooldowns; without them the router uses jittered exponential backoff from two seconds up to five minutes. A successful Claude fallback is promoted by atomically swapping its priority with the first failed connection; token-count calls never reorder connections. Once a successful streaming response starts, the router never switches accounts mid-stream.
+
+Retrying a network failure can duplicate a request if Anthropic accepted it before the connection failed. Automatic rotation also combines the capacity of multiple subscriptions and does not prevent account limitations or other provider action.
+
+Claude connection tests and quota views call the OAuth usage endpoint without sending an inference prompt. They display the five-hour, weekly, and model-specific weekly windows returned by Anthropic. A quota `429` still counts as connected and does not block inference; the TUI waits three minutes before polling quota again, using state separate from inference cooldowns.
+
+## Local Data
 
 State is stored under `~/.lm-router/` by default:
 
 - `lm-router.db`
 - `openai-codex-auth-url.txt`
+- `anthropic-claude-auth-url.txt`
 - SQLite `-wal` and `-shm` sidecar files when active
 
 Treat this directory as sensitive because it contains local account credentials.
@@ -193,7 +258,7 @@ go run ./cmd/lm-router version
 
 GitHub Actions builds Linux `amd64` and `arm64` artifacts on pushes to `main` and manual workflow runs.
 
-The project is local-first and does not currently include a web dashboard, Docker packaging, cloud tunneling, or non-Codex providers.
+The project is local-first and does not currently include a web dashboard, Docker packaging, or cloud tunneling.
 
 ## License
 
