@@ -281,7 +281,8 @@ func TestCustomProviderDetailMenuOmitsOAuthActions(t *testing.T) {
 // TestCustomProviderDetailDeleteAtCorrectIndex guards against the
 // index/action desync: a 5-item custom menu must map "Delete Connection"
 // (index 4) to detailDelete, not to whatever index 4 means in the 8-item
-// OAuth menu ("Refresh Token").
+// OAuth menu ("Refresh Token"). It also exercises the Y/N confirmation:
+// Enter only arms the prompt, "y" performs the delete.
 func TestCustomProviderDetailDeleteAtCorrectIndex(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir())
@@ -299,16 +300,70 @@ func TestCustomProviderDetailDeleteAtCorrectIndex(t *testing.T) {
 	model := New(ctx, db, app.NewRingLogger(10, nil), app.NewServerController(app.ServerControllerConfig{}), store.DefaultSettings())
 	model.accounts = []store.Account{account}
 	model.selectedAccount = 0
+	model.stack = []screen{screenProviders}
 	model.screen = screenProviderDetail
 	model.selected = 4 // "Delete Connection" in the 5-item custom menu
 
 	next, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = next.(Model)
+	if len(model.accounts) != 1 {
+		t.Fatalf("expected account not yet deleted, accounts=%+v", model.accounts)
+	}
+	if model.confirmAction != confirmDeleteProvider {
+		t.Fatalf("expected confirmDeleteProvider armed, got %v", model.confirmAction)
+	}
+	if view := model.View(); !strings.Contains(view, `Delete connection "my-server"?`) {
+		t.Fatalf("confirm prompt not rendered: %q", view)
+	}
+
+	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	model = next.(Model)
 	if len(model.accounts) != 0 {
 		t.Fatalf("expected account deleted, accounts=%+v", model.accounts)
 	}
+	if model.screen != screenProviders {
+		t.Fatalf("expected screen popped back to screenProviders, got %v", model.screen)
+	}
 	if _, err := db.GetAccount(ctx, "c1"); err == nil {
 		t.Fatal("expected account removed from store")
+	}
+}
+
+// TestCustomProviderDetailDeleteCancelledOnN confirms pressing "n" leaves
+// the account intact and clears the pending confirmation.
+func TestCustomProviderDetailDeleteCancelledOnN(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	account := store.Account{
+		ID: "c1", Provider: store.ProviderCustom, Name: "my-server", Enabled: true,
+		Prefix: "myapi", BaseURL: "https://x", CompatType: store.CompatOpenAIStyle, APIType: store.CustomAPITypeChat,
+	}
+	if err := db.UpsertAccount(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	model := New(ctx, db, app.NewRingLogger(10, nil), app.NewServerController(app.ServerControllerConfig{}), store.DefaultSettings())
+	model.accounts = []store.Account{account}
+	model.selectedAccount = 0
+	model.screen = screenProviderDetail
+	model.selected = 4
+
+	next, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(Model)
+
+	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	model = next.(Model)
+	if len(model.accounts) != 1 {
+		t.Fatalf("expected account not deleted, accounts=%+v", model.accounts)
+	}
+	if model.confirmAction != confirmNone {
+		t.Fatalf("expected confirmation cleared, got %v", model.confirmAction)
+	}
+	if _, err := db.GetAccount(ctx, "c1"); err != nil {
+		t.Fatalf("expected account still in store: %v", err)
 	}
 }
 

@@ -93,6 +93,10 @@ type Model struct {
 	logFilter         string
 	riskForReauth     bool
 
+	confirmAction   confirmAction // confirmNone when no confirmation is armed
+	confirmTargetID string        // account ID or API key ID; unused for confirmClearLogs
+	confirmLabel    string        // e.g. `Delete connection "my-server"? (y/N)`
+
 	customStep         customProviderStep
 	customCompatType   string
 	customAPIType      string
@@ -194,6 +198,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.screen == screenSettings && m.settingEditing {
 			return m.updateSettingInput(msg)
+		}
+		if m.confirmAction != confirmNone {
+			return m.updateConfirm(msg)
 		}
 		switch msg.Type {
 		case tea.KeyCtrlC:
@@ -522,7 +529,8 @@ func (m Model) activate() (tea.Model, tea.Cmd) {
 			m.logFilter = nextLogFilter(m.logFilter)
 			return m, nil
 		}
-		m.logger.Clear()
+		m.confirmAction = confirmClearLogs
+		m.confirmLabel = "Clear all logs? (y/N)"
 	case screenCodexConfig:
 		return m.back(), nil
 	case screenClaudeConfig:
@@ -651,6 +659,17 @@ type detailMenuItem struct {
 	Label  string
 	Action detailAction
 }
+
+// confirmAction identifies which destructive action a pending Y/N
+// confirmation prompt will perform when the user presses "y".
+type confirmAction int
+
+const (
+	confirmNone confirmAction = iota
+	confirmDeleteProvider
+	confirmDeleteKey
+	confirmClearLogs
+)
 
 func providerDetailMenu(account store.Account) []detailMenuItem {
 	enableText := "Disable Connection"
@@ -978,13 +997,10 @@ func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
 		m.accounts[m.selectedAccount] = account
 		m.statusLine = "Success: provider updated"
 	case detailDelete:
-		if err := (app.ProviderService{DB: m.db}).Delete(m.ctx, account.ID); err != nil {
-			m.statusLine = "Error: " + err.Error()
-			return m, nil
-		}
-		m.accounts = append(m.accounts[:m.selectedAccount], m.accounts[m.selectedAccount+1:]...)
-		m.statusLine = "Success: provider deleted"
-		return m.back(), nil
+		m.confirmAction = confirmDeleteProvider
+		m.confirmTargetID = account.ID
+		m.confirmLabel = fmt.Sprintf("Delete connection %q? (y/N)", account.Name)
+		return m, nil
 	}
 	return m, nil
 }
@@ -1002,13 +1018,86 @@ func (m Model) activateKeys() (tea.Model, tea.Cmd) {
 	idx := m.selected - 2
 	if idx >= 0 && idx < len(m.keys) {
 		key := m.keys[idx]
-		if err := (app.KeyService{DB: m.db}).Delete(m.ctx, key.ID); err != nil {
-			m.statusLine = "Error: " + err.Error()
-			return m, nil
-		}
-		m.keys = append(m.keys[:idx], m.keys[idx+1:]...)
-		m.statusLine = "Success: API key deleted"
+		m.confirmAction = confirmDeleteKey
+		m.confirmTargetID = key.ID
+		m.confirmLabel = fmt.Sprintf("Delete API key %q? (y/N)", key.Name)
 	}
+	return m, nil
+}
+
+// updateConfirm handles keystrokes while a Y/N delete confirmation is armed.
+// Only an explicit "y" performs the action — Enter is the TUI's normal
+// "activate" key everywhere else, so treating it as confirmation here would
+// defeat the whole point of the guard against a stray extra keystroke.
+func (m Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		return m.cancelConfirm(), nil
+	case tea.KeyEnter:
+		return m.cancelConfirm(), nil
+	}
+	switch msg.String() {
+	case "y", "Y":
+		return m.resolveConfirm()
+	case "n", "N":
+		return m.cancelConfirm(), nil
+	}
+	return m, nil
+}
+
+func (m Model) resolveConfirm() (tea.Model, tea.Cmd) {
+	action, targetID := m.confirmAction, m.confirmTargetID
+	m = m.cancelConfirm()
+	switch action {
+	case confirmDeleteProvider:
+		return m.deleteProviderByID(targetID)
+	case confirmDeleteKey:
+		return m.deleteKeyByID(targetID)
+	case confirmClearLogs:
+		m.logger.Clear()
+		m.statusLine = "Success: logs cleared"
+	}
+	return m, nil
+}
+
+func (m Model) cancelConfirm() Model {
+	m.confirmAction = confirmNone
+	m.confirmTargetID = ""
+	m.confirmLabel = ""
+	return m
+}
+
+// deleteProviderByID and deleteKeyByID re-look-up their target by ID rather
+// than trusting a slice index captured before the confirmation round-trip —
+// a background list reload during the prompt can't cause the wrong row to
+// be deleted.
+func (m Model) deleteProviderByID(id string) (tea.Model, tea.Cmd) {
+	if err := (app.ProviderService{DB: m.db}).Delete(m.ctx, id); err != nil {
+		m.statusLine = "Error: " + err.Error()
+		return m, nil
+	}
+	for i, a := range m.accounts {
+		if a.ID == id {
+			m.accounts = append(m.accounts[:i], m.accounts[i+1:]...)
+			break
+		}
+	}
+	m.statusLine = "Success: provider deleted"
+	return m.back(), nil
+}
+
+func (m Model) deleteKeyByID(id string) (tea.Model, tea.Cmd) {
+	if err := (app.KeyService{DB: m.db}).Delete(m.ctx, id); err != nil {
+		m.statusLine = "Error: " + err.Error()
+		return m, nil
+	}
+	for i, k := range m.keys {
+		if k.ID == id {
+			m.keys = append(m.keys[:i], m.keys[i+1:]...)
+			break
+		}
+	}
+	m.statusLine = "Success: API key deleted"
 	return m, nil
 }
 
@@ -1634,6 +1723,10 @@ func (m Model) viewProviderDetail() string {
 		}
 	}
 	lines = append(lines, "")
+	if m.confirmAction == confirmDeleteProvider {
+		lines = append(lines, m.confirmLabel)
+		return strings.Join(lines, "\n")
+	}
 	if m.aliasEditing {
 		lines = append(lines, "Edit alias:", m.aliasInput.View())
 		return strings.Join(lines, "\n")
@@ -1676,7 +1769,11 @@ func (m Model) viewKeys() string {
 	for _, key := range m.keys {
 		items = append(items, fmt.Sprintf("Delete %s (%s, prefix=%s)", key.Name, key.ID, key.Prefix))
 	}
-	return strings.Join(renderMenu(m.selected, items), "\n")
+	menu := strings.Join(renderMenu(m.selected, items), "\n")
+	if m.confirmAction == confirmDeleteKey {
+		return menu + "\n\n" + m.confirmLabel
+	}
+	return menu
 }
 
 func (m Model) viewServer() string {
@@ -1720,6 +1817,10 @@ func (m Model) viewSettings() string {
 
 func (m Model) viewLogs() string {
 	lines := renderMenu(m.selected, []string{"<- Back", "Filter: " + strings.ToUpper(m.logFilter), "Clear Logs"})
+	if m.confirmAction == confirmClearLogs {
+		lines = append(lines, "", m.confirmLabel)
+		return strings.Join(lines, "\n")
+	}
 	lines = append(lines, "")
 	entries := m.logger.Entries()
 	if len(entries) == 0 {
