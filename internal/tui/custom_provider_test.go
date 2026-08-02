@@ -202,6 +202,61 @@ func TestCustomProviderEditReusesWizardAndPreseedsFields(t *testing.T) {
 	}
 }
 
+// TestCustomProviderEditPreservesResponsesAPIType is a regression test: the
+// wizard's API-Type step used to always reset its cursor to "chat" (index 0)
+// on entry, so editing a "responses" connection and clicking straight through
+// silently downgraded it to "chat". TestCustomProviderEditReusesWizardAndPreseedsFields
+// only exercises a "chat" account and can't catch this.
+func TestCustomProviderEditPreservesResponsesAPIType(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	account := store.Account{
+		ID: "acct_1", Provider: store.ProviderCustom, Name: "my-server", Enabled: true,
+		AccessToken: "sk-original", Prefix: "myapi", BaseURL: "https://api.example.com/v1",
+		CompatType: store.CompatOpenAIStyle, APIType: store.CustomAPITypeResponses,
+	}
+	if err := db.UpsertAccount(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	model := New(ctx, db, app.NewRingLogger(10, nil), app.NewServerController(app.ServerControllerConfig{}), store.DefaultSettings())
+	model.accounts = []store.Account{account}
+
+	next, _ := model.beginAddCustomProvider("acct_1")
+	model = next.(Model)
+
+	// Click straight through without touching the API-Type cursor.
+	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter}) // name -> prefix
+	model = next.(Model)
+	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter}) // prefix -> baseURL
+	model = next.(Model)
+	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter}) // baseURL -> apikey
+	model = next.(Model)
+	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter}) // apikey (left blank) -> apitype
+	model = next.(Model)
+	if model.customListSelected != 1 {
+		t.Fatalf("customListSelected=%d want 1 (responses) pre-selected", model.customListSelected)
+	}
+	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter}) // apitype -> submit
+	model = next.(Model)
+	if cmd == nil {
+		t.Fatal("expected save command")
+	}
+	next, _ = model.Update(cmd())
+	model = next.(Model)
+
+	updated, err := db.GetAccount(ctx, "acct_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.APIType != store.CustomAPITypeResponses {
+		t.Fatalf("api type=%q want unchanged %q", updated.APIType, store.CustomAPITypeResponses)
+	}
+}
+
 func TestCustomProviderDetailMenuOmitsOAuthActions(t *testing.T) {
 	account := store.Account{ID: "c1", Provider: store.ProviderCustom, Name: "my-server", Enabled: true, Prefix: "myapi"}
 	model := NewTestModel()

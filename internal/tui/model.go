@@ -795,7 +795,15 @@ func (m Model) advanceCustomProviderStep() (tea.Model, tea.Cmd) {
 			return m.submitCustomProvider()
 		}
 		m.customStep = customStepAPIType
-		m.customListSelected = 0
+		// Derive the cursor from the current value (pre-seeded from the account
+		// on edit, "" on add) instead of always resetting to 0 — otherwise
+		// editing a "responses" connection silently downgrades it to "chat" on
+		// the next Enter, since the cursor is what customStepAPIType reads from.
+		if m.customAPIType == store.CustomAPITypeResponses {
+			m.customListSelected = 1
+		} else {
+			m.customListSelected = 0
+		}
 	case customStepAPIType:
 		if m.customListSelected == 0 {
 			m.customAPIType = store.CustomAPITypeChat
