@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -353,5 +354,190 @@ func TestConcurrentPrioritySwapCASSucceedsOnce(t *testing.T) {
 	}
 	if successes.Load() != 1 {
 		t.Fatalf("successful swaps=%d", successes.Load())
+	}
+}
+
+func customAccount(id, prefix string) Account {
+	return Account{
+		ID:          id,
+		Provider:    ProviderCustom,
+		Name:        id,
+		Enabled:     true,
+		AccessToken: "sk-test",
+		Prefix:      prefix,
+		BaseURL:     "https://example.com/v1",
+		CompatType:  CompatOpenAIStyle,
+		APIType:     CustomAPITypeChat,
+	}
+}
+
+// TestNonCustomAccountsStoreNullPrefix guards against the sharpest edge case
+// in the custom-provider migration: '' IS NOT NULL is true in SQLite, so if
+// the empty-string Prefix on ordinary accounts were bound directly instead of
+// mapped to NULL, the second non-custom account added after this migration
+// would collide on accounts_prefix_unique and fail to save.
+func TestNonCustomAccountsStoreNullPrefix(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.UpsertAccount(ctx, Account{ID: "codex-1", Provider: ProviderOpenAICodex, Name: "one", Enabled: true}); err != nil {
+		t.Fatalf("first account: %v", err)
+	}
+	if err := db.UpsertAccount(ctx, Account{ID: "codex-2", Provider: ProviderOpenAICodex, Name: "two", Enabled: true}); err != nil {
+		t.Fatalf("second account: %v", err)
+	}
+}
+
+func TestCustomPrefixUniquenessRejectsDuplicate(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.UpsertAccount(ctx, customAccount("custom-1", "foo")); err != nil {
+		t.Fatalf("first custom account: %v", err)
+	}
+	if err := db.UpsertAccount(ctx, customAccount("custom-2", "foo")); err == nil {
+		t.Fatal("expected duplicate prefix to be rejected")
+	}
+	// Saving the same account again (e.g. an edit) with its own prefix must succeed.
+	again := customAccount("custom-1", "foo")
+	again.BaseURL = "https://example.com/v2"
+	if err := db.UpsertAccount(ctx, again); err != nil {
+		t.Fatalf("re-saving own prefix: %v", err)
+	}
+}
+
+func TestUpsertCustomAccountValidatesPrefixSyntax(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	for _, prefix := range []string{"", "has/slash", "has space"} {
+		account := customAccount("custom-1", prefix)
+		if err := db.UpsertAccount(ctx, account); err == nil {
+			t.Fatalf("prefix %q: expected validation error", prefix)
+		}
+	}
+}
+
+func TestGetAccountByPrefixReturnsAccount(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.UpsertAccount(ctx, customAccount("custom-1", "Foo")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.GetAccountByPrefix(ctx, "foo")
+	if err != nil {
+		t.Fatalf("get by prefix: %v", err)
+	}
+	if got.ID != "custom-1" || got.BaseURL != "https://example.com/v1" || got.CompatType != CompatOpenAIStyle {
+		t.Fatalf("unexpected account: %+v", got)
+	}
+}
+
+func TestGetAccountByPrefixMissingReturnsNotFound(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.GetAccountByPrefix(ctx, "nope"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected sql.ErrNoRows, got %v", err)
+	}
+}
+
+func TestCanonicalProviderAcceptsCustom(t *testing.T) {
+	if got, err := CanonicalProvider("custom"); err != nil || got != ProviderCustom {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+}
+
+func TestListAccountsByProviderReturnsCustomPool(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.UpsertAccount(ctx, customAccount("custom-1", "foo")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertAccount(ctx, Account{ID: "codex-1", Provider: ProviderOpenAICodex, Name: "one", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	accounts, err := db.ListAccountsByProvider(ctx, ProviderCustom)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 1 || accounts[0].ID != "custom-1" {
+		t.Fatalf("custom pool=%+v", accounts)
+	}
+}
+
+// TestCustomProviderColumnsMigrationPreservesExistingAccount mirrors
+// TestRetryStateMigrationPreservesExistingAccount: a pre-migration accounts
+// table missing prefix/base_url/compat_type/api_type must still open and
+// read cleanly, and re-running init must stay idempotent.
+func TestCustomProviderColumnsMigrationPreservesExistingAccount(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	legacy, err := sql.Open("sqlite", filepath.Join(dir, "lm-router.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.ExecContext(ctx, `
+		create table accounts (
+			id text primary key, provider text not null, name text not null,
+			priority integer not null default 0, enabled integer not null default 1,
+			needs_reauth integer not null default 0, access_token text not null default '',
+			refresh_token text not null default '', expires_at text not null default '',
+			consecutive_failures integer not null default 0, last_failure_at text,
+			cooldown_until text, metadata_json text not null default '{}'
+		);
+		insert into accounts (id, provider, name, priority, enabled, access_token)
+		values ('legacy', 'openai-codex', 'main', 1, 1, 'kept');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	account, err := db.GetAccount(ctx, "legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.AccessToken != "kept" || account.Prefix != "" || account.BaseURL != "" || account.CompatType != "" || account.APIType != "" {
+		t.Fatalf("migrated account=%+v", account)
+	}
+	// A second non-custom account must still save after migration (NULL-prefix regression guard).
+	if err := db.UpsertAccount(ctx, Account{ID: "legacy-2", Provider: ProviderOpenAICodex, Name: "second", Enabled: true}); err != nil {
+		t.Fatalf("second account after migration: %v", err)
+	}
+	if err := db.init(ctx); err != nil {
+		t.Fatalf("second migration: %v", err)
 	}
 }

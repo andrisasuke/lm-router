@@ -17,6 +17,7 @@ import (
 
 	"github.com/andrisasuke/lm-router/internal/anthropic"
 	"github.com/andrisasuke/lm-router/internal/codex"
+	"github.com/andrisasuke/lm-router/internal/customprovider"
 	"github.com/andrisasuke/lm-router/internal/store"
 )
 
@@ -30,6 +31,7 @@ type ServerConfig struct {
 	Store       *store.DB
 	Codex       *codex.Client
 	Anthropic   *anthropic.Client
+	Custom      *customprovider.Client
 	RequireKey  bool
 	Logger      Logger
 	LogRequests bool
@@ -49,14 +51,24 @@ type Server struct {
 	store      *store.DB
 	codex      *codex.Client
 	anthropic  *anthropic.Client
+	custom     *customprovider.Client
 	requireKey bool
 }
 
 func New(cfg ServerConfig) http.Handler {
+	logger := cfg.Logger
+	if logger == nil {
+		logger = stdLogger{}
+	}
+	custom := cfg.Custom
+	if custom == nil {
+		custom = customprovider.NewClient(logger)
+	}
 	s := &Server{
 		store:      cfg.Store,
 		codex:      cfg.Codex,
 		anthropic:  cfg.Anthropic,
+		custom:     custom,
 		requireKey: cfg.RequireKey,
 	}
 	mux := http.NewServeMux()
@@ -68,10 +80,6 @@ func New(cfg ServerConfig) http.Handler {
 	mux.HandleFunc("/v1/v1/messages", s.messages)
 	mux.HandleFunc("/v1/messages/count_tokens", s.countAnthropicTokens)
 	mux.HandleFunc("/v1/v1/messages/count_tokens", s.countAnthropicTokens)
-	logger := cfg.Logger
-	if logger == nil {
-		logger = stdLogger{}
-	}
 	if !cfg.LogRequests {
 		return mux
 	}
@@ -182,12 +190,20 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	provider, _, err := providerForModel(reqBody["model"])
+	route, err := s.resolveModelRoute(r.Context(), reqBody["model"])
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	if provider != store.ProviderOpenAICodex {
+	if route.Provider == store.ProviderCustom {
+		if route.Account.CompatType != store.CompatOpenAIStyle || route.Account.APIType != store.CustomAPITypeResponses {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("custom provider %q does not support /v1/responses", route.Account.Name))
+			return
+		}
+		s.dispatchCustomResponses(w, r, route, body)
+		return
+	}
+	if route.Provider != store.ProviderOpenAICodex {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "claude models are only supported through /v1/messages")
 		return
 	}
@@ -226,17 +242,30 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
 		return
 	}
-	var body map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
-		return
-	}
-	provider, _, err := providerForModel(body["model"])
+	rawBody, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	if provider != store.ProviderOpenAICodex {
+	var body map[string]any
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	route, err := s.resolveModelRoute(r.Context(), body["model"])
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	if route.Provider == store.ProviderCustom {
+		if route.Account.CompatType != store.CompatOpenAIStyle || route.Account.APIType != store.CustomAPITypeChat {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("custom provider %q does not support /v1/chat/completions", route.Account.Name))
+			return
+		}
+		s.dispatchCustomChatCompletions(w, r, route, rawBody)
+		return
+	}
+	if route.Provider != store.ProviderOpenAICodex {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "claude models are only supported through /v1/messages")
 		return
 	}
@@ -1742,12 +1771,20 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	provider, _, err := providerForModel(model)
+	route, err := s.resolveModelRoute(r.Context(), model)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	if provider == store.ProviderAnthropicClaude {
+	if route.Provider == store.ProviderCustom {
+		if route.Account.CompatType != store.CompatAnthropicStyle {
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("custom provider %q does not support /v1/messages", route.Account.Name))
+			return
+		}
+		s.dispatchCustomMessages(w, r, route, body)
+		return
+	}
+	if route.Provider == store.ProviderAnthropicClaude {
 		var envelope struct {
 			Stream bool `json:"stream"`
 		}
@@ -1809,12 +1846,19 @@ func (s *Server) countAnthropicTokens(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	provider, _, err := providerForModel(model)
+	route, err := s.resolveModelRoute(r.Context(), model)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	if provider == store.ProviderAnthropicClaude {
+	if route.Provider == store.ProviderCustom && route.Account.CompatType != store.CompatAnthropicStyle {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("custom provider %q does not support /v1/messages/count_tokens; use /v1/chat/completions", route.Account.Name))
+		return
+	}
+	// A custom anthropic-compatible connection falls through to the same local
+	// estimate as openai-codex below, rather than forwarding to an upstream
+	// count_tokens endpoint that may not exist on arbitrary third-party servers.
+	if route.Provider == store.ProviderAnthropicClaude {
 		result, err := s.routeAnthropic(r.Context(), body, r.Header, true)
 		if err != nil {
 			if result.Status > 0 && result.Header != nil {

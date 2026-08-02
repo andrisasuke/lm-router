@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,6 +35,7 @@ const (
 	screenProviderTypes
 	screenClaudeRisk
 	screenClaudeConfig
+	screenAddCustomProvider
 )
 
 type addProviderField int
@@ -41,6 +43,20 @@ type addProviderField int
 const (
 	addProviderNameField addProviderField = iota
 	addProviderCallbackField
+)
+
+// customProviderStep drives the custom-provider add/edit wizard, a separate
+// state machine from addProviderField's 2-field OAuth flow — this one has up
+// to 6 sequential steps and no OAuth browser-URL/callback concept at all.
+type customProviderStep int
+
+const (
+	customStepCompatType customProviderStep = iota
+	customStepName
+	customStepPrefix
+	customStepBaseURL
+	customStepAPIKey
+	customStepAPIType
 )
 
 const statusTimeout = 3 * time.Second
@@ -77,6 +93,16 @@ type Model struct {
 	logFilter         string
 	riskForReauth     bool
 
+	customStep         customProviderStep
+	customCompatType   string
+	customAPIType      string
+	customListSelected int
+	customEditingID    string
+	customNameInput    textinput.Model
+	customPrefixInput  textinput.Model
+	customBaseURLInput textinput.Model
+	customAPIKeyInput  textinput.Model
+
 	providerQuota        *codex.QuotaInfo
 	claudeQuota          *anthropic.UsageInfo
 	claudeQuotaRetryAt   map[string]time.Time
@@ -102,6 +128,23 @@ func NewWithDataDir(ctx context.Context, db *store.DB, logger *app.RingLogger, s
 	aliasInput.Width = 32
 	settingInput := textinput.New()
 	settingInput.Width = 40
+	customName := textinput.New()
+	customName.Placeholder = "my-server"
+	customName.CharLimit = 80
+	customName.Width = 32
+	customPrefix := textinput.New()
+	customPrefix.Placeholder = "myapi"
+	customPrefix.CharLimit = 40
+	customPrefix.Width = 32
+	customBaseURL := textinput.New()
+	customBaseURL.Placeholder = "https://api.example.com/v1"
+	customBaseURL.CharLimit = 200
+	customBaseURL.Width = 60
+	customAPIKey := textinput.New()
+	customAPIKey.Placeholder = "sk-..."
+	customAPIKey.CharLimit = 200
+	customAPIKey.Width = 60
+	customAPIKey.EchoMode = textinput.EchoPassword
 	return Model{
 		ctx:                ctx,
 		db:                 db,
@@ -116,6 +159,10 @@ func NewWithDataDir(ctx context.Context, db *store.DB, logger *app.RingLogger, s
 		settingInput:       settingInput,
 		logFilter:          "all",
 		claudeQuotaRetryAt: make(map[string]time.Time),
+		customNameInput:    customName,
+		customPrefixInput:  customPrefix,
+		customBaseURLInput: customBaseURL,
+		customAPIKeyInput:  customAPIKey,
 	}
 }
 
@@ -136,6 +183,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.screen == screenAddProvider {
 			return m.updateAddProvider(msg)
 		}
+		if m.screen == screenAddCustomProvider {
+			return m.updateAddCustomProvider(msg)
+		}
 		if m.screen == screenReauthProvider {
 			return m.updateReauthProvider(msg)
 		}
@@ -151,12 +201,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyEsc, tea.KeyBackspace:
 			return m.navigateBack()
 		case tea.KeyShiftUp:
-			if m.screen == screenProviders {
+			// Priority ordering is meaningless for custom providers — a prefix
+			// selects one connection directly, there is no pool to reorder.
+			if m.screen == screenProviders && m.selectedProvider != store.ProviderCustom {
 				return m.reorderSelectedProvider(-1)
 			}
 			m.move(-1)
 		case tea.KeyShiftDown:
-			if m.screen == screenProviders {
+			if m.screen == screenProviders && m.selectedProvider != store.ProviderCustom {
 				return m.reorderSelectedProvider(1)
 			}
 			m.move(1)
@@ -178,6 +230,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.accounts = append(m.accounts, msg.account)
 		m.statusLine = fmt.Sprintf("Success: provider %q saved", msg.account.Name)
+		m.screen = screenProviders
+		if len(m.stack) > 0 && m.stack[len(m.stack)-1] == screenProviders {
+			m.stack = m.stack[:len(m.stack)-1]
+		}
+		m.selected = 0
+	case customProviderDoneMsg:
+		if msg.err != nil {
+			m.statusLine = "Error: " + app.HumanError(msg.err.Error())
+			return m, nil
+		}
+		if m.customEditingID == "" {
+			m.accounts = append(m.accounts, msg.account)
+		} else {
+			for i, existing := range m.accounts {
+				if existing.ID == msg.account.ID {
+					m.accounts[i] = msg.account
+					break
+				}
+			}
+		}
+		m.statusLine = fmt.Sprintf("Success: custom provider %q saved", msg.account.Name)
 		m.screen = screenProviders
 		if len(m.stack) > 0 && m.stack[len(m.stack)-1] == screenProviders {
 			m.stack = m.stack[:len(m.stack)-1]
@@ -275,6 +348,8 @@ func (m Model) View() string {
 		b.WriteString(m.viewClaudeRisk())
 	case screenAddProvider:
 		b.WriteString(m.viewAddProvider())
+	case screenAddCustomProvider:
+		b.WriteString(m.viewAddCustomProvider())
 	case screenReauthProvider:
 		b.WriteString(m.viewReauthProvider())
 	case screenProviderDetail:
@@ -483,10 +558,13 @@ func (m Model) activateProviderTypes() (tea.Model, tea.Cmd) {
 	if m.selected == 0 {
 		return m.navigateBack()
 	}
-	if m.selected == 1 {
+	switch m.selected {
+	case 1:
 		m.selectedProvider = store.ProviderOpenAICodex
-	} else {
+	case 2:
 		m.selectedProvider = store.ProviderAnthropicClaude
+	case 3:
+		m.selectedProvider = store.ProviderCustom
 	}
 	m.accounts = nil
 	m.selectedAccount = -1
@@ -529,6 +607,11 @@ func (m Model) activateProviders() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) beginProviderAuth(reauth bool) (tea.Model, tea.Cmd) {
+	if m.selectedProvider == store.ProviderCustom {
+		// Custom providers have no OAuth flow to begin; reauth is never true
+		// here since the detail screen omits Re-authenticate for them.
+		return m.beginAddCustomProvider("")
+	}
 	service := app.ProviderService{DB: m.db}
 	redirectURI := "http://localhost:1455/auth/callback"
 	if m.selectedProvider == store.ProviderAnthropicClaude {
@@ -548,25 +631,305 @@ func (m Model) beginProviderAuth(reauth bool) (tea.Model, tea.Cmd) {
 	return m, textinput.Blink
 }
 
+// detailAction identifies a provider-detail menu row independent of its
+// position, so a shorter custom-provider menu can't have its rows
+// misinterpreted as the longer OAuth menu's rows at the same index.
+type detailAction int
+
+const (
+	detailBack detailAction = iota
+	detailEdit
+	detailTest
+	detailQuota
+	detailRefresh
+	detailReauth
+	detailToggleEnabled
+	detailDelete
+)
+
+type detailMenuItem struct {
+	Label  string
+	Action detailAction
+}
+
+func providerDetailMenu(account store.Account) []detailMenuItem {
+	enableText := "Disable Connection"
+	if !account.Enabled {
+		enableText = "Enable Connection"
+	}
+	if account.Provider == store.ProviderCustom {
+		return []detailMenuItem{
+			{"<- Back", detailBack},
+			{"Edit Connection", detailEdit},
+			{"Test Connection", detailTest},
+			{enableText, detailToggleEnabled},
+			{"Delete Connection", detailDelete},
+		}
+	}
+	return []detailMenuItem{
+		{"<- Back", detailBack},
+		{"Edit Alias", detailEdit},
+		{"Test Connection", detailTest},
+		{"Show Quota Limit", detailQuota},
+		{"Refresh Token", detailRefresh},
+		{"Re-authenticate", detailReauth},
+		{enableText, detailToggleEnabled},
+		{"Delete Connection", detailDelete},
+	}
+}
+
+// beginAddCustomProvider starts the custom-provider wizard for either Add
+// (editID == "") or Edit (editID identifies the account to pre-seed from and
+// update in place). It is the single screen used for both.
+func (m Model) beginAddCustomProvider(editID string) (tea.Model, tea.Cmd) {
+	m.customEditingID = editID
+	m.customCompatType = ""
+	m.customAPIType = ""
+	m.customListSelected = 0
+	m.customNameInput.SetValue("")
+	m.customPrefixInput.SetValue("")
+	m.customBaseURLInput.SetValue("")
+	m.customAPIKeyInput.SetValue("")
+	m.customStep = customStepCompatType
+	if editID != "" {
+		for _, account := range m.accounts {
+			if account.ID != editID {
+				continue
+			}
+			m.customCompatType = account.CompatType
+			m.customAPIType = account.APIType
+			m.customNameInput.SetValue(account.Name)
+			m.customPrefixInput.SetValue(account.Prefix)
+			m.customBaseURLInput.SetValue(account.BaseURL)
+			break
+		}
+		// Compat type can't change on edit (UpdateCustomProviderParams has no
+		// field for it), so the wizard starts one step in.
+		m.customStep = customStepName
+	}
+	m.push(screenAddCustomProvider)
+	m.focusCustomStep()
+	return m, textinput.Blink
+}
+
+func (m *Model) focusCustomStep() {
+	m.customNameInput.Blur()
+	m.customPrefixInput.Blur()
+	m.customBaseURLInput.Blur()
+	m.customAPIKeyInput.Blur()
+	switch m.customStep {
+	case customStepName:
+		m.customNameInput.Focus()
+	case customStepPrefix:
+		m.customPrefixInput.Focus()
+	case customStepBaseURL:
+		m.customBaseURLInput.Focus()
+	case customStepAPIKey:
+		m.customAPIKeyInput.Focus()
+	}
+}
+
+func (m Model) updateAddCustomProvider(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	isListStep := m.customStep == customStepCompatType || m.customStep == customStepAPIType
+	switch msg.Type {
+	case tea.KeyEsc:
+		return m.back(), nil
+	case tea.KeyUp, tea.KeyDown:
+		if isListStep {
+			m.customListSelected = (m.customListSelected + 1) % 2
+		}
+		return m, nil
+	case tea.KeyEnter:
+		return m.advanceCustomProviderStep()
+	}
+	if isListStep {
+		return m, nil
+	}
+	var cmd tea.Cmd
+	switch m.customStep {
+	case customStepName:
+		m.customNameInput, cmd = m.customNameInput.Update(msg)
+	case customStepPrefix:
+		m.customPrefixInput, cmd = m.customPrefixInput.Update(msg)
+	case customStepBaseURL:
+		m.customBaseURLInput, cmd = m.customBaseURLInput.Update(msg)
+	case customStepAPIKey:
+		m.customAPIKeyInput, cmd = m.customAPIKeyInput.Update(msg)
+	}
+	return m, cmd
+}
+
+func (m Model) advanceCustomProviderStep() (tea.Model, tea.Cmd) {
+	switch m.customStep {
+	case customStepCompatType:
+		if m.customListSelected == 0 {
+			m.customCompatType = store.CompatOpenAIStyle
+		} else {
+			m.customCompatType = store.CompatAnthropicStyle
+		}
+		m.customStep = customStepName
+	case customStepName:
+		if strings.TrimSpace(m.customNameInput.Value()) == "" {
+			m.statusLine = "Error: name is required"
+			return m, nil
+		}
+		m.customStep = customStepPrefix
+	case customStepPrefix:
+		if err := m.validatePrefix(m.customPrefixInput.Value(), m.customEditingID); err != nil {
+			m.statusLine = "Error: " + err.Error()
+			return m, nil
+		}
+		m.customStep = customStepBaseURL
+	case customStepBaseURL:
+		if err := validateBaseURL(strings.TrimSpace(m.customBaseURLInput.Value())); err != nil {
+			m.statusLine = "Error: " + err.Error()
+			return m, nil
+		}
+		m.customStep = customStepAPIKey
+	case customStepAPIKey:
+		if m.customEditingID == "" && strings.TrimSpace(m.customAPIKeyInput.Value()) == "" {
+			m.statusLine = "Error: API key is required"
+			return m, nil
+		}
+		if m.customCompatType != store.CompatOpenAIStyle {
+			return m.submitCustomProvider()
+		}
+		m.customStep = customStepAPIType
+		// Derive the cursor from the current value (pre-seeded from the account
+		// on edit, "" on add) instead of always resetting to 0 — otherwise
+		// editing a "responses" connection silently downgrades it to "chat" on
+		// the next Enter, since the cursor is what customStepAPIType reads from.
+		if m.customAPIType == store.CustomAPITypeResponses {
+			m.customListSelected = 1
+		} else {
+			m.customListSelected = 0
+		}
+	case customStepAPIType:
+		if m.customListSelected == 0 {
+			m.customAPIType = store.CustomAPITypeChat
+		} else {
+			m.customAPIType = store.CustomAPITypeResponses
+		}
+		return m.submitCustomProvider()
+	}
+	m.focusCustomStep()
+	return m, nil
+}
+
+func (m Model) submitCustomProvider() (tea.Model, tea.Cmd) {
+	name := strings.TrimSpace(m.customNameInput.Value())
+	prefix := strings.ToLower(strings.TrimSpace(m.customPrefixInput.Value()))
+	baseURL := strings.TrimSpace(m.customBaseURLInput.Value())
+	apiKey := m.customAPIKeyInput.Value()
+	compatType := m.customCompatType
+	apiType := m.customAPIType
+	editID := m.customEditingID
+	db := m.db
+	ctx := m.ctx
+	return m, func() tea.Msg {
+		if editID == "" {
+			account, err := (app.ProviderService{DB: db}).AddCustomProvider(ctx, app.AddCustomProviderParams{
+				Name: name, Prefix: prefix, BaseURL: baseURL, APIKey: apiKey,
+				CompatType: compatType, APIType: apiType,
+			})
+			return customProviderDoneMsg{account: account, err: err}
+		}
+		params := app.UpdateCustomProviderParams{Name: &name, Prefix: &prefix, BaseURL: &baseURL, APIType: &apiType}
+		if apiKey != "" {
+			params.APIKey = &apiKey
+		}
+		account, err := (app.ProviderService{DB: db}).UpdateCustomProvider(ctx, editID, params)
+		return customProviderDoneMsg{account: account, err: err}
+	}
+}
+
+func (m Model) viewAddCustomProvider() string {
+	switch m.customStep {
+	case customStepCompatType:
+		lines := []string{"Select type:"}
+		lines = append(lines, renderMenu(m.customListSelected, []string{"openai-compatible", "anthropic-compatible"})...)
+		return strings.Join(lines, "\n")
+	case customStepAPIType:
+		lines := []string{"API Type:"}
+		lines = append(lines, renderMenu(m.customListSelected, []string{"chat (chat/completions)", "responses"})...)
+		return strings.Join(lines, "\n")
+	case customStepName:
+		return "Name:\n" + m.customNameInput.View()
+	case customStepPrefix:
+		return "Prefix (used in model IDs, e.g. myapi):\n" + m.customPrefixInput.View()
+	case customStepBaseURL:
+		return "Base URL (e.g. https://api.example.com/v1):\n" + m.customBaseURLInput.View()
+	case customStepAPIKey:
+		lines := []string{"API Key:", m.customAPIKeyInput.View()}
+		if m.customEditingID != "" {
+			lines = append(lines, "", "Leave blank to keep the current key.")
+		}
+		return strings.Join(lines, "\n")
+	default:
+		return ""
+	}
+}
+
+// validatePrefix checks syntax locally and gives an early uniqueness hint;
+// the authoritative check runs server-side in store.UpsertAccount on submit.
+func (m Model) validatePrefix(raw, excludeID string) error {
+	prefix := strings.ToLower(strings.TrimSpace(raw))
+	if prefix == "" {
+		return fmt.Errorf("prefix is required")
+	}
+	if strings.ContainsAny(prefix, "/ \t\n") {
+		return fmt.Errorf("prefix must not contain slashes or whitespace")
+	}
+	if m.db == nil {
+		return nil
+	}
+	existing, err := m.db.GetAccountByPrefix(m.ctx, prefix)
+	if err != nil {
+		return nil
+	}
+	if existing.ID != excludeID {
+		return fmt.Errorf("prefix %q is already in use", prefix)
+	}
+	return nil
+}
+
+func validateBaseURL(raw string) error {
+	if raw == "" {
+		return fmt.Errorf("base URL is required")
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return fmt.Errorf("base URL must be a valid http(s) URL")
+	}
+	return nil
+}
+
 func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
 	if m.selectedAccount < 0 || m.selectedAccount >= len(m.accounts) {
 		return m.back(), nil
 	}
 	account := m.accounts[m.selectedAccount]
-	switch m.selected {
-	case 0:
+	menu := providerDetailMenu(account)
+	if m.selected < 0 || m.selected >= len(menu) {
+		return m, nil
+	}
+	switch menu[m.selected].Action {
+	case detailBack:
 		return m.back(), nil
-	case 1:
+	case detailEdit:
+		if account.Provider == store.ProviderCustom {
+			return m.beginAddCustomProvider(account.ID)
+		}
 		m.aliasInput.SetValue(account.Name)
 		m.aliasInput.Focus()
 		m.aliasEditing = true
 		return m, textinput.Blink
-	case 2:
+	case detailTest:
 		return m, func() tea.Msg {
 			result, err := (app.ProviderService{DB: m.db, Logger: m.logger}).Test(m.ctx, account, m.settings.DefaultModel)
 			return providerTestDoneMsg{result: result, err: err}
 		}
-	case 3:
+	case detailQuota:
 		if m.providerQuotaLoading {
 			return m, nil
 		}
@@ -589,7 +952,7 @@ func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
 			info, err := (app.ProviderService{DB: m.db, Logger: m.logger}).Quota(m.ctx, account)
 			return providerQuotaDoneMsg{info: info, err: err}
 		}
-	case 4:
+	case detailRefresh:
 		refreshed, err := (app.ProviderService{DB: m.db}).Refresh(m.ctx, account.ID)
 		if err != nil {
 			m.statusLine = "Error: " + app.HumanError(err.Error())
@@ -597,7 +960,7 @@ func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
 		}
 		m.accounts[m.selectedAccount] = refreshed
 		m.statusLine = "Success: provider refreshed"
-	case 5:
+	case detailReauth:
 		m.selectedProvider = account.Provider
 		if account.Provider == store.ProviderAnthropicClaude {
 			m.riskForReauth = true
@@ -605,7 +968,7 @@ func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m.beginProviderAuth(true)
-	case 6:
+	case detailToggleEnabled:
 		err := (app.ProviderService{DB: m.db}).SetEnabled(m.ctx, account.ID, !account.Enabled)
 		if err != nil {
 			m.statusLine = "Error: " + err.Error()
@@ -614,7 +977,7 @@ func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
 		account.Enabled = !account.Enabled
 		m.accounts[m.selectedAccount] = account
 		m.statusLine = "Success: provider updated"
-	case 7:
+	case detailDelete:
 		if err := (app.ProviderService{DB: m.db}).Delete(m.ctx, account.ID); err != nil {
 			m.statusLine = "Error: " + err.Error()
 			return m, nil
@@ -801,12 +1164,15 @@ func (m Model) itemCount() int {
 	case screenHome:
 		return 8
 	case screenProviderTypes:
-		return 3
+		return 4
 	case screenProviders:
 		return 2 + len(m.accounts)
 	case screenClaudeRisk:
 		return 2
 	case screenProviderDetail:
+		if m.selectedAccount >= 0 && m.selectedAccount < len(m.accounts) {
+			return len(providerDetailMenu(m.accounts[m.selectedAccount]))
+		}
 		return 8
 	case screenReauthProvider:
 		return 0
@@ -929,9 +1295,17 @@ func (m Model) title() string {
 	case screenProviderTypes:
 		return "Providers"
 	case screenProviders:
+		if m.selectedProvider == store.ProviderCustom {
+			return providerTitle(m.selectedProvider)
+		}
 		return providerTitle(m.selectedProvider) + " (OAUTH)"
 	case screenAddProvider:
 		return "Add " + providerTitle(m.selectedProvider)
+	case screenAddCustomProvider:
+		if m.customEditingID == "" {
+			return "Add Custom Provider"
+		}
+		return "Edit Custom Provider"
 	case screenClaudeRisk:
 		return "Anthropic Claude Risk Warning"
 	case screenReauthProvider:
@@ -971,6 +1345,11 @@ func (m Model) breadcrumb() string {
 		return "LM Router > Providers > " + providerTitle(m.selectedProvider)
 	case screenAddProvider:
 		return "LM Router > Providers > " + providerTitle(m.selectedProvider) + " > Add"
+	case screenAddCustomProvider:
+		if m.customEditingID == "" {
+			return "LM Router > Providers > Custom Provider > Add"
+		}
+		return "LM Router > Providers > Custom Provider > Edit"
 	case screenClaudeRisk:
 		return "LM Router > Providers > Anthropic Claude > Risk"
 	case screenReauthProvider:
@@ -1012,7 +1391,7 @@ func (m Model) viewHome() string {
 }
 
 func (m Model) viewProviderTypes() string {
-	return strings.Join(renderMenu(m.selected, []string{"<- Back", "OpenAI Codex", "Anthropic Claude"}), "\n")
+	return strings.Join(renderMenu(m.selected, []string{"<- Back", "OpenAI Codex", "Anthropic Claude", "Custom Provider"}), "\n")
 }
 
 func (m Model) viewProviders() string {
@@ -1045,27 +1424,39 @@ func (m Model) viewClaudeRisk() string {
 }
 
 func providerTitle(provider string) string {
-	if provider == store.ProviderAnthropicClaude {
+	switch provider {
+	case store.ProviderAnthropicClaude:
 		return "Anthropic Claude"
+	case store.ProviderCustom:
+		return "Custom Provider"
+	default:
+		return "OpenAI Codex"
 	}
-	return "OpenAI Codex"
 }
 
 func providerRouting(provider string) string {
-	if provider == store.ProviderAnthropicClaude {
+	switch provider {
+	case store.ProviderAnthropicClaude:
 		return "claude* via native Messages API"
+	case store.ProviderCustom:
+		return "<prefix>/<model> via configured connection (passthrough)"
+	default:
+		return "gpt* via Codex Responses"
 	}
-	return "gpt* via Codex Responses"
 }
 
 func providerDefaultModel(provider, configured string) string {
-	if provider == store.ProviderAnthropicClaude {
+	switch provider {
+	case store.ProviderAnthropicClaude:
 		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(configured)), "claude") {
 			return configured
 		}
 		return app.DefaultClaudeModel
+	case store.ProviderCustom:
+		return "n/a — set per connection"
+	default:
+		return configured
 	}
-	return configured
 }
 
 func (m Model) viewAddProvider() string {
@@ -1186,16 +1577,23 @@ func (m Model) viewProviderDetail() string {
 		return "Connection not found"
 	}
 	account := m.accounts[m.selectedAccount]
-	enableText := "Disable Connection"
-	if !account.Enabled {
-		enableText = "Enable Connection"
-	}
 	lines := []string{
 		"Connection: " + providerDisplayName(account),
 		"Alias:      " + account.Name,
 		"Status:     " + app.FormatProviderStatus(account),
 		"Priority:   " + fmt.Sprintf("%d", account.Priority),
-		"Expires:    " + account.ExpiresAt.Local().Format(time.RFC3339),
+	}
+	if account.Provider == store.ProviderCustom {
+		lines = append(lines,
+			"Prefix:     "+account.Prefix,
+			"Base URL:   "+account.BaseURL,
+			"Compat:     "+account.CompatType,
+		)
+		if account.APIType != "" {
+			lines = append(lines, "API Type:   "+account.APIType)
+		}
+	} else {
+		lines = append(lines, "Expires:    "+account.ExpiresAt.Local().Format(time.RFC3339))
 	}
 	switch {
 	case m.providerQuotaLoading:
@@ -1240,7 +1638,12 @@ func (m Model) viewProviderDetail() string {
 		lines = append(lines, "Edit alias:", m.aliasInput.View())
 		return strings.Join(lines, "\n")
 	}
-	lines = append(lines, renderMenu(m.selected, []string{"<- Back", "Edit Alias", "Test Connection", "Show Quota Limit", "Refresh Token", "Re-authenticate", enableText, "Delete Connection"})...)
+	menu := providerDetailMenu(account)
+	labels := make([]string, len(menu))
+	for i, item := range menu {
+		labels[i] = item.Label
+	}
+	lines = append(lines, renderMenu(m.selected, labels)...)
 	return strings.Join(lines, "\n")
 }
 
@@ -1441,6 +1844,11 @@ type providerQuotaDoneMsg struct {
 }
 
 type reauthDoneMsg struct {
+	account store.Account
+	err     error
+}
+
+type customProviderDoneMsg struct {
 	account store.Account
 	err     error
 }
