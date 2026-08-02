@@ -103,6 +103,8 @@ func runAuth(args []string) {
 	switch args[0] {
 	case "add":
 		runAuthAdd(args[1:])
+	case "edit":
+		runAuthEdit(args[1:])
 	case "list":
 		runAuthList(args[1:])
 	case "remove":
@@ -131,6 +133,10 @@ func runAuthAdd(args []string) {
 		}
 		provider = canonical
 		args = args[1:]
+	}
+	if provider == store.ProviderCustom {
+		runAuthAddCustom(args)
+		return
 	}
 	fs := flag.NewFlagSet("auth add", flag.ExitOnError)
 	name := fs.String("name", "", "")
@@ -198,6 +204,166 @@ func runAuthAdd(args []string) {
 		}
 		printTestResult(result)
 	}
+}
+
+func runAuthAddCustom(args []string) {
+	fs := flag.NewFlagSet("auth add custom", flag.ExitOnError)
+	name := fs.String("name", "", "")
+	prefix := fs.String("prefix", "", "")
+	baseURL := fs.String("base-url", "", "")
+	compatType := fs.String("compat-type", "", "")
+	apiType := fs.String("api-type", "", "")
+	dataDir := fs.String("data-dir", defaultDataDir(), "")
+	testAfterAdd := fs.Bool("test", false, "")
+	testModel := fs.String("test-model", "", "")
+	fs.Parse(args)
+
+	compat := strings.TrimSpace(*compatType)
+	if compat == "" {
+		fmt.Println("Select type:")
+		fmt.Println("  1. openai-compatible")
+		fmt.Println("  2. anthropic-compatible")
+		fmt.Print("Type (1/2): ")
+		choice, err := readPromptLine(os.Stdin)
+		if err != nil {
+			exitError(err)
+		}
+		switch strings.TrimSpace(choice) {
+		case "1":
+			compat = store.CompatOpenAIStyle
+		case "2":
+			compat = store.CompatAnthropicStyle
+		default:
+			exitErrorf("invalid type selection %q", choice)
+		}
+	}
+
+	name2 := promptIfEmpty(*name, "Name: ")
+	prefixVal := promptIfEmpty(*prefix, "Prefix (used in model IDs, e.g. myapi): ")
+	baseURLVal := promptIfEmpty(*baseURL, "Base URL (e.g. https://api.example.com/v1): ")
+
+	apiKey, err := promptAPIKey()
+	if err != nil {
+		exitError(err)
+	}
+
+	apiTypeVal := strings.TrimSpace(*apiType)
+	if compat == store.CompatOpenAIStyle && apiTypeVal == "" {
+		fmt.Println("API Type:")
+		fmt.Println("  1. chat")
+		fmt.Println("  2. responses")
+		fmt.Print("API Type (1/2, default 1): ")
+		choice, err := readPromptLine(os.Stdin)
+		if err != nil {
+			exitError(err)
+		}
+		switch strings.TrimSpace(choice) {
+		case "", "1":
+			apiTypeVal = store.CustomAPITypeChat
+		case "2":
+			apiTypeVal = store.CustomAPITypeResponses
+		default:
+			exitErrorf("invalid api type selection %q", choice)
+		}
+	}
+
+	ctx := context.Background()
+	db, err := store.Open(ctx, *dataDir)
+	if err != nil {
+		exitError(err)
+	}
+	defer db.Close()
+
+	account, err := (app.ProviderService{DB: db}).AddCustomProvider(ctx, app.AddCustomProviderParams{
+		Name: name2, Prefix: prefixVal, BaseURL: baseURLVal, APIKey: apiKey,
+		CompatType: compat, APIType: apiTypeVal,
+	})
+	if err != nil {
+		exitError(err)
+	}
+	fmt.Printf("Success: custom provider %q saved (%s), prefix=%s\n", account.Name, account.ID, account.Prefix)
+	if *testAfterAdd {
+		result, err := testStoredAccount(ctx, db, account, *testModel, "")
+		if err != nil {
+			exitError(err)
+		}
+		printTestResult(result)
+	}
+}
+
+// promptIfEmpty returns current trimmed, or prompts for it if blank. Only the
+// custom-provider wizard uses this — the OAuth add flow's two fields have
+// their own dedicated prompts above.
+func promptIfEmpty(current, label string) string {
+	if v := strings.TrimSpace(current); v != "" {
+		return v
+	}
+	fmt.Print(label)
+	line, err := readPromptLine(os.Stdin)
+	if err != nil {
+		exitError(err)
+	}
+	value := strings.TrimSpace(line)
+	if value == "" {
+		exitErrorf("a value is required")
+	}
+	return value
+}
+
+// promptAPIKey reads a secret without echoing it, unlike readPromptLine.
+func promptAPIKey() (string, error) {
+	fmt.Print("API Key: ")
+	fd := int(os.Stdin.Fd())
+	if !term.IsTerminal(fd) {
+		return readPromptLine(os.Stdin)
+	}
+	raw, err := term.ReadPassword(fd)
+	fmt.Println()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(raw)), nil
+}
+
+func runAuthEdit(args []string) {
+	fs := flag.NewFlagSet("auth edit", flag.ExitOnError)
+	dataDir := fs.String("data-dir", defaultDataDir(), "")
+	name := fs.String("name", "", "")
+	prefix := fs.String("prefix", "", "")
+	baseURL := fs.String("base-url", "", "")
+	apiKey := fs.String("api-key", "", "")
+	apiType := fs.String("api-type", "", "")
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		exitErrorf("usage: lm-router auth edit <account-id> [--name] [--prefix] [--base-url] [--api-key] [--api-type]")
+	}
+	ctx := context.Background()
+	db, err := store.Open(ctx, *dataDir)
+	if err != nil {
+		exitError(err)
+	}
+	defer db.Close()
+
+	var params app.UpdateCustomProviderParams
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "name":
+			params.Name = name
+		case "prefix":
+			params.Prefix = prefix
+		case "base-url":
+			params.BaseURL = baseURL
+		case "api-key":
+			params.APIKey = apiKey
+		case "api-type":
+			params.APIType = apiType
+		}
+	})
+	account, err := (app.ProviderService{DB: db}).UpdateCustomProvider(ctx, fs.Arg(0), params)
+	if err != nil {
+		exitError(err)
+	}
+	fmt.Printf("Success: custom provider %q updated (%s)\n", account.Name, account.ID)
 }
 
 func runAuthList(args []string) {
@@ -307,6 +473,10 @@ func runAuthRefresh(args []string) {
 	account, err := resolveAccount(ctx, db, fs, *provider, *name)
 	if err != nil {
 		exitError(err)
+	}
+	if account.Provider == store.ProviderCustom {
+		fmt.Printf("No refresh needed: %q uses a static API key, not OAuth (%s)\n", account.Name, account.ID)
+		return
 	}
 	account, err = (app.ProviderService{DB: db}).Refresh(ctx, account.ID)
 	if err != nil {
@@ -427,13 +597,20 @@ func printAccounts(accounts []store.Account) {
 		if account.CooldownUntil.Valid && account.CooldownUntil.Time.After(time.Now()) {
 			status = "cooldown until " + account.CooldownUntil.Time.Local().Format(time.RFC3339)
 		}
-		fmt.Printf("- %s (%s): provider=%s priority=%d status=%s expires=%s\n",
+		expires := account.ExpiresAt.Local().Format(time.RFC3339)
+		extra := ""
+		if account.Provider == store.ProviderCustom {
+			expires = "n/a (static key)"
+			extra = fmt.Sprintf(" prefix=%s", account.Prefix)
+		}
+		fmt.Printf("- %s (%s): provider=%s priority=%d status=%s expires=%s%s\n",
 			account.Name,
 			account.ID,
 			account.Provider,
 			account.Priority,
 			status,
-			account.ExpiresAt.Local().Format(time.RFC3339),
+			expires,
+			extra,
 		)
 	}
 }

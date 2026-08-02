@@ -1,14 +1,35 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/andrisasuke/lm-router/internal/app"
 	"github.com/andrisasuke/lm-router/internal/store"
 )
+
+// captureStdout redirects os.Stdout for the duration of fn. Only safe for
+// code paths that don't call os.Exit.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+	fn()
+	_ = w.Close()
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	return buf.String()
+}
 
 func TestVersionTextIncludesVersionCommitAndBuildDate(t *testing.T) {
 	got := versionText("0.0.1", "abc123", "2026-05-08T00:00:00Z")
@@ -101,6 +122,70 @@ func TestResolveAccountNameIsScopedByProvider(t *testing.T) {
 	got, err := resolveAccount(ctx, db, fs, "claude", "main")
 	if err != nil || got.ID != "claude" {
 		t.Fatalf("got=%+v err=%v", got, err)
+	}
+}
+
+func TestResolveAccountNameIsScopedByProviderIncludesCustom(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.UpsertAccount(ctx, store.Account{
+		ID: "custom", Provider: store.ProviderCustom, Name: "main", Enabled: true,
+		Prefix: "myapi", BaseURL: "https://api.example.com", CompatType: store.CompatOpenAIStyle, APIType: store.CustomAPITypeChat,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	got, err := resolveAccount(ctx, db, fs, "custom", "main")
+	if err != nil || got.ID != "custom" {
+		t.Fatalf("got=%+v err=%v", got, err)
+	}
+}
+
+func TestRunAuthRefreshOnCustomAccountReportsNoRefreshNeeded(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	db, err := store.Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, err := (app.ProviderService{DB: db}).AddCustomProvider(ctx, app.AddCustomProviderParams{
+		Name: "my-server", Prefix: "myapi", BaseURL: "https://api.example.com",
+		APIKey: "sk-test", CompatType: store.CompatOpenAIStyle, APIType: store.CustomAPITypeChat,
+	})
+	db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		runAuthRefresh([]string{"-data-dir", dir, account.ID})
+	})
+	if !strings.Contains(output, "No refresh needed") {
+		t.Fatalf("output=%q, want a no-refresh-needed message, not a misleading Success", output)
+	}
+	if strings.Contains(output, "Success") {
+		t.Fatalf("output=%q should not claim Success for a static-key account", output)
+	}
+}
+
+func TestPrintAccountsOmitsZeroExpiryForCustomAccounts(t *testing.T) {
+	output := captureStdout(t, func() {
+		printAccounts([]store.Account{{
+			ID: "custom", Provider: store.ProviderCustom, Name: "my-server", Enabled: true, Prefix: "myapi",
+		}})
+	})
+	if !strings.Contains(output, "n/a (static key)") {
+		t.Fatalf("output=%q missing static-key expiry placeholder", output)
+	}
+	if strings.Contains(output, "0001-01-01") {
+		t.Fatalf("output=%q leaked zero-value expiry timestamp", output)
+	}
+	if !strings.Contains(output, "prefix=myapi") {
+		t.Fatalf("output=%q missing prefix", output)
 	}
 }
 

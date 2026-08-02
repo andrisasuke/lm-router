@@ -14,6 +14,7 @@ import (
 
 	"github.com/andrisasuke/lm-router/internal/anthropic"
 	"github.com/andrisasuke/lm-router/internal/codex"
+	"github.com/andrisasuke/lm-router/internal/customprovider"
 	"github.com/andrisasuke/lm-router/internal/oauth"
 	"github.com/andrisasuke/lm-router/internal/proxy"
 	"github.com/andrisasuke/lm-router/internal/store"
@@ -135,6 +136,76 @@ func (s ProviderService) ReAuthFromCallback(ctx context.Context, session AuthSes
 	return updated, nil
 }
 
+type AddCustomProviderParams struct {
+	Name, Prefix, BaseURL, APIKey, CompatType, APIType string
+}
+
+// AddCustomProvider saves a static-API-key connection to a user-configured
+// OpenAI-compatible or Anthropic-compatible endpoint. Unlike AddFromCallback,
+// there is no OAuth exchange: the caller already has everything needed.
+func (s ProviderService) AddCustomProvider(ctx context.Context, params AddCustomProviderParams) (store.Account, error) {
+	name := strings.TrimSpace(params.Name)
+	if name == "" {
+		name = params.Prefix
+	}
+	priority, err := s.DB.NextPriorityForProvider(ctx, store.ProviderCustom)
+	if err != nil {
+		return store.Account{}, err
+	}
+	account := store.Account{
+		ID:          "acct_" + randomHexString(8),
+		Provider:    store.ProviderCustom,
+		Name:        name,
+		Priority:    priority,
+		Enabled:     true,
+		AccessToken: params.APIKey,
+		Prefix:      params.Prefix,
+		BaseURL:     params.BaseURL,
+		CompatType:  params.CompatType,
+		APIType:     params.APIType,
+	}
+	if err := s.DB.UpsertAccount(ctx, account); err != nil {
+		return store.Account{}, err
+	}
+	return account, nil
+}
+
+// UpdateCustomProviderParams uses pointer fields so an omitted flag/field
+// leaves the stored value untouched. A nil or empty APIKey always means
+// "keep the current key" — there is no way to clear it back to empty.
+type UpdateCustomProviderParams struct {
+	Name, Prefix, BaseURL, APIKey, APIType *string
+}
+
+func (s ProviderService) UpdateCustomProvider(ctx context.Context, id string, params UpdateCustomProviderParams) (store.Account, error) {
+	account, err := s.DB.MustGetAccount(ctx, id)
+	if err != nil {
+		return store.Account{}, err
+	}
+	if account.Provider != store.ProviderCustom {
+		return store.Account{}, fmt.Errorf("account %s is not a custom provider connection", id)
+	}
+	if params.Name != nil {
+		account.Name = *params.Name
+	}
+	if params.Prefix != nil {
+		account.Prefix = *params.Prefix
+	}
+	if params.BaseURL != nil {
+		account.BaseURL = *params.BaseURL
+	}
+	if params.APIKey != nil && *params.APIKey != "" {
+		account.AccessToken = *params.APIKey
+	}
+	if params.APIType != nil {
+		account.APIType = *params.APIType
+	}
+	if err := s.DB.UpsertAccount(ctx, account); err != nil {
+		return store.Account{}, err
+	}
+	return account, nil
+}
+
 func (s ProviderService) List(ctx context.Context) ([]store.Account, error) {
 	return s.DB.ListAccounts(ctx)
 }
@@ -164,6 +235,9 @@ func (s ProviderService) Refresh(ctx context.Context, id string) (store.Account,
 }
 
 func (s ProviderService) Test(ctx context.Context, account store.Account, model string) (ProviderTestResult, error) {
+	if account.Provider == store.ProviderCustom {
+		return s.testCustomProvider(ctx, account, model)
+	}
 	if account.Provider == store.ProviderAnthropicClaude {
 		client := anthropic.NewClient(s.AnthropicMessagesURL, s.AnthropicUsageURL, NewProviderTokenManager(s.DB), s.Logger)
 		info, err := client.FetchUsage(ctx, account)
@@ -200,6 +274,44 @@ func (s ProviderService) Test(ctx context.Context, account store.Account, model 
 		OK:        result.Status >= 200 && result.Status < 300,
 		Output:    output,
 	}, nil
+}
+
+// testCustomProvider probes a custom connection using its own base_url and
+// api_key. anthropic-compatible: a minimal /messages ping — a 4xx/5xx other
+// than 401/403 still means "we reached a server," so only 2xx counts as
+// fully connected, and 401/403 is called out explicitly as an auth failure
+// rather than folded into a generic "not connected." openai-compatible: a
+// GET /models probe, which some third-party servers may not implement — a
+// documented v1 limitation, not a bug.
+func (s ProviderService) testCustomProvider(ctx context.Context, account store.Account, model string) (ProviderTestResult, error) {
+	client := customprovider.NewClient(s.Logger)
+	var result customprovider.ExecuteResult
+	var err error
+	if account.CompatType == store.CompatAnthropicStyle {
+		if model == "" {
+			model = "test"
+		}
+		body := []byte(mustJSON(map[string]any{
+			"model":      model,
+			"max_tokens": 1,
+			"messages":   []map[string]any{{"role": "user", "content": "ping"}},
+		}))
+		result, err = client.Execute(ctx, customprovider.ExecuteParams{Account: account, Path: "/messages", Body: body})
+	} else {
+		result, err = client.Execute(ctx, customprovider.ExecuteParams{Account: account, Path: "/models", Method: http.MethodGet})
+	}
+	if err != nil {
+		return ProviderTestResult{}, err
+	}
+	output := string(result.Body)
+	switch {
+	case result.Status >= 200 && result.Status < 300:
+		return ProviderTestResult{AccountID: account.ID, Name: account.Name, Status: result.Status, OK: true, Output: output}, nil
+	case result.Status == http.StatusUnauthorized || result.Status == http.StatusForbidden:
+		return ProviderTestResult{AccountID: account.ID, Name: account.Name, Status: result.Status, OK: false, Output: "authentication failed: " + output}, nil
+	default:
+		return ProviderTestResult{AccountID: account.ID, Name: account.Name, Status: result.Status, OK: false, Output: output}, nil
+	}
 }
 
 func (s ProviderService) Quota(ctx context.Context, account store.Account) (codex.QuotaInfo, error) {
@@ -293,10 +405,13 @@ func NewProxyHandler(db *store.DB, settings store.Settings, logger Logger) http.
 	client.SetUpstreamTimeout(settings.UpstreamTimeoutSeconds)
 	claudeClient := anthropic.NewClient(anthropic.DefaultMessagesURL, anthropic.DefaultUsageURL, tokens, codexLogger)
 	claudeClient.SetUpstreamTimeout(settings.UpstreamTimeoutSeconds)
+	customClient := customprovider.NewClient(codexLogger)
+	customClient.SetUpstreamTimeout(settings.UpstreamTimeoutSeconds)
 	return proxy.New(proxy.ServerConfig{
 		Store:       db,
 		Codex:       client,
 		Anthropic:   claudeClient,
+		Custom:      customClient,
 		RequireKey:  true,
 		Logger:      logger,
 		LogRequests: settings.LogRequests,

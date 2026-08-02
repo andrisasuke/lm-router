@@ -9,17 +9,12 @@ It provides model-prefix routing, provider-scoped priority and failover, local A
 
 ## Features
 
-- OpenAI-compatible endpoints:
-  - `POST /v1/responses`
-  - `POST /v1/chat/completions`
-  - `GET /v1/models`
-- Anthropic-compatible `POST /v1/messages` and `POST /v1/messages/count_tokens`
-- Native Claude Messages pass-through, including streaming, thinking, tools, prompt caching, and Claude Code headers
-- Multiple Codex and Claude connections with independent provider-scoped priority
-- Failover on retryable errors such as `429` and upstream `5xx`
+- OpenAI-compatible endpoints: `POST /v1/responses`, `POST /v1/chat/completions`, `GET /v1/models`
+- Anthropic-compatible `POST /v1/messages` and `POST /v1/messages/count_tokens`, including streaming, thinking, tools, prompt caching, and Claude Code headers
+- Multiple Codex and Claude connections with provider-scoped priority and failover on retryable errors (`429`, upstream `5xx`)
+- Custom OpenAI/Anthropic-compatible connections routed by model prefix, authenticated with a static API key
 - Provider-specific OAuth refresh, account testing, and quota display
-- CLI and terminal UI for providers, API keys, settings, and logs
-- Sensitive authorization headers are redacted from logs
+- CLI and terminal UI for providers, API keys, settings, and logs; sensitive headers are redacted from logs
 
 ## Requirements
 
@@ -128,6 +123,21 @@ go run ./cmd/lm-router claude print-config \
 
 `ANTHROPIC_AUTH_TOKEN` is the local `lm-router` API key, not the upstream OAuth token. The router replaces it with the selected provider token and never forwards the local key upstream.
 
+## Custom Providers
+
+Route a model prefix to any OpenAI-compatible or Anthropic-compatible HTTP endpoint using a static API key instead of OAuth:
+
+```bash
+go run ./cmd/lm-router auth add custom \
+  --name my-server --prefix myapi --base-url https://api.example.com/v1 \
+  --compat-type openai-compatible --api-type chat
+# prompts for the API key without echoing it
+```
+
+A request for model `myapi/gpt-4o` then routes to that connection, with the prefix stripped before forwarding. `--api-type` (`chat` or `responses`) only applies to `openai-compatible`; anthropic-compatible connections serve `/v1/messages`. Edit a saved connection with `auth edit <account-id> [--name] [--prefix] [--base-url] [--api-key] [--api-type]` (omit `--api-key` to keep the current one), or manage it from the TUI under `Providers > Custom Provider`.
+
+Custom connections are passthrough only: no format translation and no multi-key failover — one prefix maps to exactly one connection. See [Model Routing](#model-routing-failover-and-quota) below for the endpoint matrix.
+
 ## Client URLs
 
 | Client | Base URL | API |
@@ -172,7 +182,7 @@ go run ./cmd/lm-router tui \
   --port 19090
 ```
 
-The TUI starts with `Providers > OpenAI Codex` or `Providers > Anthropic Claude`, then shows only that provider's connections. Both providers support alias editing, connection tests, quota, refresh, re-authentication, enable/disable, deletion, and Shift+Up/Down reordering. Claude OAuth is gated by a risk confirmation page. The home screen includes read-only Codex and Claude configuration views.
+The TUI starts with `Providers > OpenAI Codex`, `Providers > Anthropic Claude`, or `Providers > Custom Provider`, then shows only that type's connections. Codex and Claude connections support alias editing, connection tests, quota, refresh, re-authentication, enable/disable, deletion, and Shift+Up/Down reordering; custom connections support edit, test, enable/disable, and deletion (no quota, refresh, or OAuth). Claude OAuth is gated by a risk confirmation page. The home screen includes read-only Codex and Claude configuration views.
 
 Long OAuth URLs are saved to `~/.lm-router/openai-codex-auth-url.txt` or `~/.lm-router/anthropic-claude-auth-url.txt` to avoid terminal clipping.
 
@@ -199,6 +209,11 @@ go run ./cmd/lm-router auth disable <account-id>
 go run ./cmd/lm-router auth move <account-id> --priority 1
 go run ./cmd/lm-router auth remove <account-id>
 
+# Custom providers
+go run ./cmd/lm-router auth add custom --name my-server --prefix myapi \
+  --base-url https://api.example.com/v1 --compat-type openai-compatible --api-type chat
+go run ./cmd/lm-router auth edit <account-id> --base-url https://api.example.com/v2
+
 # API keys
 go run ./cmd/lm-router keys create --name local
 go run ./cmd/lm-router keys list
@@ -220,16 +235,16 @@ The config helper prints authentication material; treat its output as sensitive.
 
 ## Model Routing, Failover, and Quota
 
-Routing uses the trimmed model prefix case-insensitively:
+Routing uses the trimmed model prefix case-insensitively. A model containing a `/` (`<prefix>/<model_id>`) is matched against registered custom-provider connections instead:
 
-| Endpoint | `gpt*` | `claude*` | Other prefix |
-| --- | --- | --- | --- |
-| `/v1/messages` | Translate to Codex Responses | Native Anthropic Messages | `400` |
-| `/v1/messages/count_tokens` | Local estimate | Native Anthropic token count | `400` |
-| `/v1/responses` | Codex Responses | `400`; use `/v1/messages` | `400` |
-| `/v1/chat/completions` | Translate to Codex Responses | `400`; use `/v1/messages` | `400` |
+| Endpoint | `gpt*` | `claude*` | Matching custom prefix | Other prefix |
+| --- | --- | --- | --- | --- |
+| `/v1/messages` | Translate to Codex Responses | Native Anthropic Messages | Native passthrough (anthropic-compatible only) | `400` |
+| `/v1/messages/count_tokens` | Local estimate | Native Anthropic token count | Local estimate (anthropic-compatible only) | `400` |
+| `/v1/responses` | Codex Responses | `400`; use `/v1/messages` | Native passthrough (openai-compatible + responses only) | `400` |
+| `/v1/chat/completions` | Translate to Codex Responses | `400`; use `/v1/messages` | Native passthrough (openai-compatible + chat only) | `400` |
 
-The Claude model list returned by `/v1/models` is informational. Any `claude*` model is passed through, so newly released model names do not require a router update.
+`/v1/models` returns a static, informational list; it does not enumerate custom-provider models, and any `claude*` model is passed through without needing a router update.
 
 For each request, the router tries enabled connections in priority order within the selected provider. Network errors, `429`, `5xx`, and persistent `401/403` after one refresh-and-retry can move to the next connection. Other `4xx` request errors stop immediately. `Retry-After` and rate-limit reset headers create per-account cooldowns; without them the router uses jittered exponential backoff from two seconds up to five minutes. A successful Claude fallback is promoted by atomically swapping its priority with the first failed connection; token-count calls never reorder connections. Once a successful streaming response starts, the router never switches accounts mid-stream.
 

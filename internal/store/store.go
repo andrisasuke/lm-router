@@ -25,6 +25,13 @@ type DB struct {
 const (
 	ProviderOpenAICodex     = "openai-codex"
 	ProviderAnthropicClaude = "anthropic-claude"
+	ProviderCustom          = "custom"
+
+	CompatOpenAIStyle    = "openai-compatible"
+	CompatAnthropicStyle = "anthropic-compatible"
+
+	CustomAPITypeChat      = "chat"
+	CustomAPITypeResponses = "responses"
 )
 
 func CanonicalProvider(raw string) (string, error) {
@@ -33,6 +40,8 @@ func CanonicalProvider(raw string) (string, error) {
 		return ProviderOpenAICodex, nil
 	case ProviderAnthropicClaude, "claude":
 		return ProviderAnthropicClaude, nil
+	case ProviderCustom:
+		return ProviderCustom, nil
 	default:
 		return "", fmt.Errorf("unsupported provider %q", raw)
 	}
@@ -52,6 +61,14 @@ type Account struct {
 	LastFailureAt       sql.NullTime
 	CooldownUntil       sql.NullTime
 	MetadataJSON        string
+
+	// Custom-provider fields; empty/zero for openai-codex and anthropic-claude
+	// accounts. Prefix is stored as SQL NULL (not "") for non-custom accounts,
+	// see nullStringValue.
+	Prefix     string
+	BaseURL    string
+	CompatType string
+	APIType    string
 }
 
 type APIKey struct {
@@ -166,10 +183,24 @@ func (db *DB) init(ctx context.Context) error {
 		{name: "consecutive_failures", definition: "integer not null default 0"},
 		{name: "last_failure_at", definition: "text"},
 		{name: "cooldown_until", definition: "text"},
+		{name: "prefix", definition: "text"},
+		{name: "base_url", definition: "text not null default ''"},
+		{name: "compat_type", definition: "text not null default ''"},
+		{name: "api_type", definition: "text not null default ''"},
 	} {
 		if err := db.ensureColumn(ctx, "accounts", migration.name, migration.definition); err != nil {
 			return err
 		}
+	}
+	// Partial unique index: prefix is NULL for every openai-codex/anthropic-claude
+	// account (see nullStringValue), so only custom-provider connections are
+	// constrained here. ponytail: no NOCASE collation — callers normalize
+	// prefixes to lowercase before they ever reach this column.
+	if _, err := db.sql.ExecContext(ctx, `
+		create unique index if not exists accounts_prefix_unique
+		on accounts(prefix) where prefix is not null
+	`); err != nil {
+		return err
 	}
 	return db.migrateLegacyAccountAliases(ctx)
 }
@@ -392,6 +423,30 @@ func (db *DB) UpsertAccount(ctx context.Context, account Account) error {
 	if account.Name == "" {
 		return errors.New("connection alias is required")
 	}
+	if account.Provider == ProviderCustom {
+		account.Prefix = strings.ToLower(strings.TrimSpace(account.Prefix))
+		if err := validatePrefixSyntax(account.Prefix); err != nil {
+			return err
+		}
+		if err := db.ensurePrefixAvailable(ctx, account.Prefix, account.ID); err != nil {
+			return err
+		}
+		switch account.CompatType {
+		case CompatOpenAIStyle:
+			if account.APIType != CustomAPITypeChat && account.APIType != CustomAPITypeResponses {
+				return fmt.Errorf("api type must be %q or %q for an openai-compatible provider", CustomAPITypeChat, CustomAPITypeResponses)
+			}
+		case CompatAnthropicStyle:
+			account.APIType = ""
+		default:
+			return fmt.Errorf("compat type must be %q or %q", CompatOpenAIStyle, CompatAnthropicStyle)
+		}
+	} else {
+		account.Prefix = ""
+		account.BaseURL = ""
+		account.CompatType = ""
+		account.APIType = ""
+	}
 	if err := db.ensureAccountNameAvailable(ctx, account.Provider, account.Name, account.ID); err != nil {
 		return err
 	}
@@ -399,8 +454,8 @@ func (db *DB) UpsertAccount(ctx context.Context, account Account) error {
 		insert into accounts (
 			id, provider, name, priority, enabled, needs_reauth, access_token,
 			refresh_token, expires_at, consecutive_failures, last_failure_at,
-			cooldown_until, metadata_json
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			cooldown_until, metadata_json, prefix, base_url, compat_type, api_type
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(id) do update set
 			provider=excluded.provider,
 			name=excluded.name,
@@ -413,7 +468,11 @@ func (db *DB) UpsertAccount(ctx context.Context, account Account) error {
 			consecutive_failures=excluded.consecutive_failures,
 			last_failure_at=excluded.last_failure_at,
 			cooldown_until=excluded.cooldown_until,
-			metadata_json=excluded.metadata_json
+			metadata_json=excluded.metadata_json,
+			prefix=excluded.prefix,
+			base_url=excluded.base_url,
+			compat_type=excluded.compat_type,
+			api_type=excluded.api_type
 	`,
 		account.ID,
 		account.Provider,
@@ -428,15 +487,38 @@ func (db *DB) UpsertAccount(ctx context.Context, account Account) error {
 		nullTimeValue(account.LastFailureAt),
 		nullTimeValue(account.CooldownUntil),
 		defaultString(account.MetadataJSON, "{}"),
+		nullStringValue(account.Prefix),
+		account.BaseURL,
+		account.CompatType,
+		account.APIType,
 	)
 	return err
 }
 
+// validatePrefixSyntax enforces that a custom-provider prefix is safe to use
+// as the leading path segment of a "<prefix>/<model>" model id.
+func validatePrefixSyntax(prefix string) error {
+	if prefix == "" {
+		return errors.New("prefix is required for a custom provider")
+	}
+	if strings.ContainsAny(prefix, "/ \t\n") {
+		return errors.New("prefix must not contain slashes or whitespace")
+	}
+	for _, r := range prefix {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return fmt.Errorf("prefix %q contains an unsupported character %q", prefix, r)
+		}
+	}
+	return nil
+}
+
+const accountColumns = `id, provider, name, priority, enabled, needs_reauth, access_token,
+			refresh_token, expires_at, consecutive_failures, last_failure_at,
+			cooldown_until, metadata_json, prefix, base_url, compat_type, api_type`
+
 func (db *DB) GetAccount(ctx context.Context, id string) (Account, error) {
 	row := db.sql.QueryRowContext(ctx, `
-		select id, provider, name, priority, enabled, needs_reauth, access_token,
-			refresh_token, expires_at, consecutive_failures, last_failure_at,
-			cooldown_until, metadata_json
+		select `+accountColumns+`
 		from accounts where id = ?
 	`, id)
 	return scanAccount(row)
@@ -444,9 +526,7 @@ func (db *DB) GetAccount(ctx context.Context, id string) (Account, error) {
 
 func (db *DB) GetAccountByName(ctx context.Context, name string) (Account, error) {
 	row := db.sql.QueryRowContext(ctx, `
-		select id, provider, name, priority, enabled, needs_reauth, access_token,
-			refresh_token, expires_at, consecutive_failures, last_failure_at,
-			cooldown_until, metadata_json
+		select `+accountColumns+`
 		from accounts where name = ?
 		order by priority asc
 		limit 1
@@ -460,13 +540,22 @@ func (db *DB) GetAccountByProviderAndName(ctx context.Context, provider, name st
 		return Account{}, err
 	}
 	row := db.sql.QueryRowContext(ctx, `
-		select id, provider, name, priority, enabled, needs_reauth, access_token,
-			refresh_token, expires_at, consecutive_failures, last_failure_at,
-			cooldown_until, metadata_json
+		select `+accountColumns+`
 		from accounts where provider = ? and lower(name) = lower(?)
 		order by priority asc
 		limit 1
 	`, provider, strings.TrimSpace(name))
+	return scanAccount(row)
+}
+
+// GetAccountByPrefix resolves a custom-provider connection by its routing
+// prefix (the leading path segment of a "<prefix>/<model>" model id).
+func (db *DB) GetAccountByPrefix(ctx context.Context, prefix string) (Account, error) {
+	prefix = strings.ToLower(strings.TrimSpace(prefix))
+	row := db.sql.QueryRowContext(ctx, `
+		select `+accountColumns+`
+		from accounts where provider = ? and prefix = ?
+	`, ProviderCustom, prefix)
 	return scanAccount(row)
 }
 
@@ -492,9 +581,7 @@ func (db *DB) ListAccountsByProvider(ctx context.Context, provider string) ([]Ac
 
 func (db *DB) listAccounts(ctx context.Context, where string, arg any) ([]Account, error) {
 	query := `
-		select id, provider, name, priority, enabled, needs_reauth, access_token,
-			refresh_token, expires_at, consecutive_failures, last_failure_at,
-			cooldown_until, metadata_json
+		select ` + accountColumns + `
 		from accounts
 	`
 	if where != "" {
@@ -620,6 +707,21 @@ func (db *DB) ensureAccountNameAvailable(ctx context.Context, provider, name, ex
 	}
 	if count > 0 {
 		return fmt.Errorf("connection alias %q already exists for provider %s", name, provider)
+	}
+	return nil
+}
+
+func (db *DB) ensurePrefixAvailable(ctx context.Context, prefix, excludeID string) error {
+	var count int
+	err := db.sql.QueryRowContext(ctx, `
+		select count(1) from accounts
+		where provider = ? and prefix = ? and id <> ?
+	`, ProviderCustom, prefix, excludeID).Scan(&count)
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return fmt.Errorf("custom provider prefix %q is already in use", prefix)
 	}
 	return nil
 }
@@ -794,6 +896,7 @@ func scanAccount(scanner accountScanner) (Account, error) {
 	var expiresAt string
 	var lastFailure sql.NullString
 	var cooldown sql.NullString
+	var prefix sql.NullString
 	err := scanner.Scan(
 		&account.ID,
 		&account.Provider,
@@ -808,10 +911,15 @@ func scanAccount(scanner accountScanner) (Account, error) {
 		&lastFailure,
 		&cooldown,
 		&account.MetadataJSON,
+		&prefix,
+		&account.BaseURL,
+		&account.CompatType,
+		&account.APIType,
 	)
 	if err != nil {
 		return Account{}, err
 	}
+	account.Prefix = prefix.String
 	account.Enabled = enabled == 1
 	account.NeedsReauth = needsReauth == 1
 	if expiresAt != "" {
@@ -856,6 +964,16 @@ func nullTimeValue(v sql.NullTime) any {
 		return nil
 	}
 	return v.Time.UTC().Format(time.RFC3339Nano)
+}
+
+// nullStringValue maps "" to SQL NULL. Required for the accounts.prefix
+// column: '' IS NOT NULL is true in SQLite, so binding a plain "" would
+// collide with the partial unique index on every non-custom account.
+func nullStringValue(v string) any {
+	if v == "" {
+		return nil
+	}
+	return v
 }
 
 func hashSecret(secret string) string {
