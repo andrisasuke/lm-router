@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -531,6 +532,7 @@ func (m Model) activate() (tea.Model, tea.Cmd) {
 		}
 		m.confirmAction = confirmClearLogs
 		m.confirmLabel = "Clear all logs? (y/N)"
+		m.statusLine = ""
 	case screenCodexConfig:
 		return m.back(), nil
 	case screenClaudeConfig:
@@ -1000,6 +1002,7 @@ func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
 		m.confirmAction = confirmDeleteProvider
 		m.confirmTargetID = account.ID
 		m.confirmLabel = fmt.Sprintf("Delete connection %q? (y/N)", account.Name)
+		m.statusLine = ""
 		return m, nil
 	}
 	return m, nil
@@ -1021,6 +1024,7 @@ func (m Model) activateKeys() (tea.Model, tea.Cmd) {
 		m.confirmAction = confirmDeleteKey
 		m.confirmTargetID = key.ID
 		m.confirmLabel = fmt.Sprintf("Delete API key %q? (y/N)", key.Name)
+		m.statusLine = ""
 	}
 	return m, nil
 }
@@ -1031,9 +1035,7 @@ func (m Model) activateKeys() (tea.Model, tea.Cmd) {
 // defeat the whole point of the guard against a stray extra keystroke.
 func (m Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
-	case tea.KeyEsc:
-		return m.cancelConfirm(), nil
-	case tea.KeyEnter:
+	case tea.KeyEsc, tea.KeyEnter:
 		return m.cancelConfirm(), nil
 	}
 	switch msg.String() {
@@ -1076,12 +1078,7 @@ func (m Model) deleteProviderByID(id string) (tea.Model, tea.Cmd) {
 		m.statusLine = "Error: " + err.Error()
 		return m, nil
 	}
-	for i, a := range m.accounts {
-		if a.ID == id {
-			m.accounts = append(m.accounts[:i], m.accounts[i+1:]...)
-			break
-		}
-	}
+	m.accounts = slices.DeleteFunc(m.accounts, func(a store.Account) bool { return a.ID == id })
 	m.statusLine = "Success: provider deleted"
 	return m.back(), nil
 }
@@ -1091,12 +1088,7 @@ func (m Model) deleteKeyByID(id string) (tea.Model, tea.Cmd) {
 		m.statusLine = "Error: " + err.Error()
 		return m, nil
 	}
-	for i, k := range m.keys {
-		if k.ID == id {
-			m.keys = append(m.keys[:i], m.keys[i+1:]...)
-			break
-		}
-	}
+	m.keys = slices.DeleteFunc(m.keys, func(k store.APIKey) bool { return k.ID == id })
 	m.statusLine = "Success: API key deleted"
 	return m, nil
 }

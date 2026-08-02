@@ -278,18 +278,17 @@ func TestCustomProviderDetailMenuOmitsOAuthActions(t *testing.T) {
 	}
 }
 
-// TestCustomProviderDetailDeleteAtCorrectIndex guards against the
-// index/action desync: a 5-item custom menu must map "Delete Connection"
-// (index 4) to detailDelete, not to whatever index 4 means in the 8-item
-// OAuth menu ("Refresh Token"). It also exercises the Y/N confirmation:
-// Enter only arms the prompt, "y" performs the delete.
-func TestCustomProviderDetailDeleteAtCorrectIndex(t *testing.T) {
+// newCustomProviderDetailModel seeds a single custom-provider account named
+// "my-server" and returns a real-store-backed Model parked on its detail
+// screen with "Delete Connection" selected, ready for a confirm/cancel test.
+func newCustomProviderDetailModel(t *testing.T) (*store.DB, Model) {
+	t.Helper()
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	t.Cleanup(func() { db.Close() })
 	account := store.Account{
 		ID: "c1", Provider: store.ProviderCustom, Name: "my-server", Enabled: true,
 		Prefix: "myapi", BaseURL: "https://x", CompatType: store.CompatOpenAIStyle, APIType: store.CustomAPITypeChat,
@@ -300,9 +299,20 @@ func TestCustomProviderDetailDeleteAtCorrectIndex(t *testing.T) {
 	model := New(ctx, db, app.NewRingLogger(10, nil), app.NewServerController(app.ServerControllerConfig{}), store.DefaultSettings())
 	model.accounts = []store.Account{account}
 	model.selectedAccount = 0
-	model.stack = []screen{screenProviders}
 	model.screen = screenProviderDetail
 	model.selected = 4 // "Delete Connection" in the 5-item custom menu
+	return db, model
+}
+
+// TestCustomProviderDetailDeleteAtCorrectIndex guards against the
+// index/action desync: a 5-item custom menu must map "Delete Connection"
+// (index 4) to detailDelete, not to whatever index 4 means in the 8-item
+// OAuth menu ("Refresh Token"). It also exercises the Y/N confirmation:
+// Enter only arms the prompt, "y" performs the delete.
+func TestCustomProviderDetailDeleteAtCorrectIndex(t *testing.T) {
+	db, model := newCustomProviderDetailModel(t)
+	ctx := context.Background()
+	model.stack = []screen{screenProviders}
 
 	next, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = next.(Model)
@@ -332,24 +342,8 @@ func TestCustomProviderDetailDeleteAtCorrectIndex(t *testing.T) {
 // TestCustomProviderDetailDeleteCancelledOnN confirms pressing "n" leaves
 // the account intact and clears the pending confirmation.
 func TestCustomProviderDetailDeleteCancelledOnN(t *testing.T) {
+	db, model := newCustomProviderDetailModel(t)
 	ctx := context.Background()
-	db, err := store.Open(ctx, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	account := store.Account{
-		ID: "c1", Provider: store.ProviderCustom, Name: "my-server", Enabled: true,
-		Prefix: "myapi", BaseURL: "https://x", CompatType: store.CompatOpenAIStyle, APIType: store.CustomAPITypeChat,
-	}
-	if err := db.UpsertAccount(ctx, account); err != nil {
-		t.Fatal(err)
-	}
-	model := New(ctx, db, app.NewRingLogger(10, nil), app.NewServerController(app.ServerControllerConfig{}), store.DefaultSettings())
-	model.accounts = []store.Account{account}
-	model.selectedAccount = 0
-	model.screen = screenProviderDetail
-	model.selected = 4
 
 	next, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = next.(Model)

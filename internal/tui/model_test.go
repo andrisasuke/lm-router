@@ -563,6 +563,7 @@ func TestClearLogsRequiresConfirmation(t *testing.T) {
 func TestConfirmCancelledByEscOrEnter(t *testing.T) {
 	for _, key := range []tea.KeyMsg{{Type: tea.KeyEsc}, {Type: tea.KeyEnter}} {
 		model := NewTestModel()
+		model.logger.Printf("keep me")
 		model.confirmAction = confirmClearLogs
 		model.confirmLabel = "Clear all logs? (y/N)"
 
@@ -570,6 +571,9 @@ func TestConfirmCancelledByEscOrEnter(t *testing.T) {
 		model = next.(Model)
 		if model.confirmAction != confirmNone {
 			t.Fatalf("key %v: expected confirmation cancelled, got %v", key.Type, model.confirmAction)
+		}
+		if len(model.logger.Entries()) == 0 {
+			t.Fatalf("key %v: expected logs to survive cancellation, not be cleared", key.Type)
 		}
 	}
 }
