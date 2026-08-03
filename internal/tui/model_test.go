@@ -490,3 +490,90 @@ func TestStatusTimeoutIsThreeSeconds(t *testing.T) {
 		t.Fatalf("statusTimeout=%s want 3s", statusTimeout)
 	}
 }
+
+func TestDeleteAPIKeyRequiresConfirmation(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	key, err := db.CreateAPIKey(ctx, "prod-key")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	model := New(ctx, db, app.NewRingLogger(10, nil), app.NewServerController(app.ServerControllerConfig{}), store.DefaultSettings())
+	model.keys = []store.APIKey{key}
+	model.screen = screenKeys
+	model.selected = 2 // first key's delete row ("<- Back", "Create Key", <keys...>)
+
+	next, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(Model)
+	if len(model.keys) != 1 {
+		t.Fatalf("expected key not yet deleted, keys=%+v", model.keys)
+	}
+	if model.confirmAction != confirmDeleteKey {
+		t.Fatalf("expected confirmDeleteKey armed, got %v", model.confirmAction)
+	}
+	if view := model.View(); !strings.Contains(view, `Delete API key "prod-key"?`) {
+		t.Fatalf("confirm prompt not rendered: %q", view)
+	}
+
+	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	model = next.(Model)
+	if len(model.keys) != 0 {
+		t.Fatalf("expected key deleted, keys=%+v", model.keys)
+	}
+	stored, err := db.ListAPIKeys(ctx)
+	if err != nil {
+		t.Fatalf("list keys: %v", err)
+	}
+	if len(stored) != 0 {
+		t.Fatalf("expected key removed from store, got %+v", stored)
+	}
+}
+
+func TestClearLogsRequiresConfirmation(t *testing.T) {
+	logger := app.NewRingLogger(10, nil)
+	logger.Printf("hello world")
+	model := NewTestModel()
+	model.logger = logger
+	model.screen = screenLogs
+	model.selected = 2 // "Clear Logs" row
+
+	next, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(Model)
+	if len(model.logger.Entries()) == 0 {
+		t.Fatal("expected log entries to survive Enter (not yet confirmed)")
+	}
+	if model.confirmAction != confirmClearLogs {
+		t.Fatalf("expected confirmClearLogs armed, got %v", model.confirmAction)
+	}
+	if view := model.View(); !strings.Contains(view, "Clear all logs?") {
+		t.Fatalf("confirm prompt not rendered: %q", view)
+	}
+
+	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	model = next.(Model)
+	if len(model.logger.Entries()) != 0 {
+		t.Fatalf("expected logs cleared, entries=%+v", model.logger.Entries())
+	}
+}
+
+func TestConfirmCancelledByEscOrEnter(t *testing.T) {
+	for _, key := range []tea.KeyMsg{{Type: tea.KeyEsc}, {Type: tea.KeyEnter}} {
+		model := NewTestModel()
+		model.logger.Printf("keep me")
+		model.confirmAction = confirmClearLogs
+		model.confirmLabel = "Clear all logs? (y/N)"
+
+		next, _ := model.Update(key)
+		model = next.(Model)
+		if model.confirmAction != confirmNone {
+			t.Fatalf("key %v: expected confirmation cancelled, got %v", key.Type, model.confirmAction)
+		}
+		if len(model.logger.Entries()) == 0 {
+			t.Fatalf("key %v: expected logs to survive cancellation, not be cleared", key.Type)
+		}
+	}
+}
