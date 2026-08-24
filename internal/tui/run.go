@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 
 	"github.com/andrisasuke/lm-router/internal/app"
@@ -27,6 +28,17 @@ func Run(ctx context.Context, dataDir, host string, port int) error {
 		settings.Port = port
 	}
 	logger := app.NewRingLogger(500, nil)
+	previousLogOutput := log.Writer()
+	previousLogFlags := log.Flags()
+	previousLogPrefix := log.Prefix()
+	log.SetOutput(logger)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	defer func() {
+		log.SetOutput(previousLogOutput)
+		log.SetFlags(previousLogFlags)
+		log.SetPrefix(previousLogPrefix)
+	}()
 	controller := app.NewServerController(app.ServerControllerConfig{
 		Logger: logger,
 		HandlerFactory: func() (http.Handler, error) {

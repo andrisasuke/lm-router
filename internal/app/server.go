@@ -3,8 +3,10 @@ package app
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -39,6 +41,18 @@ type ServerController struct {
 	status         ServerStatus
 }
 
+type loggerWriter struct {
+	logger Logger
+}
+
+func (w loggerWriter) Write(p []byte) (int, error) {
+	message := strings.TrimSuffix(string(p), "\n")
+	if message != "" {
+		w.logger.Printf("%s", message)
+	}
+	return len(p), nil
+}
+
 func NewServerController(cfg ServerControllerConfig) *ServerController {
 	return &ServerController{
 		handlerFactory: cfg.HandlerFactory,
@@ -70,6 +84,11 @@ func (c *ServerController) Start(ctx context.Context, host string, port int) err
 	srv := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if c.logger != nil {
+		// net/http otherwise writes internal server errors to the process-wide
+		// standard logger, which corrupts an active terminal UI.
+		srv.ErrorLog = log.New(loggerWriter{logger: c.logger}, "", 0)
 	}
 	endpointHost := host
 	if endpointHost == "0.0.0.0" || endpointHost == "::" || endpointHost == "" {

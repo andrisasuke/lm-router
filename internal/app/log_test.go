@@ -27,3 +27,19 @@ func TestRingLoggerKeepsRecentEntriesAndRedactsAuthorization(t *testing.T) {
 		t.Fatalf("missing expected entries: %s", joined)
 	}
 }
+
+func TestRingLoggerAcceptsStandardLoggerOutput(t *testing.T) {
+	logger := NewRingLogger(2, nil)
+
+	n, err := logger.Write([]byte("http: internal server error\n"))
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if n != len("http: internal server error\n") {
+		t.Fatalf("bytes written=%d", n)
+	}
+	entries := logger.Entries()
+	if len(entries) != 1 || entries[0].Message != "http: internal server error" {
+		t.Fatalf("unexpected entries: %+v", entries)
+	}
+}

@@ -15,6 +15,21 @@ import (
 	"github.com/andrisasuke/lm-router/internal/store"
 )
 
+func TestLoggingResponseWriterIgnoresRepeatedWriteHeader(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	w := &loggingResponseWriter{ResponseWriter: recorder}
+
+	w.WriteHeader(http.StatusCreated)
+	w.WriteHeader(http.StatusInternalServerError)
+
+	if w.status != http.StatusCreated {
+		t.Fatalf("logged status=%d, want first status %d", w.status, http.StatusCreated)
+	}
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("response status=%d, want %d", recorder.Code, http.StatusCreated)
+	}
+}
+
 func TestResponsesFallsBackToSecondAccount(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir())

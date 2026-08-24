@@ -52,6 +52,16 @@ func (l *RingLogger) Printf(format string, args ...any) {
 	}
 }
 
+// Write lets the process-wide standard logger feed the ring without writing to
+// the terminal that owns the TUI.
+func (l *RingLogger) Write(p []byte) (int, error) {
+	message := strings.TrimSuffix(string(p), "\n")
+	if message != "" {
+		l.Printf("%s", message)
+	}
+	return len(p), nil
+}
+
 func (l *RingLogger) Entries() []LogEntry {
 	l.mu.Lock()
 	defer l.mu.Unlock()
