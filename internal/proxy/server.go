@@ -211,7 +211,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if stream, _ := reqBody["stream"].(bool); stream {
-		contentType, status, err := s.streamResponses(r.Context(), body, w)
+		contentType, status, err := s.streamResponses(r.Context(), body, r.Header, w)
 		if err != nil {
 			writeOpenAIError(w, statusOrDefault(status, http.StatusBadGateway), "proxy_error", err.Error())
 			return
@@ -222,7 +222,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		_ = contentType
 		return
 	}
-	respBody, contentType, status, err := s.routeResponses(r.Context(), body)
+	respBody, contentType, status, err := s.routeResponses(r.Context(), body, r.Header)
 	if err != nil {
 		writeOpenAIError(w, statusOrDefault(status, http.StatusBadGateway), "proxy_error", err.Error())
 		return
@@ -291,13 +291,13 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	payload, _ := json.Marshal(responsesBody)
 	if stream, _ := responsesBody["stream"].(bool); stream {
-		status, err := s.streamChatCompletions(r.Context(), payload, w)
+		status, err := s.streamChatCompletions(r.Context(), payload, r.Header, w)
 		if err != nil {
 			writeOpenAIError(w, statusOrDefault(status, http.StatusBadGateway), "proxy_error", err.Error())
 		}
 		return
 	}
-	respBody, _, status, err := s.routeResponses(r.Context(), payload)
+	respBody, _, status, err := s.routeResponses(r.Context(), payload, r.Header)
 	if err != nil {
 		writeOpenAIError(w, statusOrDefault(status, http.StatusBadGateway), "proxy_error", err.Error())
 		return
@@ -374,7 +374,7 @@ func chatUsageFromResponses(final map[string]any) map[string]any {
 	}
 }
 
-func (s *Server) routeResponses(ctx context.Context, body []byte) ([]byte, string, int, error) {
+func (s *Server) routeResponses(ctx context.Context, body []byte, headers http.Header) ([]byte, string, int, error) {
 	accounts, err := s.store.ListRoutableAccounts(ctx, "openai-codex")
 	if err != nil {
 		return nil, "application/json", http.StatusInternalServerError, err
@@ -391,6 +391,7 @@ func (s *Server) routeResponses(ctx context.Context, body []byte) ([]byte, strin
 		result, err := s.codex.ExecuteResponses(ctx, codex.ExecuteParams{
 			Account: account,
 			Body:    body,
+			Headers: headers,
 		})
 		if err != nil {
 			lastErr = err
@@ -412,8 +413,8 @@ func (s *Server) routeResponses(ctx context.Context, body []byte) ([]byte, strin
 	return nil, "application/json", lastStatus, lastErr
 }
 
-func (s *Server) streamResponses(ctx context.Context, body []byte, w http.ResponseWriter) (string, int, error) {
-	stream, status, err := s.openResponseStream(ctx, body)
+func (s *Server) streamResponses(ctx context.Context, body []byte, headers http.Header, w http.ResponseWriter) (string, int, error) {
+	stream, status, err := s.openResponseStream(ctx, body, headers)
 	if err != nil {
 		return "application/json", status, err
 	}
@@ -428,8 +429,8 @@ func (s *Server) streamResponses(ctx context.Context, body []byte, w http.Respon
 	return contentTypeOrDefault(stream.Header.Get("Content-Type")), stream.Status, nil
 }
 
-func (s *Server) streamChatCompletions(ctx context.Context, body []byte, w http.ResponseWriter) (int, error) {
-	stream, status, err := s.openResponseStream(ctx, body)
+func (s *Server) streamChatCompletions(ctx context.Context, body []byte, headers http.Header, w http.ResponseWriter) (int, error) {
+	stream, status, err := s.openResponseStream(ctx, body, headers)
 	if err != nil {
 		return status, err
 	}
@@ -444,7 +445,7 @@ func (s *Server) streamChatCompletions(ctx context.Context, body []byte, w http.
 	return http.StatusOK, nil
 }
 
-func (s *Server) openResponseStream(ctx context.Context, body []byte) (codex.StreamResult, int, error) {
+func (s *Server) openResponseStream(ctx context.Context, body []byte, headers http.Header) (codex.StreamResult, int, error) {
 	accounts, err := s.store.ListRoutableAccounts(ctx, "openai-codex")
 	if err != nil {
 		return codex.StreamResult{}, http.StatusInternalServerError, err
@@ -461,6 +462,7 @@ func (s *Server) openResponseStream(ctx context.Context, body []byte) (codex.Str
 		result, err := s.codex.OpenResponsesStream(ctx, codex.ExecuteParams{
 			Account: account,
 			Body:    body,
+			Headers: headers,
 		})
 		if err != nil {
 			lastErr = err
@@ -1106,7 +1108,7 @@ func convertResponsesStreamToAnthropicSSE(w io.Writer, body io.Reader, flusher h
 }
 
 func (s *Server) streamAnthropicMessages(w http.ResponseWriter, r *http.Request, body []byte, model string) {
-	result, status, err := s.openResponseStream(r.Context(), body)
+	result, status, err := s.openResponseStream(r.Context(), body, r.Header)
 	if err != nil {
 		writeAnthropicError(w, statusOrDefault(status, http.StatusBadGateway), "api_error", err.Error())
 		return
@@ -1821,7 +1823,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		s.streamAnthropicMessages(w, r, responsesBody, model)
 		return
 	}
-	respBody, _, status, err := s.routeResponses(r.Context(), responsesBody)
+	respBody, _, status, err := s.routeResponses(r.Context(), responsesBody, r.Header)
 	if err != nil {
 		writeAnthropicError(w, statusOrDefault(status, http.StatusBadGateway), "api_error", err.Error())
 		return

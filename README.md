@@ -73,12 +73,14 @@ Add the provider to the user-level `~/.codex/config.toml`. Merge it with any exi
 ```toml
 model = "gpt-5.3-codex"
 model_provider = "lm-router"
+web_search = "live"
 
 [model_providers.lm-router]
 name = "LM Router"
 base_url = "http://127.0.0.1:19090/v1"
 env_key = "LM_ROUTER_API_KEY"
 wire_api = "responses"
+http_headers = { "X-LM-Router-Web-Search" = "live" }
 ```
 
 Use the user-level file: Codex ignores `model_provider` and `model_providers` in project-level `.codex/config.toml` files. See the [Codex configuration reference](https://developers.openai.com/codex/config-reference/).
@@ -98,6 +100,12 @@ Start a new Codex session:
 ```bash
 codex
 ```
+
+Codex uses a reduced Responses payload for custom providers and omits hosted
+tools from it. The `X-LM-Router-Web-Search` provider header tells lm-router to
+restore the native Responses API `web_search` tool; `live` enables external
+access, while `cached` keeps it on the OpenAI-maintained index. Set both the
+header and `web_search` to `disabled` to remove web search.
 
 ## Use with Claude Code
 

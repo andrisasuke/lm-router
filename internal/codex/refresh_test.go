@@ -172,7 +172,7 @@ func TestUnrecoverableRefreshMarksNeedsReauth(t *testing.T) {
 }
 
 func TestTransformRequestAddsCodexRequiredFields(t *testing.T) {
-	transformed, err := TransformRequest([]byte(`{"model":"gpt-5.3-codex","input":"ping","stream":false,"max_output_tokens":100}`))
+	transformed, err := TransformRequest([]byte(`{"model":"gpt-5.3-codex","input":"ping","stream":false,"max_output_tokens":100,"tools":[{"type":"web_search","external_web_access":true}],"tool_choice":"auto","client_metadata":{"session_id":"session-1"}}`))
 	if err != nil {
 		t.Fatalf("transform request: %v", err)
 	}
@@ -191,6 +191,21 @@ func TestTransformRequestAddsCodexRequiredFields(t *testing.T) {
 	}
 	if _, ok := body["max_output_tokens"]; ok {
 		t.Fatal("max_output_tokens should be stripped")
+	}
+	tools, ok := body["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("web search tool was not preserved: %#v", body["tools"])
+	}
+	tool, _ := tools[0].(map[string]any)
+	if tool["type"] != "web_search" || tool["external_web_access"] != true {
+		t.Fatalf("unexpected web search tool: %#v", tool)
+	}
+	if body["tool_choice"] != "auto" {
+		t.Fatalf("tool_choice=%#v", body["tool_choice"])
+	}
+	metadata, _ := body["client_metadata"].(map[string]any)
+	if metadata["session_id"] != "session-1" {
+		t.Fatalf("client_metadata=%#v", metadata)
 	}
 	input, ok := body["input"].([]any)
 	if !ok || len(input) != 1 {

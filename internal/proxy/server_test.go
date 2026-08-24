@@ -43,15 +43,17 @@ func TestResponsesFallsBackToSecondAccount(t *testing.T) {
 		t.Fatalf("create key: %v", err)
 	}
 	for _, acct := range []store.Account{
-		{ID: "acct_1", Provider: "openai-codex", Name: "one", Priority: 1, Enabled: true, AccessToken: "token-1", RefreshToken: "r1", ExpiresAt: time.Now().Add(time.Hour)},
-		{ID: "acct_2", Provider: "openai-codex", Name: "two", Priority: 2, Enabled: true, AccessToken: "token-2", RefreshToken: "r2", ExpiresAt: time.Now().Add(time.Hour)},
+		{ID: "acct_1", Provider: "openai-codex", Name: "one", Priority: 1, Enabled: true, AccessToken: "token-1", RefreshToken: "r1", ExpiresAt: time.Now().Add(time.Hour), MetadataJSON: `{"chatgpt_account_id":"workspace-1"}`},
+		{ID: "acct_2", Provider: "openai-codex", Name: "two", Priority: 2, Enabled: true, AccessToken: "token-2", RefreshToken: "r2", ExpiresAt: time.Now().Add(time.Hour), MetadataJSON: `{"chatgpt_account_id":"workspace-2"}`},
 	} {
 		if err := db.UpsertAccount(ctx, acct); err != nil {
 			t.Fatalf("upsert account: %v", err)
 		}
 	}
 
+	attempts := make(chan string, 2)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts <- r.Header.Get("Authorization") + "|" + r.Header.Get("ChatGPT-Account-Id")
 		if r.Header.Get("Authorization") == "Bearer token-1" {
 			http.Error(w, `{"error":{"type":"usage_limit_reached","resets_in_seconds":60}}`, http.StatusTooManyRequests)
 			return
@@ -80,6 +82,92 @@ func TestResponsesFallsBackToSecondAccount(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "ok") {
 		t.Fatalf("expected second account response, got %s", rec.Body.String())
+	}
+	for _, want := range []string{"Bearer token-1|workspace-1", "Bearer token-2|workspace-2"} {
+		if got := <-attempts; got != want {
+			t.Fatalf("upstream identity=%q want %q", got, want)
+		}
+	}
+}
+
+func TestResponsesPreservesNativeWebSearchRequestAndEvents(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	key, err := db.CreateAPIKey(ctx, "test")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	account := store.Account{
+		ID:           "acct_1",
+		Provider:     store.ProviderOpenAICodex,
+		Name:         "one",
+		Priority:     1,
+		Enabled:      true,
+		AccessToken:  "token-1",
+		RefreshToken: "r1",
+		ExpiresAt:    time.Now().Add(time.Hour),
+		MetadataJSON: `{"chatgpt_account_id":"workspace-1"}`,
+	}
+	if err := db.UpsertAccount(ctx, account); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	const webSearchSSE = "event: response.web_search_call.in_progress\n" +
+		"data: {\"type\":\"response.web_search_call.in_progress\",\"item_id\":\"ws_1\",\"sequence_number\":1}\n\n" +
+		"event: response.output_item.done\n" +
+		"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"queries\":[\"Liverpool FC 2026/27\"],\"sources\":[{\"url\":\"https://example.com/source\",\"title\":\"Source\"}]}}}\n\n" +
+		"data: [DONE]\n\n"
+
+	requestBody := make(chan map[string]any, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode upstream body: %v", err)
+		}
+		requestBody <- body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(webSearchSSE))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{
+		Store:      db,
+		Codex:      codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)),
+		RequireKey: true,
+	})
+	body := `{"model":"gpt-5.3-codex","input":"search","stream":true,"tools":[{"type":"web_search","external_web_access":true}],"tool_choice":"auto","include":["web_search_call.action.sources"]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+key.Secret)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Session-Id", "session-1")
+	req.Header.Set("X-Codex-Turn-Metadata", `{"turn_id":"turn-1"}`)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != webSearchSSE {
+		t.Fatalf("web search SSE changed:\n%s", rec.Body.String())
+	}
+	forwarded := <-requestBody
+	tools, _ := forwarded["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools=%#v", forwarded["tools"])
+	}
+	tool, _ := tools[0].(map[string]any)
+	if tool["type"] != "web_search" || tool["external_web_access"] != true {
+		t.Fatalf("web search tool=%#v", tool)
+	}
+	include, _ := forwarded["include"].([]any)
+	if len(include) != 1 || include[0] != "web_search_call.action.sources" {
+		t.Fatalf("include=%#v", forwarded["include"])
 	}
 }
 
