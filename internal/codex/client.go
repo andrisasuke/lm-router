@@ -22,6 +22,7 @@ const logBodyLimit = 64 * 1024
 
 const (
 	CodexResponsesLiteHeader = "X-OpenAI-Internal-Codex-Responses-Lite"
+	RouterCodexModeHeader    = "X-LM-Router-Codex-Mode"
 	RouterWebSearchHeader    = "X-LM-Router-Web-Search"
 )
 
@@ -172,17 +173,35 @@ func prepareRequest(body []byte, headers http.Header) ([]byte, http.Header, erro
 		return nil, nil, err
 	}
 
-	mode := strings.ToLower(strings.TrimSpace(headers.Get(RouterWebSearchHeader)))
-	if mode == "" {
+	codexMode := strings.ToLower(strings.TrimSpace(headers.Get(RouterCodexModeHeader)))
+	webSearchMode := strings.ToLower(strings.TrimSpace(headers.Get(RouterWebSearchHeader)))
+	if codexMode == "" && webSearchMode == "" {
 		return transformed, headers, nil
 	}
+
 	forwardHeaders := headers.Clone()
+	forwardHeaders.Del(RouterCodexModeHeader)
 	forwardHeaders.Del(RouterWebSearchHeader)
-	switch mode {
+
+	switch codexMode {
+	case "":
+	case "full":
+		// Custom Codex providers normally send the reduced Responses Lite
+		// contract. Full mode opts this request into the regular Responses
+		// contract so supported input parts, tools, includes, and annotations
+		// can flow through the router without changing other API clients.
+		forwardHeaders.Del(CodexResponsesLiteHeader)
+	default:
+		return nil, nil, errors.New("invalid " + RouterCodexModeHeader + " value")
+	}
+
+	switch webSearchMode {
+	case "":
+		return transformed, forwardHeaders, nil
 	case "disabled":
 		return transformed, forwardHeaders, nil
 	case "cached", "indexed", "live":
-		transformed, err = enableNativeWebSearch(transformed, mode == "live")
+		transformed, err = enableNativeWebSearch(transformed, webSearchMode == "live")
 		if err != nil {
 			return nil, nil, err
 		}
@@ -473,7 +492,10 @@ func TransformRequest(body []byte) ([]byte, error) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
 	}
-	if instructions, _ := payload["instructions"].(string); strings.TrimSpace(instructions) == "" {
+	instructions, exists := payload["instructions"]
+	if !exists || instructions == nil {
+		payload["instructions"] = DefaultInstructions
+	} else if text, ok := instructions.(string); ok && strings.TrimSpace(text) == "" {
 		payload["instructions"] = DefaultInstructions
 	}
 	payload["stream"] = true

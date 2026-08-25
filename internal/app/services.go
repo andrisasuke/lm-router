@@ -428,8 +428,8 @@ func CodexConfigText(port int, apiKey, model string) string {
 	if model == "" {
 		model = "gpt-5.3-codex"
 	}
-	return fmt.Sprintf("model = %q\nmodel_provider = %q\nweb_search = %q\n\n[model_providers.lm-router]\nname = %q\nbase_url = %q\nwire_api = %q\nhttp_headers = { %q = %q }\n\n[agents.subagent]\nmodel = %q\n\n{\n  \"auth_mode\": \"apikey\",\n  \"OPENAI_API_KEY\": %q\n}\n",
-		model, "lm-router", "live", "LM Router", fmt.Sprintf("http://127.0.0.1:%d/v1", port), "responses", codex.RouterWebSearchHeader, "live", model, apiKey)
+	return fmt.Sprintf("model = %q\nmodel_provider = %q\nweb_search = %q\n\n[model_providers.lm-router]\nname = %q\nbase_url = %q\nwire_api = %q\nhttp_headers = { %q = %q, %q = %q }\n\n[agents.subagent]\nmodel = %q\n\n{\n  \"auth_mode\": \"apikey\",\n  \"OPENAI_API_KEY\": %q\n}\n",
+		model, "lm-router", "live", "LM Router", fmt.Sprintf("http://127.0.0.1:%d/v1", port), "responses", codex.RouterCodexModeHeader, "full", codex.RouterWebSearchHeader, "live", model, apiKey)
 }
 
 func ClaudeConfigText(port int, apiKey, model string) string {

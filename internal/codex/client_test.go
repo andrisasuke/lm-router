@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -95,6 +96,7 @@ func TestOpenResponsesStreamForwardsSafeCodexIdentityHeaders(t *testing.T) {
 func TestPrepareRequestEnablesNativeWebSearchForCodexCustomProvider(t *testing.T) {
 	headers := make(http.Header)
 	headers.Set(CodexResponsesLiteHeader, "true")
+	headers.Set(RouterCodexModeHeader, "full")
 	headers.Set(RouterWebSearchHeader, "live")
 
 	body, forwardedHeaders, err := prepareRequest([]byte(`{
@@ -108,10 +110,13 @@ func TestPrepareRequestEnablesNativeWebSearchForCodexCustomProvider(t *testing.T
 	if got := forwardedHeaders.Get(RouterWebSearchHeader); got != "" {
 		t.Fatalf("private router header was forwarded=%q", got)
 	}
+	if got := forwardedHeaders.Get(RouterCodexModeHeader); got != "" {
+		t.Fatalf("private Codex mode header was forwarded=%q", got)
+	}
 	if got := forwardedHeaders.Get(CodexResponsesLiteHeader); got != "" {
 		t.Fatalf("responses-lite header was retained after adding hosted tools=%q", got)
 	}
-	if headers.Get(CodexResponsesLiteHeader) != "true" || headers.Get(RouterWebSearchHeader) != "live" {
+	if headers.Get(CodexResponsesLiteHeader) != "true" || headers.Get(RouterCodexModeHeader) != "full" || headers.Get(RouterWebSearchHeader) != "live" {
 		t.Fatal("prepare request mutated inbound headers")
 	}
 
@@ -130,6 +135,50 @@ func TestPrepareRequestEnablesNativeWebSearchForCodexCustomProvider(t *testing.T
 	include, _ := payload["include"].([]any)
 	if len(include) != 2 || include[0] != "reasoning.encrypted_content" || include[1] != "web_search_call.action.sources" {
 		t.Fatalf("include=%#v", payload["include"])
+	}
+}
+
+func TestPrepareRequestFullCodexModeRemovesResponsesLiteWithoutAddingTools(t *testing.T) {
+	headers := make(http.Header)
+	headers.Set(CodexResponsesLiteHeader, "true")
+	headers.Set(RouterCodexModeHeader, "full")
+	headers.Set("X-Codex-Beta-Features", "remote_compaction_v2")
+
+	body, forwardedHeaders, err := prepareRequest([]byte(`{
+		"model":"gpt-5.6-sol",
+		"input":[{"role":"user","content":[{"type":"input_file","file_id":"file_123"}]}]
+	}`), headers)
+	if err != nil {
+		t.Fatalf("prepare request: %v", err)
+	}
+	if forwardedHeaders.Get(RouterCodexModeHeader) != "" {
+		t.Fatalf("private Codex mode header was forwarded=%q", forwardedHeaders.Get(RouterCodexModeHeader))
+	}
+	if forwardedHeaders.Get(CodexResponsesLiteHeader) != "" {
+		t.Fatalf("responses-lite header was retained=%q", forwardedHeaders.Get(CodexResponsesLiteHeader))
+	}
+	if forwardedHeaders.Get("X-Codex-Beta-Features") != "remote_compaction_v2" {
+		t.Fatalf("Codex protocol header was lost=%q", forwardedHeaders.Get("X-Codex-Beta-Features"))
+	}
+	if headers.Get(CodexResponsesLiteHeader) != "true" || headers.Get(RouterCodexModeHeader) != "full" {
+		t.Fatal("prepare request mutated inbound headers")
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	if _, ok := payload["tools"]; ok {
+		t.Fatalf("full mode unexpectedly added tools=%#v", payload["tools"])
+	}
+}
+
+func TestPrepareRequestRejectsInvalidCodexMode(t *testing.T) {
+	headers := make(http.Header)
+	headers.Set(RouterCodexModeHeader, "automatic")
+
+	if _, _, err := prepareRequest([]byte(`{"model":"gpt-5.6-sol","input":"hello"}`), headers); err == nil || !strings.Contains(err.Error(), RouterCodexModeHeader) {
+		t.Fatalf("expected invalid %s error, got %v", RouterCodexModeHeader, err)
 	}
 }
 
@@ -354,5 +403,45 @@ func TestOutputTextFromItems_IgnoresFunctionCall(t *testing.T) {
 	items, _ = ConvertResponsesSSEToItems([]byte(textSSE))
 	if got := OutputTextFromItems(items); got != "Hello there" {
 		t.Errorf("text: want %q, got %q", "Hello there", got)
+	}
+}
+
+func TestConvertResponsesSSEToItemsPreservesFileCitations(t *testing.T) {
+	sse := []byte(`event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"See workbook","annotations":[{"type":"file_citation","file_id":"file_123","filename":"report.xlsx","index":0}]}]}}
+
+data: [DONE]
+
+`)
+	items, _ := ConvertResponsesSSEToItems(sse)
+	if len(items) != 1 {
+		t.Fatalf("items=%#v", items)
+	}
+	content, _ := items[0]["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("content=%#v", content)
+	}
+	output, _ := content[0].(map[string]any)
+	annotations, _ := output["annotations"].([]any)
+	if len(annotations) != 1 {
+		t.Fatalf("annotations=%#v", annotations)
+	}
+	citation, _ := annotations[0].(map[string]any)
+	if citation["type"] != "file_citation" || citation["file_id"] != "file_123" || citation["filename"] != "report.xlsx" {
+		t.Fatalf("citation was not preserved: %#v", citation)
+	}
+}
+
+func TestCopyStreamPreservesAnnotationsAndUnknownEvents(t *testing.T) {
+	want := []byte("event: response.output_text.annotation.added\n" +
+		"data: {\"type\":\"response.output_text.annotation.added\",\"annotation\":{\"type\":\"file_citation\",\"file_id\":\"file_123\"}}\n\n" +
+		"event: response.future_event\n" +
+		"data: {\"type\":\"response.future_event\",\"payload\":{\"kept\":true}}\n\n")
+	var got bytes.Buffer
+	if err := CopyStream(&got, bytes.NewReader(want)); err != nil {
+		t.Fatalf("copy stream: %v", err)
+	}
+	if !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("stream changed:\n got %q\nwant %q", got.Bytes(), want)
 	}
 }

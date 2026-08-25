@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -210,6 +211,41 @@ func TestTransformRequestAddsCodexRequiredFields(t *testing.T) {
 	input, ok := body["input"].([]any)
 	if !ok || len(input) != 1 {
 		t.Fatalf("unexpected input: %#v", body["input"])
+	}
+}
+
+func TestTransformRequestPreservesFullResponsesFields(t *testing.T) {
+	original := []byte(`{
+		"model":"gpt-5.6-sol",
+		"instructions":[{"type":"input_text","text":"Use the workbook"}],
+		"input":[{"type":"message","role":"user","content":[
+			{"type":"input_text","text":"Summarize this file"},
+			{"type":"input_image","image_url":"data:image/png;base64,aW1hZ2U="},
+			{"type":"input_file","file_id":"file_123","filename":"report.xlsx"},
+			{"type":"future_input_part","payload":{"keep":true}}
+		]}],
+		"tools":[{"type":"function","name":"inspect_sheet","parameters":{"type":"object"}}],
+		"tool_choice":"auto",
+		"include":["reasoning.encrypted_content","web_search_call.action.sources"]
+	}`)
+
+	var want map[string]any
+	if err := json.Unmarshal(original, &want); err != nil {
+		t.Fatalf("decode original: %v", err)
+	}
+	transformed, err := TransformRequest(original)
+	if err != nil {
+		t.Fatalf("transform request: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(transformed, &got); err != nil {
+		t.Fatalf("decode transformed: %v", err)
+	}
+
+	for _, field := range []string{"instructions", "input", "tools", "tool_choice", "include"} {
+		if !reflect.DeepEqual(got[field], want[field]) {
+			t.Errorf("%s changed:\n got %#v\nwant %#v", field, got[field], want[field])
+		}
 	}
 }
 
