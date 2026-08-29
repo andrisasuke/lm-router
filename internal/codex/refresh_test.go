@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -172,7 +173,7 @@ func TestUnrecoverableRefreshMarksNeedsReauth(t *testing.T) {
 }
 
 func TestTransformRequestAddsCodexRequiredFields(t *testing.T) {
-	transformed, err := TransformRequest([]byte(`{"model":"gpt-5.3-codex","input":"ping","stream":false,"max_output_tokens":100}`))
+	transformed, err := TransformRequest([]byte(`{"model":"gpt-5.3-codex","input":"ping","stream":false,"max_output_tokens":100,"tools":[{"type":"web_search","external_web_access":true}],"tool_choice":"auto","client_metadata":{"session_id":"session-1"}}`))
 	if err != nil {
 		t.Fatalf("transform request: %v", err)
 	}
@@ -192,9 +193,59 @@ func TestTransformRequestAddsCodexRequiredFields(t *testing.T) {
 	if _, ok := body["max_output_tokens"]; ok {
 		t.Fatal("max_output_tokens should be stripped")
 	}
+	tools, ok := body["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("web search tool was not preserved: %#v", body["tools"])
+	}
+	tool, _ := tools[0].(map[string]any)
+	if tool["type"] != "web_search" || tool["external_web_access"] != true {
+		t.Fatalf("unexpected web search tool: %#v", tool)
+	}
+	if body["tool_choice"] != "auto" {
+		t.Fatalf("tool_choice=%#v", body["tool_choice"])
+	}
+	metadata, _ := body["client_metadata"].(map[string]any)
+	if metadata["session_id"] != "session-1" {
+		t.Fatalf("client_metadata=%#v", metadata)
+	}
 	input, ok := body["input"].([]any)
 	if !ok || len(input) != 1 {
 		t.Fatalf("unexpected input: %#v", body["input"])
+	}
+}
+
+func TestTransformRequestPreservesFullResponsesFields(t *testing.T) {
+	original := []byte(`{
+		"model":"gpt-5.6-sol",
+		"instructions":[{"type":"input_text","text":"Use the workbook"}],
+		"input":[{"type":"message","role":"user","content":[
+			{"type":"input_text","text":"Summarize this file"},
+			{"type":"input_image","image_url":"data:image/png;base64,aW1hZ2U="},
+			{"type":"input_file","file_id":"file_123","filename":"report.xlsx"},
+			{"type":"future_input_part","payload":{"keep":true}}
+		]}],
+		"tools":[{"type":"function","name":"inspect_sheet","parameters":{"type":"object"}}],
+		"tool_choice":"auto",
+		"include":["reasoning.encrypted_content","web_search_call.action.sources"]
+	}`)
+
+	var want map[string]any
+	if err := json.Unmarshal(original, &want); err != nil {
+		t.Fatalf("decode original: %v", err)
+	}
+	transformed, err := TransformRequest(original)
+	if err != nil {
+		t.Fatalf("transform request: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(transformed, &got); err != nil {
+		t.Fatalf("decode transformed: %v", err)
+	}
+
+	for _, field := range []string{"instructions", "input", "tools", "tool_choice", "include"} {
+		if !reflect.DeepEqual(got[field], want[field]) {
+			t.Errorf("%s changed:\n got %#v\nwant %#v", field, got[field], want[field])
+		}
 	}
 }
 

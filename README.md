@@ -73,12 +73,14 @@ Add the provider to the user-level `~/.codex/config.toml`. Merge it with any exi
 ```toml
 model = "gpt-5.3-codex"
 model_provider = "lm-router"
+web_search = "live"
 
 [model_providers.lm-router]
 name = "LM Router"
 base_url = "http://127.0.0.1:19090/v1"
 env_key = "LM_ROUTER_API_KEY"
 wire_api = "responses"
+http_headers = { "X-LM-Router-Codex-Mode" = "full", "X-LM-Router-Web-Search" = "live" }
 ```
 
 Use the user-level file: Codex ignores `model_provider` and `model_providers` in project-level `.codex/config.toml` files. See the [Codex configuration reference](https://developers.openai.com/codex/config-reference/).
@@ -98,6 +100,20 @@ Start a new Codex session:
 ```bash
 codex
 ```
+
+Codex uses a reduced Responses contract for custom providers. The
+`X-LM-Router-Codex-Mode = "full"` provider header tells lm-router to remove the
+Responses Lite marker, preserving Responses input parts, tools, includes, and
+annotations supported by the upstream API. The `X-LM-Router-Web-Search` header
+separately restores the native `web_search` tool; `live` enables external
+access, while `cached` keeps it on the OpenAI-maintained index. Set both
+`X-LM-Router-Web-Search` and `web_search` to `disabled` to remove web search.
+
+Both router headers are opt-in and apply only to requests that explicitly send
+them. Claude Code, OpenCode, OpenAI SDK scripts, and other clients keep their
+existing behavior unless configured with these headers. Full mode does not add
+a Files API or change which local Codex skill the model chooses; local file
+paths continue to be read by Codex from the host workspace.
 
 ## Use with Claude Code
 

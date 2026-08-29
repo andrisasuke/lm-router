@@ -20,6 +20,12 @@ import (
 const DefaultInstructions = "You are Codex, based on GPT-5. You are running as a coding agent in the Codex CLI on a user's computer."
 const logBodyLimit = 64 * 1024
 
+const (
+	CodexResponsesLiteHeader = "X-OpenAI-Internal-Codex-Responses-Lite"
+	RouterCodexModeHeader    = "X-LM-Router-Codex-Mode"
+	RouterWebSearchHeader    = "X-LM-Router-Web-Search"
+)
+
 type Client struct {
 	baseURL      string
 	http         *http.Client
@@ -41,6 +47,7 @@ func (stdLogger) Printf(format string, args ...any) {
 type ExecuteParams struct {
 	Account store.Account
 	Body    []byte
+	Headers http.Header
 }
 
 type ExecuteResult struct {
@@ -153,14 +160,100 @@ func (c *Client) OpenResponsesStream(ctx context.Context, params ExecuteParams) 
 	if err != nil {
 		return StreamResult{}, err
 	}
-	body, err := TransformRequest(params.Body)
+	body, headers, err := prepareRequest(params.Body, params.Headers)
 	if err != nil {
 		return StreamResult{}, err
 	}
-	return c.openWithAccount(ctx, account, body, true)
+	return c.openWithAccount(ctx, account, body, headers, true)
 }
 
-func (c *Client) openWithAccount(ctx context.Context, account store.Account, reqBody []byte, allowRefreshRetry bool) (StreamResult, error) {
+func prepareRequest(body []byte, headers http.Header) ([]byte, http.Header, error) {
+	transformed, err := TransformRequest(body)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	codexMode := strings.ToLower(strings.TrimSpace(headers.Get(RouterCodexModeHeader)))
+	webSearchMode := strings.ToLower(strings.TrimSpace(headers.Get(RouterWebSearchHeader)))
+	if codexMode == "" && webSearchMode == "" {
+		return transformed, headers, nil
+	}
+
+	forwardHeaders := headers.Clone()
+	forwardHeaders.Del(RouterCodexModeHeader)
+	forwardHeaders.Del(RouterWebSearchHeader)
+
+	switch codexMode {
+	case "":
+	case "full":
+		// Custom Codex providers normally send the reduced Responses Lite
+		// contract. Full mode opts this request into the regular Responses
+		// contract so supported input parts, tools, includes, and annotations
+		// can flow through the router without changing other API clients.
+		forwardHeaders.Del(CodexResponsesLiteHeader)
+	default:
+		return nil, nil, errors.New("invalid " + RouterCodexModeHeader + " value")
+	}
+
+	switch webSearchMode {
+	case "":
+		return transformed, forwardHeaders, nil
+	case "disabled":
+		return transformed, forwardHeaders, nil
+	case "cached", "indexed", "live":
+		transformed, err = enableNativeWebSearch(transformed, webSearchMode == "live")
+		if err != nil {
+			return nil, nil, err
+		}
+		// The Codex custom-provider payload uses the responses-lite envelope,
+		// which intentionally omits hosted tools. Once the router adds the
+		// native tool, send it through the regular Responses contract.
+		forwardHeaders.Del(CodexResponsesLiteHeader)
+		return transformed, forwardHeaders, nil
+	default:
+		return nil, nil, errors.New("invalid " + RouterWebSearchHeader + " value")
+	}
+}
+
+func enableNativeWebSearch(body []byte, externalWebAccess bool) ([]byte, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	tools, _ := payload["tools"].([]any)
+	found := false
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok || tool["type"] != "web_search" {
+			continue
+		}
+		tool["external_web_access"] = externalWebAccess
+		found = true
+	}
+	if !found {
+		tools = append(tools, map[string]any{
+			"type":                "web_search",
+			"external_web_access": externalWebAccess,
+		})
+	}
+	payload["tools"] = tools
+
+	include, _ := payload["include"].([]any)
+	const sources = "web_search_call.action.sources"
+	hasSources := false
+	for _, item := range include {
+		if item == sources {
+			hasSources = true
+			break
+		}
+	}
+	if !hasSources {
+		payload["include"] = append(include, sources)
+	}
+	return json.Marshal(payload)
+}
+
+func (c *Client) openWithAccount(ctx context.Context, account store.Account, reqBody []byte, inboundHeaders http.Header, allowRefreshRetry bool) (StreamResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(reqBody))
 	if err != nil {
 		return StreamResult{}, err
@@ -168,9 +261,7 @@ func (c *Client) openWithAccount(ctx context.Context, account store.Account, req
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Authorization", "Bearer "+account.AccessToken)
-	req.Header.Set("originator", "codex-cli")
-	req.Header.Set("User-Agent", "codex-cli/1.0.18 (macOS; arm64)")
-	req.Header.Set("session_id", account.ID)
+	applyCodexProtocolHeaders(req.Header, inboundHeaders, account)
 
 	start := time.Now()
 	c.logf("[openai-api] request account=%s method=%s url=%s headers=%s body=%s",
@@ -207,7 +298,7 @@ func (c *Client) openWithAccount(ctx context.Context, account store.Account, req
 			result.ErrorBody = errorBody
 			return result, refreshErr
 		}
-		return c.openWithAccount(ctx, refreshed, reqBody, false)
+		return c.openWithAccount(ctx, refreshed, reqBody, inboundHeaders, false)
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return result, nil
@@ -231,6 +322,45 @@ func (c *Client) openWithAccount(ctx context.Context, account store.Account, req
 	return result, nil
 }
 
+func applyCodexProtocolHeaders(dst, src http.Header, account store.Account) {
+	if hasCodexProtocolHeaders(src) {
+		for key, values := range src {
+			lower := strings.ToLower(key)
+			switch lower {
+			case "user-agent", "originator", "session-id", "thread-id", "x-client-request-id", "x-openai-internal-codex-responses-lite":
+				dst[http.CanonicalHeaderKey(key)] = append([]string(nil), values...)
+			default:
+				if strings.HasPrefix(lower, "x-codex-") {
+					dst[http.CanonicalHeaderKey(key)] = append([]string(nil), values...)
+				}
+			}
+		}
+	}
+	if dst.Get("Originator") == "" {
+		dst.Set("Originator", "codex-cli")
+	}
+	if dst.Get("User-Agent") == "" {
+		dst.Set("User-Agent", "codex-cli/1.0.18 (macOS; arm64)")
+	}
+	if dst.Get("Session-Id") == "" {
+		dst.Set("Session-Id", account.ID)
+	}
+	var metadata oauth.AccountMetadata
+	if json.Unmarshal([]byte(account.MetadataJSON), &metadata) == nil && strings.TrimSpace(metadata.ChatGPTAccountID) != "" {
+		dst.Set("ChatGPT-Account-Id", strings.TrimSpace(metadata.ChatGPTAccountID))
+	}
+}
+
+func hasCodexProtocolHeaders(headers http.Header) bool {
+	for key := range headers {
+		lower := strings.ToLower(key)
+		if lower == "originator" || lower == "session-id" || lower == "thread-id" || strings.HasPrefix(lower, "x-codex-") {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Client) FetchQuota(ctx context.Context, account store.Account) (QuotaInfo, error) {
 	refreshed, err := c.tokens.EnsureFresh(ctx, account.ID)
 	if err != nil {
@@ -240,7 +370,7 @@ func (c *Client) FetchQuota(ctx context.Context, account store.Account) (QuotaIn
 	if err != nil {
 		return QuotaInfo{}, err
 	}
-	result, err := c.openWithAccount(ctx, refreshed, body, true)
+	result, err := c.openWithAccount(ctx, refreshed, body, nil, true)
 	if err != nil {
 		return QuotaInfo{}, err
 	}
@@ -362,7 +492,10 @@ func TransformRequest(body []byte) ([]byte, error) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
 	}
-	if instructions, _ := payload["instructions"].(string); strings.TrimSpace(instructions) == "" {
+	instructions, exists := payload["instructions"]
+	if !exists || instructions == nil {
+		payload["instructions"] = DefaultInstructions
+	} else if text, ok := instructions.(string); ok && strings.TrimSpace(text) == "" {
 		payload["instructions"] = DefaultInstructions
 	}
 	payload["stream"] = true
@@ -516,7 +649,7 @@ func (r *loggingReadCloser) log() {
 func formatHeaders(headers http.Header) string {
 	redacted := make(map[string][]string, len(headers))
 	for key, values := range headers {
-		if strings.EqualFold(key, "Authorization") {
+		if strings.EqualFold(key, "Authorization") || strings.EqualFold(key, "ChatGPT-Account-Id") {
 			redacted[key] = []string{"<redacted>"}
 			continue
 		}
