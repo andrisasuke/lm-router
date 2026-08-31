@@ -291,7 +291,7 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	payload, _ := json.Marshal(responsesBody)
 	if stream, _ := responsesBody["stream"].(bool); stream {
-		status, err := s.streamChatCompletions(r.Context(), payload, r.Header, w)
+		status, err := s.streamChatCompletions(r.Context(), payload, r.Header, stringVal(body["model"]), w)
 		if err != nil {
 			writeOpenAIError(w, statusOrDefault(status, http.StatusBadGateway), "proxy_error", err.Error())
 		}
@@ -429,7 +429,7 @@ func (s *Server) streamResponses(ctx context.Context, body []byte, headers http.
 	return contentTypeOrDefault(stream.Header.Get("Content-Type")), stream.Status, nil
 }
 
-func (s *Server) streamChatCompletions(ctx context.Context, body []byte, headers http.Header, w http.ResponseWriter) (int, error) {
+func (s *Server) streamChatCompletions(ctx context.Context, body []byte, headers http.Header, model string, w http.ResponseWriter) (int, error) {
 	stream, status, err := s.openResponseStream(ctx, body, headers)
 	if err != nil {
 		return status, err
@@ -439,7 +439,7 @@ func (s *Server) streamChatCompletions(ctx context.Context, body []byte, headers
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
-	if err := convertResponsesStreamToChatSSE(w, stream.Body); err != nil {
+	if err := convertResponsesStreamToChatSSE(w, stream.Body, model); err != nil {
 		return http.StatusBadGateway, err
 	}
 	return http.StatusOK, nil
@@ -762,21 +762,174 @@ func responsesJSONFromSSE(model any, body []byte) map[string]any {
 	return resp
 }
 
-func convertResponsesStreamToChatSSE(w io.Writer, r io.Reader) error {
+type chatToolCallStreamState struct {
+	index              int
+	itemID             string
+	id                 string
+	name               string
+	started            bool
+	argumentsEmitted   bool
+	pendingArguments   strings.Builder
+	completedArguments string
+}
+
+func convertResponsesStreamToChatSSE(w io.Writer, r io.Reader, model string) error {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = "gpt-5.3-codex"
+	}
+	created := time.Now().Unix()
+	sentRole := false
+	sawToolCall := false
+	finalWritten := false
+	toolCallsByItemID := map[string]*chatToolCallStreamState{}
+	toolCallsByOutputIndex := map[int]*chatToolCallStreamState{}
+	nextToolIndex := 0
+
 	encoder := func(payload any) []byte {
 		data, _ := json.Marshal(payload)
 		return data
 	}
+	writeChunk := func(delta map[string]any, finishReason any) error {
+		if finishReason == nil && !sentRole {
+			delta["role"] = "assistant"
+			sentRole = true
+		}
+		chunk := map[string]any{
+			"id":      "chatcmpl-lm-router",
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": finishReason}},
+		}
+		if _, err := w.Write([]byte("data: " + string(encoder(chunk)) + "\n\n")); err != nil {
+			return err
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		return nil
+	}
 	writeFinal := func() error {
+		if finalWritten {
+			return nil
+		}
+		finalWritten = true
+		finishReason := "stop"
+		if sawToolCall {
+			finishReason = "tool_calls"
+		}
 		doneChunk := map[string]any{
 			"id":      "chatcmpl-lm-router",
 			"object":  "chat.completion.chunk",
-			"created": time.Now().Unix(),
-			"model":   "gpt-5.3-codex",
-			"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+			"created": created,
+			"model":   model,
+			"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finishReason}},
 		}
 		_, err := w.Write([]byte("data: " + string(encoder(doneChunk)) + "\n\n" + "data: [DONE]\n\n"))
 		return err
+	}
+	outputIndex := func(v any) (int, bool) {
+		switch n := v.(type) {
+		case float64:
+			return int(n), true
+		case int:
+			return n, true
+		default:
+			return 0, false
+		}
+	}
+	resolveToolCall := func(event map[string]any, item map[string]any) *chatToolCallStreamState {
+		itemID := stringVal(event["item_id"])
+		if itemID == "" && item != nil {
+			itemID = stringVal(item["id"])
+		}
+		index, hasOutputIndex := outputIndex(event["output_index"])
+		var call *chatToolCallStreamState
+		if itemID != "" {
+			call = toolCallsByItemID[itemID]
+		}
+		if call == nil && hasOutputIndex {
+			call = toolCallsByOutputIndex[index]
+		}
+		if call == nil {
+			call = &chatToolCallStreamState{index: nextToolIndex, itemID: itemID}
+			nextToolIndex++
+		}
+		if itemID != "" {
+			call.itemID = itemID
+			toolCallsByItemID[itemID] = call
+		}
+		if hasOutputIndex {
+			toolCallsByOutputIndex[index] = call
+		}
+		if item != nil {
+			if id := stringVal(item["call_id"]); id != "" {
+				call.id = id
+			} else if call.id == "" {
+				call.id = stringVal(item["id"])
+			}
+			if name := stringVal(item["name"]); name != "" {
+				call.name = name
+			}
+			if arguments := stringVal(item["arguments"]); arguments != "" {
+				call.completedArguments = arguments
+			}
+		}
+		return call
+	}
+	emitToolStart := func(call *chatToolCallStreamState) error {
+		if call.started {
+			return nil
+		}
+		if call.id == "" {
+			if call.itemID != "" {
+				call.id = call.itemID
+			} else {
+				call.id = fmt.Sprintf("call_lm_router_%d", call.index)
+			}
+		}
+		call.started = true
+		sawToolCall = true
+		return writeChunk(map[string]any{
+			"tool_calls": []map[string]any{{
+				"index": call.index,
+				"id":    call.id,
+				"type":  "function",
+				"function": map[string]any{
+					"name":      call.name,
+					"arguments": "",
+				},
+			}},
+		}, nil)
+	}
+	emitToolArguments := func(call *chatToolCallStreamState, arguments string) error {
+		if arguments == "" {
+			return nil
+		}
+		if !call.started {
+			call.pendingArguments.WriteString(arguments)
+			return nil
+		}
+		call.argumentsEmitted = true
+		return writeChunk(map[string]any{
+			"tool_calls": []map[string]any{{
+				"index": call.index,
+				"function": map[string]any{
+					"arguments": arguments,
+				},
+			}},
+		}, nil)
+	}
+	flushToolArguments := func(call *chatToolCallStreamState) error {
+		if call.argumentsEmitted {
+			return nil
+		}
+		arguments := call.pendingArguments.String()
+		if arguments == "" {
+			arguments = call.completedArguments
+		}
+		return emitToolArguments(call, arguments)
 	}
 	scanner := NewSSEScanner(r)
 	for scanner.Scan() {
@@ -788,22 +941,50 @@ func convertResponsesStreamToChatSSE(w io.Writer, r io.Reader) error {
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
 			continue
 		}
-		delta, _ := event["delta"].(string)
-		if delta == "" {
-			continue
-		}
-		chunk := map[string]any{
-			"id":      "chatcmpl-lm-router",
-			"object":  "chat.completion.chunk",
-			"created": time.Now().Unix(),
-			"model":   "gpt-5.3-codex",
-			"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": delta}, "finish_reason": nil}},
-		}
-		if _, err := w.Write([]byte("data: " + string(encoder(chunk)) + "\n\n")); err != nil {
-			return err
-		}
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
+		switch stringVal(event["type"]) {
+		case "response.output_text.delta":
+			delta := stringVal(event["delta"])
+			if delta != "" {
+				if err := writeChunk(map[string]any{"content": delta}, nil); err != nil {
+					return err
+				}
+			}
+		case "response.output_item.added":
+			item, _ := event["item"].(map[string]any)
+			if item == nil || stringVal(item["type"]) != "function_call" {
+				continue
+			}
+			call := resolveToolCall(event, item)
+			if err := emitToolStart(call); err != nil {
+				return err
+			}
+		case "response.function_call_arguments.delta":
+			call := resolveToolCall(event, nil)
+			if err := emitToolArguments(call, stringVal(event["delta"])); err != nil {
+				return err
+			}
+		case "response.function_call_arguments.done":
+			call := resolveToolCall(event, nil)
+			if arguments := stringVal(event["arguments"]); arguments != "" {
+				call.completedArguments = arguments
+			}
+			if call.started {
+				if err := flushToolArguments(call); err != nil {
+					return err
+				}
+			}
+		case "response.output_item.done":
+			item, _ := event["item"].(map[string]any)
+			if item == nil || stringVal(item["type"]) != "function_call" {
+				continue
+			}
+			call := resolveToolCall(event, item)
+			if err := emitToolStart(call); err != nil {
+				return err
+			}
+			if err := flushToolArguments(call); err != nil {
+				return err
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {

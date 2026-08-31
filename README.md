@@ -115,6 +115,39 @@ existing behavior unless configured with these headers. Full mode does not add
 a Files API or change which local Codex skill the model chooses; local file
 paths continue to be read by Codex from the host workspace.
 
+## Use with Hermes Agent
+
+Hermes works best with lm-router through the Responses API. Export the local
+router key, then add a custom provider to `~/.hermes/config.yaml`:
+
+```bash
+export LM_ROUTER_API_KEY="sk-lm-router-REPLACE_ME"
+```
+
+```yaml
+providers:
+  lm-router:
+    name: LM Router
+    base_url: http://127.0.0.1:19090/v1
+    key_env: LM_ROUTER_API_KEY
+    api_mode: codex_responses
+    default_model: gpt-5.3-codex
+    extra_headers:
+      X-LM-Router-Codex-Mode: full
+
+model:
+  default: gpt-5.3-codex
+  provider: custom:lm-router
+  base_url: http://127.0.0.1:19090/v1
+  api_mode: codex_responses
+```
+
+Responses mode preserves function calls and multimodal input without a
+Chat Completions translation step. Hermes can also use `api_mode:
+chat_completions`; lm-router translates streamed function calls into standard
+`delta.tool_calls` chunks so tools such as `vision_analyze` execute instead of
+appearing as raw JSON assistant text.
+
 ## Use with Claude Code
 
 Keep the router running and set Claude Code to the local endpoint:

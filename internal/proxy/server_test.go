@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1097,6 +1098,276 @@ func TestChatCompletionsStreamReturnsDone(t *testing.T) {
 	if strings.Index(rec.Body.String(), `"finish_reason":"stop"`) > strings.Index(rec.Body.String(), "data: [DONE]") {
 		t.Fatalf("finish chunk must be emitted before DONE, got %s", rec.Body.String())
 	}
+	chunks, done := decodeChatCompletionStream(t, rec.Body.String())
+	if !done {
+		t.Fatal("expected DONE marker")
+	}
+	_, content, finishReason, sawRole := collectChatCompletionStream(t, chunks)
+	if content != "hello" {
+		t.Fatalf("content=%q want hello", content)
+	}
+	if finishReason != "stop" {
+		t.Fatalf("finish_reason=%q want stop", finishReason)
+	}
+	if !sawRole {
+		t.Fatal("expected first delta to include role=assistant")
+	}
+}
+
+func TestChatCompletionsStreamEmitsVisionToolCall(t *testing.T) {
+	db, apiKey := newTestDBWithKey(t)
+	account := store.Account{
+		ID:           "acct_vision",
+		Provider:     store.ProviderOpenAICodex,
+		Name:         "vision",
+		Enabled:      true,
+		AccessToken:  "token-vision",
+		RefreshToken: "refresh-vision",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	if err := db.UpsertAccount(context.Background(), account); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+		}
+		tools, _ := body["tools"].([]any)
+		if len(tools) != 1 {
+			t.Errorf("tools=%#v want one vision tool", body["tools"])
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, responsesSSE(
+			map[string]any{"type": "response.output_text.delta", "delta": "Inspecting image."},
+			map[string]any{
+				"type":         "response.output_item.added",
+				"output_index": 0,
+				"item": map[string]any{
+					"type": "function_call", "id": "fc_vision", "call_id": "call_vision",
+					"name": "vision_analyze", "arguments": "",
+				},
+			},
+			map[string]any{
+				"type": "response.function_call_arguments.delta", "item_id": "fc_vision", "output_index": 0,
+				"delta": `{"image_url":"/tmp/example.png",`,
+			},
+			map[string]any{
+				"type": "response.function_call_arguments.delta", "item_id": "fc_vision", "output_index": 0,
+				"delta": `"question":"What is shown?","region":[0,0,0,0]}`,
+			},
+			map[string]any{
+				"type": "response.output_item.done", "output_index": 0,
+				"item": map[string]any{
+					"type": "function_call", "id": "fc_vision", "call_id": "call_vision",
+					"name":      "vision_analyze",
+					"arguments": `{"image_url":"/tmp/example.png","question":"What is shown?","region":[0,0,0,0]}`,
+				},
+			},
+		))
+	}))
+	defer upstream.Close()
+
+	srv := New(ServerConfig{
+		Store:      db,
+		Codex:      codex.NewClient(upstream.URL, codex.NewTokenManager(db, nil)),
+		RequireKey: true,
+	})
+	requestBody := `{
+		"model":"gpt-5.6-luna",
+		"messages":[{"role":"user","content":"What is in this image?"}],
+		"tools":[{"type":"function","function":{"name":"vision_analyze","description":"Inspect an image","parameters":{"type":"object"}}}],
+		"stream":true
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(requestBody))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	chunks, done := decodeChatCompletionStream(t, rec.Body.String())
+	if !done {
+		t.Fatal("expected DONE marker")
+	}
+	tools, content, finishReason, sawRole := collectChatCompletionStream(t, chunks)
+	tool := tools[0]
+	if tool == nil {
+		t.Fatalf("missing tool call in stream: %s", rec.Body.String())
+	}
+	if tool.ID != "call_vision" || tool.Name != "vision_analyze" {
+		t.Fatalf("tool=%+v", tool)
+	}
+	wantArguments := `{"image_url":"/tmp/example.png","question":"What is shown?","region":[0,0,0,0]}`
+	if tool.Arguments != wantArguments {
+		t.Fatalf("arguments=%q want %q", tool.Arguments, wantArguments)
+	}
+	if content != "Inspecting image." {
+		t.Fatalf("content=%q", content)
+	}
+	if strings.Contains(content, "image_url") {
+		t.Fatalf("tool arguments leaked into content: %q", content)
+	}
+	if finishReason != "tool_calls" {
+		t.Fatalf("finish_reason=%q want tool_calls", finishReason)
+	}
+	if !sawRole {
+		t.Fatal("expected first delta to include role=assistant")
+	}
+	for _, chunk := range chunks {
+		if chunk["model"] != "gpt-5.6-luna" {
+			t.Fatalf("chunk model=%v want gpt-5.6-luna", chunk["model"])
+		}
+	}
+}
+
+func TestConvertResponsesStreamToChatSSEKeepsInterleavedToolCallsSeparate(t *testing.T) {
+	upstream := responsesSSE(
+		map[string]any{
+			"type": "response.output_item.added", "output_index": 4,
+			"item": map[string]any{"type": "function_call", "id": "fc_a", "call_id": "call_a", "name": "first_tool", "arguments": ""},
+		},
+		map[string]any{
+			"type": "response.output_item.added", "output_index": 7,
+			"item": map[string]any{"type": "function_call", "id": "fc_b", "call_id": "call_b", "name": "second_tool", "arguments": ""},
+		},
+		map[string]any{"type": "response.function_call_arguments.delta", "item_id": "fc_b", "output_index": 7, "delta": `{"b":`},
+		map[string]any{"type": "response.reasoning_summary_text.delta", "delta": "must not leak"},
+		map[string]any{"type": "response.function_call_arguments.delta", "item_id": "fc_a", "output_index": 4, "delta": `{"a":`},
+		map[string]any{"type": "response.function_call_arguments.delta", "item_id": "fc_b", "output_index": 7, "delta": `"two"}`},
+		map[string]any{"type": "response.function_call_arguments.delta", "item_id": "fc_a", "output_index": 4, "delta": `"one"}`},
+		map[string]any{
+			"type": "response.output_item.done", "output_index": 4,
+			"item": map[string]any{"type": "function_call", "id": "fc_a", "call_id": "call_a", "name": "first_tool", "arguments": `{"a":"one"}`},
+		},
+		map[string]any{
+			"type": "response.output_item.done", "output_index": 7,
+			"item": map[string]any{"type": "function_call", "id": "fc_b", "call_id": "call_b", "name": "second_tool", "arguments": `{"b":"two"}`},
+		},
+		map[string]any{
+			"type": "response.output_item.done", "output_index": 9,
+			"item": map[string]any{"type": "function_call", "id": "fc_c", "call_id": "call_c", "name": "fallback_tool", "arguments": `{"c":3}`},
+		},
+	)
+	var output bytes.Buffer
+	if err := convertResponsesStreamToChatSSE(&output, strings.NewReader(upstream), "gpt-test"); err != nil {
+		t.Fatalf("convert stream: %v", err)
+	}
+	chunks, done := decodeChatCompletionStream(t, output.String())
+	if !done {
+		t.Fatal("expected DONE marker")
+	}
+	tools, content, finishReason, _ := collectChatCompletionStream(t, chunks)
+	wants := map[int]chatToolCallSummary{
+		0: {ID: "call_a", Name: "first_tool", Arguments: `{"a":"one"}`},
+		1: {ID: "call_b", Name: "second_tool", Arguments: `{"b":"two"}`},
+		2: {ID: "call_c", Name: "fallback_tool", Arguments: `{"c":3}`},
+	}
+	if len(tools) != len(wants) {
+		t.Fatalf("tools=%+v", tools)
+	}
+	for index, want := range wants {
+		if got := tools[index]; got == nil || *got != want {
+			t.Errorf("tool[%d]=%+v want %+v", index, got, want)
+		}
+	}
+	if content != "" {
+		t.Fatalf("reasoning or arguments leaked into content: %q", content)
+	}
+	if finishReason != "tool_calls" {
+		t.Fatalf("finish_reason=%q want tool_calls", finishReason)
+	}
+}
+
+type chatToolCallSummary struct {
+	ID        string
+	Name      string
+	Arguments string
+}
+
+func responsesSSE(events ...map[string]any) string {
+	var stream strings.Builder
+	for _, event := range events {
+		payload, _ := json.Marshal(event)
+		stream.WriteString("data: ")
+		stream.Write(payload)
+		stream.WriteString("\n\n")
+	}
+	stream.WriteString("data: [DONE]\n\n")
+	return stream.String()
+}
+
+func decodeChatCompletionStream(t *testing.T, stream string) ([]map[string]any, bool) {
+	t.Helper()
+	var chunks []map[string]any
+	done := false
+	for _, line := range strings.Split(stream, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			done = true
+			continue
+		}
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			t.Fatalf("decode chat completion chunk: %v\npayload=%s", err, payload)
+		}
+		chunks = append(chunks, chunk)
+	}
+	return chunks, done
+}
+
+func collectChatCompletionStream(t *testing.T, chunks []map[string]any) (map[int]*chatToolCallSummary, string, string, bool) {
+	t.Helper()
+	tools := map[int]*chatToolCallSummary{}
+	var content strings.Builder
+	finishReason := ""
+	sawRole := false
+	for _, chunk := range chunks {
+		choices, _ := chunk["choices"].([]any)
+		if len(choices) != 1 {
+			t.Fatalf("choices=%#v", chunk["choices"])
+		}
+		choice, _ := choices[0].(map[string]any)
+		if reason, _ := choice["finish_reason"].(string); reason != "" {
+			finishReason = reason
+		}
+		delta, _ := choice["delta"].(map[string]any)
+		if delta["role"] == "assistant" {
+			sawRole = true
+		}
+		if text, _ := delta["content"].(string); text != "" {
+			content.WriteString(text)
+		}
+		toolDeltas, _ := delta["tool_calls"].([]any)
+		for _, raw := range toolDeltas {
+			toolDelta, _ := raw.(map[string]any)
+			indexValue, _ := toolDelta["index"].(float64)
+			index := int(indexValue)
+			summary := tools[index]
+			if summary == nil {
+				summary = &chatToolCallSummary{}
+				tools[index] = summary
+			}
+			if id, _ := toolDelta["id"].(string); id != "" {
+				summary.ID = id
+			}
+			function, _ := toolDelta["function"].(map[string]any)
+			if name, _ := function["name"].(string); name != "" {
+				summary.Name = name
+			}
+			if arguments, _ := function["arguments"].(string); arguments != "" {
+				summary.Arguments += arguments
+			}
+		}
+	}
+	return tools, content.String(), finishReason, sawRole
 }
 
 func TestAnthropicMessagesForwardsThinking(t *testing.T) {
