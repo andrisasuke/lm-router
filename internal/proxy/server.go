@@ -28,13 +28,14 @@ func newThinkingSignature() string {
 }
 
 type ServerConfig struct {
-	Store       *store.DB
-	Codex       *codex.Client
-	Anthropic   *anthropic.Client
-	Custom      *customprovider.Client
-	RequireKey  bool
-	Logger      Logger
-	LogRequests bool
+	Store             *store.DB
+	Codex             *codex.Client
+	Anthropic         *anthropic.Client
+	Custom            *customprovider.Client
+	RequireKey        bool
+	Logger            Logger
+	LogRequests       bool
+	OnAccountActivity func(accountID string, active bool)
 }
 
 type Logger interface {
@@ -48,11 +49,12 @@ func (stdLogger) Printf(format string, args ...any) {
 }
 
 type Server struct {
-	store      *store.DB
-	codex      *codex.Client
-	anthropic  *anthropic.Client
-	custom     *customprovider.Client
-	requireKey bool
+	store             *store.DB
+	codex             *codex.Client
+	anthropic         *anthropic.Client
+	custom            *customprovider.Client
+	requireKey        bool
+	onAccountActivity func(accountID string, active bool)
 }
 
 func New(cfg ServerConfig) http.Handler {
@@ -65,11 +67,12 @@ func New(cfg ServerConfig) http.Handler {
 		custom = customprovider.NewClient(logger)
 	}
 	s := &Server{
-		store:      cfg.Store,
-		codex:      cfg.Codex,
-		anthropic:  cfg.Anthropic,
-		custom:     custom,
-		requireKey: cfg.RequireKey,
+		store:             cfg.Store,
+		codex:             cfg.Codex,
+		anthropic:         cfg.Anthropic,
+		custom:            custom,
+		requireKey:        cfg.RequireKey,
+		onAccountActivity: cfg.OnAccountActivity,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.health)
@@ -388,10 +391,12 @@ func (s *Server) routeResponses(ctx context.Context, body []byte, headers http.H
 		if !codex.IsAccountAvailable(account) {
 			continue
 		}
-		result, err := s.codex.ExecuteResponses(ctx, codex.ExecuteParams{
-			Account: account,
-			Body:    body,
-			Headers: headers,
+		result, err := trackAccountCall(s, account.ID, func() (codex.ExecuteResult, error) {
+			return s.codex.ExecuteResponses(ctx, codex.ExecuteParams{
+				Account: account,
+				Body:    body,
+				Headers: headers,
+			})
 		})
 		if err != nil {
 			lastErr = err
@@ -459,19 +464,23 @@ func (s *Server) openResponseStream(ctx context.Context, body []byte, headers ht
 		if !codex.IsAccountAvailable(account) {
 			continue
 		}
+		done := s.beginAccountActivity(account.ID)
 		result, err := s.codex.OpenResponsesStream(ctx, codex.ExecuteParams{
 			Account: account,
 			Body:    body,
 			Headers: headers,
 		})
 		if err != nil {
+			done()
 			lastErr = err
 			lastStatus = http.StatusBadGateway
 			continue
 		}
 		if result.Status >= 200 && result.Status < 300 {
+			result.Body = trackAccountStream(result.Body, done)
 			return result, result.Status, nil
 		}
+		done()
 		lastStatus = result.Status
 		lastErr = errors.New(string(result.ErrorBody))
 		if !result.Retryable {
@@ -2115,11 +2124,12 @@ func (s *Server) routeAnthropic(ctx context.Context, body []byte, header http.He
 		}
 		params := anthropic.ExecuteParams{Account: account, Body: body, Header: header}
 		var result anthropic.ExecuteResult
-		if countTokens {
-			result, err = s.anthropic.ExecuteCountTokens(ctx, params)
-		} else {
-			result, err = s.anthropic.ExecuteMessages(ctx, params)
-		}
+		result, err = trackAccountCall(s, account.ID, func() (anthropic.ExecuteResult, error) {
+			if countTokens {
+				return s.anthropic.ExecuteCountTokens(ctx, params)
+			}
+			return s.anthropic.ExecuteMessages(ctx, params)
+		})
 		if err != nil {
 			if ctx.Err() != nil {
 				return result, ctx.Err()
@@ -2172,8 +2182,10 @@ func (s *Server) openAnthropicStream(ctx context.Context, body []byte, header ht
 			first := account
 			firstTried = &first
 		}
+		done := s.beginAccountActivity(account.ID)
 		result, err := s.anthropic.OpenMessagesStream(ctx, anthropic.ExecuteParams{Account: account, Body: body, Header: header})
 		if err != nil {
+			done()
 			if ctx.Err() != nil {
 				return result, ctx.Err()
 			}
@@ -2187,9 +2199,11 @@ func (s *Server) openAnthropicStream(ctx context.Context, body []byte, header ht
 			continue
 		}
 		if result.Status >= 200 && result.Status < 300 {
+			result.Body = trackAccountStream(result.Body, done)
 			recordAnthropicSuccess(ctx, s.store, account, firstTried, true)
 			return result, nil
 		}
+		done()
 		lastResult = result
 		lastErr = errors.New(string(result.ErrorBody))
 		if !result.Retryable {

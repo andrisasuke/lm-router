@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,10 @@ func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) 
 }
 
 func anthropicProxyFixture(t *testing.T, upstream *httptest.Server, accounts ...store.Account) (http.Handler, *store.DB) {
+	return anthropicProxyFixtureWithActivity(t, upstream, nil, accounts...)
+}
+
+func anthropicProxyFixtureWithActivity(t *testing.T, upstream *httptest.Server, onActivity func(string, bool), accounts ...store.Account) (http.Handler, *store.DB) {
 	t.Helper()
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir())
@@ -47,7 +52,37 @@ func anthropicProxyFixture(t *testing.T, upstream *httptest.Server, accounts ...
 	tokens := codex.NewProviderTokenManager(db, nil, nil)
 	client := anthropic.NewClient(upstream.URL+"/v1/messages", upstream.URL+"/api/oauth/usage", tokens, nil)
 	client.SetHTTPClient(upstream.Client())
-	return New(ServerConfig{Store: db, Anthropic: client, RequireKey: false}), db
+	return New(ServerConfig{Store: db, Anthropic: client, RequireKey: false, OnAccountActivity: onActivity}), db
+}
+
+func TestClaudeMessagesReportsAccountActivity(t *testing.T) {
+	var active atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !active.Load() {
+			t.Error("account should be active while Claude upstream is handling the request")
+		}
+		_, _ = w.Write([]byte(`{"id":"msg_active"}`))
+	}))
+	defer upstream.Close()
+	events := &activityEvents{}
+	handler, _ := anthropicProxyFixtureWithActivity(t, upstream, func(accountID string, requesting bool) {
+		active.Store(requesting)
+		events.callback(accountID, requesting)
+	}, store.Account{ID: "claude", Name: "main", Priority: 1, AccessToken: "oauth"})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-opus-4-6","messages":[]}`))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if active.Load() {
+		t.Fatal("account should be idle after Claude request finishes")
+	}
+	if got, want := events.snapshot(), []string{"claude:active", "claude:idle"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("events=%v, want %v", got, want)
+	}
 }
 
 func TestClaudeMessagesAreProxiedNativeWithResponseHeaders(t *testing.T) {

@@ -82,6 +82,7 @@ type APIKey struct {
 type Settings struct {
 	Host                   string
 	Port                   int
+	TrayEnabled            bool
 	LogRequests            bool
 	LogUpstream            bool
 	LogBodyLimit           int
@@ -93,6 +94,7 @@ func DefaultSettings() Settings {
 	return Settings{
 		Host:                   "127.0.0.1",
 		Port:                   19090,
+		TrayEnabled:            true,
 		LogRequests:            true,
 		LogUpstream:            true,
 		LogBodyLimit:           64 * 1024,
@@ -341,9 +343,11 @@ func (db *DB) GetSettings(ctx context.Context) (Settings, error) {
 			}
 		case "port":
 			var port int
-			if _, err := fmt.Sscanf(value, "%d", &port); err == nil && port > 0 {
+			if _, err := fmt.Sscanf(value, "%d", &port); err == nil && port >= 0 {
 				settings.Port = port
 			}
+		case "tray_enabled":
+			settings.TrayEnabled = value != "false"
 		case "log_requests":
 			settings.LogRequests = value != "false"
 		case "log_upstream":
@@ -371,7 +375,7 @@ func (db *DB) SaveSettings(ctx context.Context, settings Settings) error {
 	if settings.Host == "" {
 		settings.Host = "127.0.0.1"
 	}
-	if settings.Port <= 0 {
+	if settings.Port < 0 {
 		settings.Port = 19090
 	}
 	if settings.LogBodyLimit <= 0 {
@@ -386,6 +390,7 @@ func (db *DB) SaveSettings(ctx context.Context, settings Settings) error {
 	values := map[string]string{
 		"host":                     settings.Host,
 		"port":                     fmt.Sprintf("%d", settings.Port),
+		"tray_enabled":             fmt.Sprintf("%t", settings.TrayEnabled),
 		"log_requests":             fmt.Sprintf("%t", settings.LogRequests),
 		"log_upstream":             fmt.Sprintf("%t", settings.LogUpstream),
 		"log_body_limit":           fmt.Sprintf("%d", settings.LogBodyLimit),
@@ -967,7 +972,7 @@ func nullTimeValue(v sql.NullTime) any {
 }
 
 // nullStringValue maps "" to SQL NULL. Required for the accounts.prefix
-// column: '' IS NOT NULL is true in SQLite, so binding a plain "" would
+// column: ” IS NOT NULL is true in SQLite, so binding a plain "" would
 // collide with the partial unique index on every non-custom account.
 func nullStringValue(v string) any {
 	if v == "" {

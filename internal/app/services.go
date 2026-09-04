@@ -230,6 +230,47 @@ func (s ProviderService) SetEnabled(ctx context.Context, id string, enabled bool
 	return s.DB.SetAccountEnabled(ctx, id, enabled)
 }
 
+// Reorder swaps an account with its adjacent connection inside the same
+// provider pool. The compare-and-swap prevents stale desktop views from
+// silently overwriting a concurrent failover promotion or TUI reorder.
+func (s ProviderService) Reorder(ctx context.Context, id string, delta int) error {
+	if delta != -1 && delta != 1 {
+		return fmt.Errorf("reorder delta must be -1 or 1")
+	}
+	account, err := s.DB.MustGetAccount(ctx, id)
+	if err != nil {
+		return err
+	}
+	accounts, err := s.DB.ListAccountsByProvider(ctx, account.Provider)
+	if err != nil {
+		return err
+	}
+	index := -1
+	for i := range accounts {
+		if accounts[i].ID == id {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return store.ErrAccountNotFound
+	}
+	target := index + delta
+	if target < 0 || target >= len(accounts) {
+		return nil
+	}
+	other := accounts[target]
+	swapped, err := s.DB.SwapAccountPrioritiesCAS(ctx, account.Provider,
+		account.ID, account.Priority, other.ID, other.Priority)
+	if err != nil {
+		return err
+	}
+	if !swapped {
+		return fmt.Errorf("provider priorities changed; reload and retry")
+	}
+	return nil
+}
+
 func (s ProviderService) Refresh(ctx context.Context, id string) (store.Account, error) {
 	return NewProviderTokenManager(s.DB).RefreshNow(ctx, id)
 }
@@ -391,7 +432,7 @@ func (s KeyService) Delete(ctx context.Context, id string) error {
 	return s.DB.DeleteAPIKey(ctx, id)
 }
 
-func NewProxyHandler(db *store.DB, settings store.Settings, logger Logger) http.Handler {
+func NewProxyHandler(db *store.DB, settings store.Settings, logger Logger, activity ...func(accountID string, active bool)) http.Handler {
 	bodyLimit := settings.LogBodyLimit
 	if bodyLimit <= 0 {
 		bodyLimit = 64 * 1024
@@ -407,14 +448,19 @@ func NewProxyHandler(db *store.DB, settings store.Settings, logger Logger) http.
 	claudeClient.SetUpstreamTimeout(settings.UpstreamTimeoutSeconds)
 	customClient := customprovider.NewClient(codexLogger)
 	customClient.SetUpstreamTimeout(settings.UpstreamTimeoutSeconds)
+	var onAccountActivity func(accountID string, active bool)
+	if len(activity) > 0 {
+		onAccountActivity = activity[0]
+	}
 	return proxy.New(proxy.ServerConfig{
-		Store:       db,
-		Codex:       client,
-		Anthropic:   claudeClient,
-		Custom:      customClient,
-		RequireKey:  true,
-		Logger:      logger,
-		LogRequests: settings.LogRequests,
+		Store:             db,
+		Codex:             client,
+		Anthropic:         claudeClient,
+		Custom:            customClient,
+		RequireKey:        true,
+		Logger:            logger,
+		LogRequests:       settings.LogRequests,
+		OnAccountActivity: onAccountActivity,
 	})
 }
 

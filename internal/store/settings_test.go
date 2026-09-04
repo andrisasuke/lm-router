@@ -23,6 +23,9 @@ func TestSettingsDefaultsAndPersistence(t *testing.T) {
 	if !settings.LogRequests || !settings.LogUpstream {
 		t.Fatalf("logging should default on: %+v", settings)
 	}
+	if !settings.TrayEnabled {
+		t.Fatalf("tray should default on: %+v", settings)
+	}
 	if settings.LogBodyLimit != 64*1024 {
 		t.Fatalf("body limit=%d", settings.LogBodyLimit)
 	}
@@ -32,6 +35,7 @@ func TestSettingsDefaultsAndPersistence(t *testing.T) {
 
 	settings.Host = "0.0.0.0"
 	settings.Port = 19191
+	settings.TrayEnabled = false
 	settings.LogUpstream = false
 	settings.LogBodyLimit = 1024
 	settings.DefaultModel = "gpt-5.4"
@@ -43,7 +47,19 @@ func TestSettingsDefaultsAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get saved settings: %v", err)
 	}
-	if got.Host != "0.0.0.0" || got.Port != 19191 || got.LogUpstream || got.LogBodyLimit != 1024 || got.DefaultModel != "gpt-5.4" {
+	if got.Host != "0.0.0.0" || got.Port != 19191 || got.TrayEnabled || got.LogUpstream || got.LogBodyLimit != 1024 || got.DefaultModel != "gpt-5.4" {
 		t.Fatalf("settings not persisted: %+v", got)
+	}
+
+	got.Port = 0
+	if err := db.SaveSettings(ctx, got); err != nil {
+		t.Fatalf("save dynamic port: %v", err)
+	}
+	dynamic, err := db.GetSettings(ctx)
+	if err != nil {
+		t.Fatalf("get dynamic port: %v", err)
+	}
+	if dynamic.Port != 0 {
+		t.Fatalf("dynamic port should persist as 0, got %d", dynamic.Port)
 	}
 }

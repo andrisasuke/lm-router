@@ -1,0 +1,40 @@
+version: '3'
+
+info:
+  companyName: LM Router
+  productName: LM Router
+  productIdentifier: com.lmrouter.desktop
+  description: Local model switchboard for Codex and Claude
+  copyright: Copyright 2026 LM Router
+  comments: Local model switchboard for Codex and Claude
+  version: 0.0.2
+
+dev_mode:
+  root_path: .
+  log_level: warn
+  debounce: 500
+  ignore:
+    dir:
+      - .git
+      - frontend
+      - node_modules
+      - desktop/build/bin
+    file:
+      - .DS_Store
+      - .gitignore
+      - .gitkeep
+    watched_extension:
+      - '*.go'
+    git_ignore: true
+  executes:
+    - cmd: wails3 task frontend:install
+      type: once
+    - cmd: wails3 task generate:bindings
+      type: blocking
+    - cmd: wails3 task frontend:dev
+      type: background
+    - cmd: wails3 task build:dev
+      type: blocking
+    - cmd: wails3 task run:dev
+      type: primary
+
