@@ -432,7 +432,12 @@ func (s KeyService) Delete(ctx context.Context, id string) error {
 	return s.DB.DeleteAPIKey(ctx, id)
 }
 
-func NewProxyHandler(db *store.DB, settings store.Settings, logger Logger, activity ...func(accountID string, active bool)) http.Handler {
+type ProxyCallbacks struct {
+	OnAccountActivity func(accountID string, active bool)
+	OnCodexQuota      func(accountID string, info codex.QuotaInfo)
+}
+
+func NewProxyHandler(db *store.DB, settings store.Settings, logger Logger, callbacks ...ProxyCallbacks) http.Handler {
 	bodyLimit := settings.LogBodyLimit
 	if bodyLimit <= 0 {
 		bodyLimit = 64 * 1024
@@ -448,9 +453,9 @@ func NewProxyHandler(db *store.DB, settings store.Settings, logger Logger, activ
 	claudeClient.SetUpstreamTimeout(settings.UpstreamTimeoutSeconds)
 	customClient := customprovider.NewClient(codexLogger)
 	customClient.SetUpstreamTimeout(settings.UpstreamTimeoutSeconds)
-	var onAccountActivity func(accountID string, active bool)
-	if len(activity) > 0 {
-		onAccountActivity = activity[0]
+	var observers ProxyCallbacks
+	if len(callbacks) > 0 {
+		observers = callbacks[0]
 	}
 	return proxy.New(proxy.ServerConfig{
 		Store:             db,
@@ -460,7 +465,8 @@ func NewProxyHandler(db *store.DB, settings store.Settings, logger Logger, activ
 		RequireKey:        true,
 		Logger:            logger,
 		LogRequests:       settings.LogRequests,
-		OnAccountActivity: onAccountActivity,
+		OnAccountActivity: observers.OnAccountActivity,
+		OnCodexQuota:      observers.OnCodexQuota,
 	})
 }
 

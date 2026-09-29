@@ -36,6 +36,7 @@ type ServerConfig struct {
 	Logger            Logger
 	LogRequests       bool
 	OnAccountActivity func(accountID string, active bool)
+	OnCodexQuota      func(accountID string, info codex.QuotaInfo)
 }
 
 type Logger interface {
@@ -55,6 +56,7 @@ type Server struct {
 	custom            *customprovider.Client
 	requireKey        bool
 	onAccountActivity func(accountID string, active bool)
+	onCodexQuota      func(accountID string, info codex.QuotaInfo)
 }
 
 func New(cfg ServerConfig) http.Handler {
@@ -73,6 +75,7 @@ func New(cfg ServerConfig) http.Handler {
 		custom:            custom,
 		requireKey:        cfg.RequireKey,
 		onAccountActivity: cfg.OnAccountActivity,
+		onCodexQuota:      cfg.OnCodexQuota,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.health)
@@ -398,6 +401,7 @@ func (s *Server) routeResponses(ctx context.Context, body []byte, headers http.H
 				Headers: headers,
 			})
 		})
+		s.observeCodexQuota(ctx, account.ID, result.Header)
 		if err != nil {
 			lastErr = err
 			lastStatus = http.StatusBadGateway
@@ -470,6 +474,7 @@ func (s *Server) openResponseStream(ctx context.Context, body []byte, headers ht
 			Body:    body,
 			Headers: headers,
 		})
+		s.observeCodexQuota(ctx, account.ID, result.Header)
 		if err != nil {
 			done()
 			lastErr = err

@@ -7,6 +7,8 @@ export {
 };
 
 export {
+    ConnectionQuotaPartVM,
+    ConnectionQuotaVM,
     ConnectionVM,
     CreatedKeyVM,
     CustomProviderInput,

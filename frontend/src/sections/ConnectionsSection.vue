@@ -51,7 +51,7 @@ const state = useConnections()
         v-if="state.selectedConnection.value"
         :connection="state.selectedConnection.value"
         :index="state.connections.value.findIndex(connection => connection.id === state.selectedConnection.value?.id)"
-        :busy="state.busy.value"
+        :busy="state.detailBusy.value"
         :result-title="state.resultTitle.value"
         :test-result="state.testResult.value"
         :quota-result="state.quotaResult.value"

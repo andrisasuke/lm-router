@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -336,6 +337,98 @@ func TestFetchQuotaUsesGPT55ProbeModel(t *testing.T) {
 	}
 	if got := body["model"]; got != "gpt-5.5" {
 		t.Errorf("probe model: got %v, want gpt-5.5", got)
+	}
+}
+
+func TestFetchQuotaClearsCooldownWhenBothWindowsRecovered(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	account := store.Account{
+		ID: "acct_1", Provider: store.ProviderOpenAICodex, Name: "main", Enabled: true,
+		AccessToken: "access-token", RefreshToken: "refresh-token", ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if err := db.UpsertAccount(ctx, account); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+	if _, err := db.RecordRetryableFailure(ctx, account.ID, time.Now(), time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("set cooldown: %v", err)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("x-codex-primary-used-percent", "0")
+		w.Header().Set("x-codex-primary-window-minutes", "300")
+		w.Header().Set("x-codex-secondary-used-percent", "0")
+		w.Header().Set("x-codex-secondary-window-minutes", "10080")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	client := NewClient(upstream.URL, NewTokenManager(db, nil))
+	if _, err := client.FetchQuota(ctx, account); err != nil {
+		t.Fatalf("fetch quota: %v", err)
+	}
+	updated, err := db.MustGetAccount(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.CooldownUntil.Valid || updated.LastFailureAt.Valid || updated.ConsecutiveFailures != 0 {
+		t.Fatalf("failure state was not cleared: %+v", updated)
+	}
+}
+
+func TestFetchQuotaSetsCooldownWhenAnyWindowIsExhausted(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		primary   string
+		secondary string
+	}{
+		{name: "primary", primary: "100", secondary: "0"},
+		{name: "secondary", primary: "0", secondary: "100"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, err := store.Open(ctx, t.TempDir())
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			defer db.Close()
+
+			account := store.Account{
+				ID: "acct_1", Provider: store.ProviderOpenAICodex, Name: "main", Enabled: true,
+				AccessToken: "access-token", RefreshToken: "refresh-token", ExpiresAt: time.Now().Add(time.Hour),
+			}
+			if err := db.UpsertAccount(ctx, account); err != nil {
+				t.Fatalf("upsert account: %v", err)
+			}
+			resetAt := time.Now().Add(time.Hour).Unix()
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("x-codex-primary-used-percent", test.primary)
+				w.Header().Set("x-codex-primary-window-minutes", "300")
+				w.Header().Set("x-codex-secondary-used-percent", test.secondary)
+				w.Header().Set("x-codex-secondary-window-minutes", "10080")
+				w.Header().Set("x-codex-primary-reset-at", strconv.FormatInt(resetAt, 10))
+				w.Header().Set("x-codex-secondary-reset-at", strconv.FormatInt(resetAt, 10))
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer upstream.Close()
+
+			client := NewClient(upstream.URL, NewTokenManager(db, nil))
+			if _, err := client.FetchQuota(ctx, account); err != nil {
+				t.Fatalf("fetch quota: %v", err)
+			}
+			updated, err := db.MustGetAccount(ctx, account.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !updated.CooldownUntil.Valid || updated.CooldownUntil.Time.Unix() != resetAt {
+				t.Fatalf("quota cooldown was not persisted: %+v", updated.CooldownUntil)
+			}
+		})
 	}
 }
 

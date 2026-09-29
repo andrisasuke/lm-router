@@ -110,6 +110,47 @@ func TestParseQuotaHeaders_collectsXHeaderKeysWhenQuotaMissing(t *testing.T) {
 	}
 }
 
+func TestQuotaCooldownUntilUsesAnyExhaustedWindowAndLatestReset(t *testing.T) {
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	primaryReset := now.Add(2 * time.Hour)
+	secondaryReset := now.Add(5 * 24 * time.Hour)
+	until, exhausted := QuotaCooldownUntil(QuotaInfo{
+		FetchedAt: now,
+		Primary:   &QuotaWindow{UsedPercent: 100, ResetAt: primaryReset},
+		Secondary: &QuotaWindow{UsedPercent: 100, ResetAt: secondaryReset},
+	})
+	if !exhausted {
+		t.Fatal("expected exhausted quota")
+	}
+	if !until.Equal(secondaryReset) {
+		t.Fatalf("cooldown=%v, want latest reset %v", until, secondaryReset)
+	}
+}
+
+func TestQuotaCooldownUntilDetectsWeeklyExhaustionAlone(t *testing.T) {
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	secondaryReset := now.Add(5 * 24 * time.Hour)
+	until, exhausted := QuotaCooldownUntil(QuotaInfo{
+		FetchedAt: now,
+		Primary:   &QuotaWindow{UsedPercent: 0, ResetAt: now.Add(5 * time.Hour)},
+		Secondary: &QuotaWindow{UsedPercent: 100, ResetAt: secondaryReset},
+	})
+	if !exhausted || !until.Equal(secondaryReset) {
+		t.Fatalf("exhausted=%t cooldown=%v, want %v", exhausted, until, secondaryReset)
+	}
+}
+
+func TestQuotaCooldownUntilAllowsBothAvailableWindows(t *testing.T) {
+	_, exhausted := QuotaCooldownUntil(QuotaInfo{
+		FetchedAt: time.Now(),
+		Primary:   &QuotaWindow{UsedPercent: 99},
+		Secondary: &QuotaWindow{UsedPercent: 99},
+	})
+	if exhausted {
+		t.Fatal("quota below 100% must remain available")
+	}
+}
+
 func TestFormatQuotaWindow_fiveHour(t *testing.T) {
 	now := time.Now()
 	w := &QuotaWindow{

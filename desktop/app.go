@@ -18,6 +18,7 @@ import (
 	"time"
 
 	appsvc "github.com/andrisasuke/lm-router/internal/app"
+	"github.com/andrisasuke/lm-router/internal/codex"
 	"github.com/andrisasuke/lm-router/internal/store"
 	iversion "github.com/andrisasuke/lm-router/internal/version"
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -32,17 +33,23 @@ type pendingOAuth struct {
 }
 
 type App struct {
-	ctx        context.Context
-	db         *store.DB
-	logger     *appsvc.RingLogger
-	controller *appsvc.ServerController
-	profile    desktopProfile
-	dataDir    string
-	initErr    error
-	desktopApp *application.App
-	mainWindow application.Window
-	tray       *trayController
-	activity   *appsvc.AccountActivityTracker
+	ctx         context.Context
+	db          *store.DB
+	logger      *appsvc.RingLogger
+	controller  *appsvc.ServerController
+	profile     desktopProfile
+	dataDir     string
+	initErr     error
+	desktopApp  *application.App
+	mainWindow  application.Window
+	tray        *trayController
+	activity    *appsvc.AccountActivityTracker
+	codexQuotas *codexQuotaTracker
+
+	codexQuotaFetcher func(context.Context, store.Account) (codex.QuotaInfo, error)
+	quotaContext      context.Context
+	quotaCancel       context.CancelFunc
+	quotaWorkers      sync.WaitGroup
 
 	mu                 sync.Mutex
 	pending            map[string]*pendingOAuth
@@ -96,6 +103,11 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 	log.SetFlags(0)
 	log.SetPrefix("")
 	a.activity = appsvc.NewAccountActivityTracker(a.emitConnectionActivity)
+	a.codexQuotas = newCodexQuotaTracker(a.emitConnectionQuota)
+	a.codexQuotaFetcher = func(ctx context.Context, account store.Account) (codex.QuotaInfo, error) {
+		return a.providerService().Quota(ctx, account)
+	}
+	a.quotaContext, a.quotaCancel = context.WithCancel(ctx)
 	a.controller = appsvc.NewServerController(appsvc.ServerControllerConfig{
 		Logger: a.logger,
 		HandlerFactory: func() (http.Handler, error) {
@@ -103,13 +115,28 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 			if err != nil {
 				return nil, err
 			}
-			return appsvc.NewProxyHandler(a.db, settings, a.logger, a.activity.Update), nil
+			return appsvc.NewProxyHandler(a.db, settings, a.logger, appsvc.ProxyCallbacks{
+				OnAccountActivity: a.activity.Update,
+				OnCodexQuota:      a.observeCodexQuota,
+			}), nil
 		},
 	})
+	a.quotaWorkers.Add(2)
+	go func() {
+		defer a.quotaWorkers.Done()
+		a.warmCodexQuotas(a.quotaContext)
+	}()
+	go func() {
+		defer a.quotaWorkers.Done()
+		a.monitorCodexQuotaResets(a.quotaContext)
+	}()
 	return nil
 }
 
 func (a *App) ServiceShutdown() error {
+	if a.quotaCancel != nil {
+		a.quotaCancel()
+	}
 	a.mu.Lock()
 	for _, pending := range a.pending {
 		pending.loopback.stop()
@@ -121,6 +148,7 @@ func (a *App) ServiceShutdown() error {
 		_ = a.controller.Stop(ctx)
 		cancel()
 	}
+	a.quotaWorkers.Wait()
 	if a.db != nil {
 		_ = a.db.Close()
 	}
@@ -215,6 +243,16 @@ func (a *App) ListConnections(provider string) ([]ConnectionVM, error) {
 func (a *App) connectionView(account store.Account) ConnectionVM {
 	result := connectionVM(account)
 	result.Requesting = a.activity != nil && a.activity.Active(account.ID)
+	if account.Provider == store.ProviderOpenAICodex {
+		state := codexQuotaState{}
+		if a.codexQuotas != nil {
+			state = a.codexQuotas.Snapshot(account.ID)
+		}
+		result.Quota = connectionQuotaVM(state)
+		if account.NeedsReauth && result.Quota.State == quotaStateUnknown {
+			result.Quota = ConnectionQuotaVM{State: quotaStateUnavailable, Summary: "Quota unavailable"}
+		}
+	}
 	return result
 }
 
@@ -226,6 +264,32 @@ func (a *App) emitConnectionActivity(accountID string, requesting bool) {
 		ID:         accountID,
 		Requesting: requesting,
 	})
+}
+
+func (a *App) emitConnectionQuota(accountID string, state codexQuotaState) {
+	if a.desktopApp == nil {
+		return
+	}
+	a.desktopApp.Event.Emit("connection-quota", a.connectionQuotaEvent(accountID, state))
+}
+
+func (a *App) connectionQuotaEvent(accountID string, state codexQuotaState) ConnectionQuotaEventVM {
+	event := ConnectionQuotaEventVM{
+		ID:    accountID,
+		Quota: connectionQuotaVM(state),
+	}
+	if a.db == nil {
+		return event
+	}
+	account, err := a.db.MustGetAccount(a.context(), accountID)
+	if err != nil {
+		return event
+	}
+	connection := connectionVM(account)
+	event.Status = connection.Status
+	event.CooldownUntil = connection.CooldownUntil
+	event.ConsecutiveFailures = connection.ConsecutiveFailures
+	return event
 }
 
 func (a *App) BeginOAuth(provider string) (OAuthSessionVM, error) {
@@ -396,7 +460,7 @@ func (a *App) Quota(id string) (QuotaVM, error) {
 		a.mu.Unlock()
 		return claudeQuotaVM(info), nil
 	}
-	info, err := service.Quota(a.context(), account)
+	info, err := a.refreshCodexQuota(a.context(), account)
 	if err != nil {
 		return QuotaVM{}, humanError(err)
 	}

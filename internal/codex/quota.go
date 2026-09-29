@@ -40,6 +40,46 @@ func ParseQuotaHeaders(h http.Header, now time.Time) QuotaInfo {
 	return info
 }
 
+func quotaWindowsRecovered(h http.Header, info QuotaInfo) bool {
+	if strings.TrimSpace(h.Get("x-codex-primary-used-percent")) == "" ||
+		strings.TrimSpace(h.Get("x-codex-secondary-used-percent")) == "" {
+		return false
+	}
+	return info.Primary != nil && info.Secondary != nil &&
+		info.Primary.UsedPercent < 100 && info.Secondary.UsedPercent < 100
+}
+
+func QuotaCooldownUntil(info QuotaInfo) (time.Time, bool) {
+	base := info.FetchedAt
+	if base.IsZero() {
+		base = time.Now()
+	}
+	var (
+		exhausted bool
+		until     time.Time
+	)
+	for _, window := range []*QuotaWindow{info.Primary, info.Secondary} {
+		if window == nil || window.UsedPercent < 100 {
+			continue
+		}
+		exhausted = true
+		resetAt := window.ResetAt
+		if resetAt.IsZero() && window.ResetAfterSecs > 0 {
+			resetAt = base.Add(time.Duration(window.ResetAfterSecs) * time.Second)
+		}
+		if resetAt.After(until) {
+			until = resetAt
+		}
+	}
+	if !exhausted {
+		return time.Time{}, false
+	}
+	if !until.After(base) {
+		until = base.Add(time.Minute)
+	}
+	return until, true
+}
+
 func parseQuotaWindow(h http.Header, prefix string, now time.Time) *QuotaWindow {
 	usedStr := h.Get(prefix + "-used-percent")
 	windowStr := h.Get(prefix + "-window-minutes")

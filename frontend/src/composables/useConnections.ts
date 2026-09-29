@@ -22,6 +22,8 @@ import { providers } from '../constants'
 import type {
   Connection,
   ConnectionActivity,
+  ConnectionQuota,
+  ConnectionQuotaEvent,
   CustomProviderInput,
   OAuthSession,
   Provider,
@@ -41,9 +43,12 @@ export function useConnections() {
   const resultTitle = ref('')
   const testResult = ref<TestResult | null>(null)
   const quotaResult = ref<QuotaResult | null>(null)
+  const quotaBusyIDs = ref(new Set<string>())
   const confirmDialog = useConfirmDialog()
   const requestingByID = new Map<string, boolean>()
+  const quotaByID = new Map<string, ConnectionQuota>()
   let stopActivityListener: (() => void) | undefined
+  let stopQuotaListener: (() => void) | undefined
 
   const oauthOpen = ref(false)
   const oauthStage = ref<'prepare' | 'waiting'>('prepare')
@@ -63,6 +68,11 @@ export function useConnections() {
 
   const selectedConnection = computed(() => connections.value.find((connection) => connection.id === selectedID.value) ?? null)
   const providerInfo = computed(() => providers.find((provider) => provider.id === activeProvider.value)!)
+  const detailBusy = computed(() => busy.value || quotaBusyIDs.value.has(selectedID.value))
+
+  function isConnectionStatus(value: unknown): value is Connection['status'] {
+    return value === 'Active' || value === 'Cooldown' || value === 'Needs re-auth' || value === 'Disabled'
+  }
 
   watch(selectedConnection, () => {
     testResult.value = null
@@ -82,6 +92,7 @@ export function useConnections() {
       connections.value = loaded.map((connection) => ({
         ...connection,
         requesting: requestingByID.get(connection.id) ?? connection.requesting,
+        quota: quotaByID.get(connection.id) ?? connection.quota,
       }))
       if (!connections.value.some((connection) => connection.id === selectedID.value)) {
         selectedID.value = connections.value[0]?.id ?? ''
@@ -179,17 +190,21 @@ export function useConnections() {
   async function showQuota() {
     const connection = selectedConnection.value
     if (!connection) return
-    busy.value = true
+    const cardOnly = connection.provider === 'openai-codex'
+    quotaBusyIDs.value = new Set(quotaBusyIDs.value).add(connection.id)
     error.value = ''
     testResult.value = null
     quotaResult.value = null
-    resultTitle.value = 'Quota'
+    resultTitle.value = cardOnly ? '' : 'Quota'
     try {
-      quotaResult.value = await Quota(connection.id) as unknown as QuotaResult
+      const result = await Quota(connection.id) as unknown as QuotaResult
+      if (!cardOnly) quotaResult.value = result
     } catch (cause) {
       error.value = errorText(cause)
     } finally {
-      busy.value = false
+      const remaining = new Set(quotaBusyIDs.value)
+      remaining.delete(connection.id)
+      quotaBusyIDs.value = remaining
     }
   }
 
@@ -329,14 +344,29 @@ export function useConnections() {
       const connection = connections.value.find((item) => item.id === activity.id)
       if (connection) connection.requesting = activity.requesting
     })
+    stopQuotaListener = Events.On('connection-quota', (event) => {
+      const update = event.data as ConnectionQuotaEvent
+      if (!update || typeof update.id !== 'string' || !update.quota || typeof update.quota.summary !== 'string') return
+      quotaByID.set(update.id, update.quota)
+      const connection = connections.value.find((item) => item.id === update.id)
+      if (connection) {
+        connection.quota = update.quota
+        if (isConnectionStatus(update.status)) connection.status = update.status
+        if (typeof update.cooldownUntil === 'string') connection.cooldownUntil = update.cooldownUntil
+        if (typeof update.consecutiveFailures === 'number') connection.consecutiveFailures = update.consecutiveFailures
+      }
+    })
     void load()
   })
 
-  onUnmounted(() => stopActivityListener?.())
+  onUnmounted(() => {
+    stopActivityListener?.()
+    stopQuotaListener?.()
+  })
 
   return {
     activeProvider, connections, selectedID, selectedConnection, providerInfo,
-    busy, error, resultTitle, testResult, quotaResult, confirmDialog,
+    busy, detailBusy, error, resultTitle, testResult, quotaResult, confirmDialog,
     oauthOpen, oauthStage, oauthSession, oauthName, oauthCallback, oauthBusy,
     oauthMessage, oauthReauthID, riskOpen, customOpen, customConnection,
     customBusy, customError,
