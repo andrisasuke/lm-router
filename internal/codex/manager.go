@@ -111,6 +111,10 @@ func (m *TokenManager) SetCooldown(ctx context.Context, accountID string, until 
 	return m.db.SetCooldown(ctx, accountID, until)
 }
 
+func (m *TokenManager) ResetFailureState(ctx context.Context, accountID string) error {
+	return m.db.ResetFailureState(ctx, accountID)
+}
+
 func needsRefresh(account store.Account, lead time.Duration) bool {
 	if account.ExpiresAt.IsZero() {
 		return false

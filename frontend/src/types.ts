@@ -29,11 +29,34 @@ export interface Connection {
   canRefresh: boolean
   canReauth: boolean
   requesting: boolean
+  quota: ConnectionQuota
 }
 
 export interface ConnectionActivity {
   id: string
   requesting: boolean
+}
+
+export interface ConnectionQuota {
+  state: 'unknown' | 'loading' | 'available' | 'unavailable' | 'error'
+  summary: string
+  fetchedAt: string
+  windows: ConnectionQuotaPart[]
+}
+
+export interface ConnectionQuotaPart {
+  label: string
+  utilization: number
+  critical: boolean
+  resetsAt: string
+}
+
+export interface ConnectionQuotaEvent {
+  id: string
+  quota: ConnectionQuota
+  status?: Connection['status']
+  cooldownUntil?: string
+  consecutiveFailures?: number
 }
 
 export interface APIKey {

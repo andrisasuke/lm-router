@@ -21,9 +21,20 @@
 
 html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 
-body { background: var(--ink-900); color: var(--text); }
+body {
+  background: var(--ink-900);
+  color: var(--text);
+  -webkit-user-select: none;
+  user-select: none;
+}
 
 button, input, textarea { font: inherit; }
+
+input,
+textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
 
 button { color: inherit; }
 
@@ -208,7 +219,7 @@ h2 { margin-bottom: 8px; font-size: 18px; font-weight: 600; }
 }
 .connection-card:hover { border-color: #46515e; }
 .connection-card.selected { border-color: #596574; background: var(--ink-700); }
-.connection-card.status-cooldown { --lamp: var(--amber); }
+.connection-card.status-cooldown { --lamp: var(--fault); }
 .connection-card.status-disabled, .connection-card.status-needs-reauth { --lamp: var(--muted); }
 .connection-card.status-needs-reauth { --lamp: var(--fault); }
 .connection-card::before,
@@ -247,7 +258,7 @@ h2 { margin-bottom: 8px; font-size: 18px; font-weight: 600; }
 .detail-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding-bottom: 17px; border-bottom: 1px solid var(--seam); }
 .detail-heading h2 { margin-top: 6px; margin-bottom: 0; }
 .status-pill { padding: 5px 7px; border: 1px solid var(--signal); color: var(--signal); font-family: "IBM Plex Mono", monospace; font-size: 8px; text-transform: uppercase; white-space: nowrap; }
-.pill-cooldown { border-color: var(--amber); color: var(--amber); }
+.pill-cooldown { border-color: var(--fault); color: var(--fault); }
 .pill-disabled { border-color: var(--muted); color: var(--muted); }
 .pill-needs-re-auth { border-color: var(--fault); color: var(--fault); }
 .detail-data { display: grid; gap: 0; margin: 15px 0 18px; }
@@ -744,6 +755,15 @@ body {
   backdrop-filter: blur(12px);
 }
 
+.connection-card.has-card-quota {
+  grid-template-columns: 46px 32px minmax(0, 1fr) 160px 72px 20px;
+  padding-right: 4px;
+}
+
+.connection-card.has-card-quota.status-needs-reauth {
+  grid-template-columns: 46px 32px minmax(0, 1fr) 160px 88px 20px;
+}
+
 .connection-card:hover {
   border-color: rgba(202, 206, 218, .45);
   background: linear-gradient(112deg, rgba(90, 91, 103, .34), rgba(56, 56, 67, .31));
@@ -785,9 +805,50 @@ body {
   animation: live-fade 1.8s ease-in-out infinite;
 }
 
-.channel-copy { gap: 2px; padding-left: 5px; }
-.channel-copy strong { color: #f4f1ed; font-size: 13px; font-weight: 600; }
+.channel-copy { min-width: 0; gap: 2px; padding-left: 5px; overflow: hidden; }
+.channel-copy strong { display: block; min-width: 0; color: #f4f1ed; font-size: 13px; font-weight: 600; }
 .channel-copy small { color: #aaaab0; font-family: "IBM Plex Sans", sans-serif; font-size: 9px; }
+
+.channel-quota {
+  align-self: center;
+  display: flex;
+  flex-direction: column;
+  justify-self: end;
+  justify-content: center;
+  width: 128px;
+  gap: 3px;
+  padding: 0;
+  overflow: hidden;
+  color: #e8e5df;
+  font-family: "IBM Plex Sans", sans-serif;
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1.25;
+  text-align: left;
+}
+
+.channel-quota > .quota-window {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.channel-quota .quota-reset {
+  color: #b2b0b5;
+}
+
+.channel-quota.quota-loading,
+.channel-quota.quota-unknown,
+.channel-quota.quota-unavailable,
+.channel-quota.quota-error {
+  color: #929198;
+  font-weight: 400;
+}
+
+.channel-quota .quota-critical {
+  color: var(--fault);
+}
 
 .channel-status {
   margin-left: 8px;
@@ -796,6 +857,12 @@ body {
   background: color-mix(in srgb, var(--lamp) 14%, rgba(53, 56, 66, .8));
   color: var(--lamp);
   font-size: 8px;
+}
+
+.connection-card.has-card-quota .channel-status {
+  justify-self: end;
+  margin-right: 4px;
+  margin-left: 8px;
 }
 
 .drag-handle {

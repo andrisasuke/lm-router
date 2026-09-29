@@ -23,29 +23,60 @@ type ServerStatusVM struct {
 }
 
 type ConnectionVM struct {
-	ID                  string `json:"id"`
-	Provider            string `json:"provider"`
-	Name                string `json:"name"`
-	Priority            int    `json:"priority"`
-	Enabled             bool   `json:"enabled"`
-	Status              string `json:"status"`
-	NeedsReauth         bool   `json:"needsReauth"`
-	Routable            bool   `json:"routable"`
-	CooldownUntil       string `json:"cooldownUntil"`
-	ConsecutiveFailures int    `json:"consecutiveFailures"`
-	Prefix              string `json:"prefix"`
-	BaseURL             string `json:"baseUrl"`
-	CompatType          string `json:"compatType"`
-	APIType             string `json:"apiType"`
-	CanQuota            bool   `json:"canQuota"`
-	CanRefresh          bool   `json:"canRefresh"`
-	CanReauth           bool   `json:"canReauth"`
-	Requesting          bool   `json:"requesting"`
+	ID                  string            `json:"id"`
+	Provider            string            `json:"provider"`
+	Name                string            `json:"name"`
+	Priority            int               `json:"priority"`
+	Enabled             bool              `json:"enabled"`
+	Status              string            `json:"status"`
+	NeedsReauth         bool              `json:"needsReauth"`
+	Routable            bool              `json:"routable"`
+	CooldownUntil       string            `json:"cooldownUntil"`
+	ConsecutiveFailures int               `json:"consecutiveFailures"`
+	Prefix              string            `json:"prefix"`
+	BaseURL             string            `json:"baseUrl"`
+	CompatType          string            `json:"compatType"`
+	APIType             string            `json:"apiType"`
+	CanQuota            bool              `json:"canQuota"`
+	CanRefresh          bool              `json:"canRefresh"`
+	CanReauth           bool              `json:"canReauth"`
+	Requesting          bool              `json:"requesting"`
+	Quota               ConnectionQuotaVM `json:"quota"`
 }
 
 type ConnectionActivityVM struct {
 	ID         string `json:"id"`
 	Requesting bool   `json:"requesting"`
+}
+
+const (
+	quotaStateUnknown     = "unknown"
+	quotaStateLoading     = "loading"
+	quotaStateAvailable   = "available"
+	quotaStateUnavailable = "unavailable"
+	quotaStateError       = "error"
+)
+
+type ConnectionQuotaVM struct {
+	State     string                  `json:"state"`
+	Summary   string                  `json:"summary"`
+	FetchedAt string                  `json:"fetchedAt"`
+	Windows   []ConnectionQuotaPartVM `json:"windows"`
+}
+
+type ConnectionQuotaPartVM struct {
+	Label       string  `json:"label"`
+	Utilization float64 `json:"utilization"`
+	Critical    bool    `json:"critical"`
+	ResetsAt    string  `json:"resetsAt"`
+}
+
+type ConnectionQuotaEventVM struct {
+	ID                  string            `json:"id"`
+	Quota               ConnectionQuotaVM `json:"quota"`
+	Status              string            `json:"status,omitempty"`
+	CooldownUntil       string            `json:"cooldownUntil,omitempty"`
+	ConsecutiveFailures int               `json:"consecutiveFailures,omitempty"`
 }
 
 type KeyVM struct {
@@ -213,6 +244,63 @@ func codexQuotaVM(info codex.QuotaInfo) QuotaVM {
 		}
 	}
 	return QuotaVM{Connected: true, Available: len(windows) > 0, FetchedAt: formatTime(info.FetchedAt), Message: message, Windows: windows}
+}
+
+func connectionQuotaVM(state codexQuotaState) ConnectionQuotaVM {
+	view := ConnectionQuotaVM{State: quotaStateUnknown}
+	if !state.Info.FetchedAt.IsZero() {
+		view.FetchedAt = formatTime(state.Info.FetchedAt)
+	}
+	if hasCodexQuota(state.Info) {
+		view.State = quotaStateAvailable
+		view.Summary = codexQuotaSummary(state.Info)
+		view.Windows = codexQuotaParts(state.Info)
+		return view
+	}
+	if state.Loading {
+		view.State = quotaStateLoading
+		view.Summary = "Loading quota..."
+		return view
+	}
+	if state.Error != "" {
+		view.State = quotaStateError
+		view.Summary = "Quota unavailable"
+		return view
+	}
+	if !state.Info.FetchedAt.IsZero() {
+		view.State = quotaStateUnavailable
+		view.Summary = "Quota unavailable"
+	}
+	return view
+}
+
+func codexQuotaSummary(info codex.QuotaInfo) string {
+	parts := codexQuotaParts(info)
+	summaries := make([]string, 0, len(parts))
+	for _, part := range parts {
+		summaries = append(summaries, fmt.Sprintf("%s: %.0f%%", part.Label, part.Utilization))
+	}
+	return strings.Join(summaries, " - ")
+}
+
+func codexQuotaParts(info codex.QuotaInfo) []ConnectionQuotaPartVM {
+	parts := make([]ConnectionQuotaPartVM, 0, 2)
+	for _, window := range []*codex.QuotaWindow{info.Primary, info.Secondary} {
+		if window == nil {
+			continue
+		}
+		label := codexQuotaWindowName(window.WindowMinutes)
+		if label == "weekly" {
+			label = "Weekly"
+		}
+		parts = append(parts, ConnectionQuotaPartVM{
+			Label:       label,
+			Utilization: window.UsedPercent,
+			Critical:    window.UsedPercent > 90,
+			ResetsAt:    formatTime(window.ResetAt),
+		})
+	}
+	return parts
 }
 
 func codexQuotaWindowName(minutes int) string {

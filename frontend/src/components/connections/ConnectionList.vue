@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { GripVertical } from '@lucide/vue'
-import { ref } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
 import type { Connection } from '../../types'
+import { formatQuotaReset } from '../../utils'
 
 defineProps<{
   connections: Connection[]
@@ -17,6 +18,18 @@ const emit = defineEmits<{
 }>()
 
 const draggedID = ref('')
+const quotaClock = ref(Date.now())
+let quotaClockTimer: number | undefined
+
+onMounted(() => {
+  quotaClockTimer = window.setInterval(() => {
+    quotaClock.value = Date.now()
+  }, 60_000)
+})
+
+onUnmounted(() => {
+  if (quotaClockTimer !== undefined) window.clearInterval(quotaClockTimer)
+})
 
 function dropOn(targetID: string) {
   emit('drop', draggedID.value, targetID)
@@ -38,7 +51,7 @@ function dropOn(targetID: string) {
       class="connection-card"
       :class="[
         `status-${connection.status.toLowerCase().replaceAll(' ', '-').replace('re-auth', 'reauth')}`,
-        { selected: selectedID === connection.id, requesting: connection.requesting, 'chain-active': chainActive(index), 'chain-first': index === 0, 'chain-last': index === connections.length - 1 },
+        { selected: selectedID === connection.id, requesting: connection.requesting, 'has-card-quota': connection.provider === 'openai-codex', 'chain-active': chainActive(index), 'chain-first': index === 0, 'chain-last': index === connections.length - 1 },
       ]"
       draggable="true"
       :disabled="busy"
@@ -52,9 +65,23 @@ function dropOn(targetID: string) {
       <span class="priority">{{ String(index + 1).padStart(2, '0') }}</span>
       <span class="channel-lamp" aria-hidden="true"></span>
       <span class="channel-copy">
-        <strong>{{ connection.name }}</strong>
+        <strong :title="connection.name">{{ connection.name }}</strong>
         <small v-if="connection.provider === 'custom'">{{ connection.prefix }}/ · {{ connection.compatType }}</small>
         <small v-else>{{ connection.provider.replaceAll('-', '+') }}</small>
+      </span>
+      <span
+        v-if="connection.provider === 'openai-codex'"
+        class="channel-quota"
+        :class="`quota-${connection.quota.state}`"
+        :title="connection.quota.fetchedAt ? `Updated ${connection.quota.fetchedAt}` : ''"
+      >
+        <template v-if="connection.quota.state === 'available' && connection.quota.windows.length">
+          <span v-for="window in connection.quota.windows" :key="window.label" class="quota-window">
+            <span :class="{ 'quota-critical': window.critical }">{{ window.label }}: {{ Math.round(window.utilization) }}%</span>
+            <span class="quota-reset"> - {{ formatQuotaReset(window.resetsAt, quotaClock) }}</span>
+          </span>
+        </template>
+        <template v-else>{{ connection.quota.summary || 'Loading quota...' }}</template>
       </span>
       <span class="channel-status">{{ connection.status }}</span>
       <GripVertical class="drag-handle" :size="17" :stroke-width="2" aria-hidden="true" />

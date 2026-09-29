@@ -5,6 +5,76 @@
 // @ts-ignore: Unused imports
 import { Create as $Create } from "@wailsio/runtime";
 
+export class ConnectionQuotaPartVM {
+    "label": string;
+    "utilization": number;
+    "critical": boolean;
+    "resetsAt": string;
+
+    /** Creates a new ConnectionQuotaPartVM instance. */
+    constructor($$source: Partial<ConnectionQuotaPartVM> = {}) {
+        if (!("label" in $$source)) {
+            this["label"] = "";
+        }
+        if (!("utilization" in $$source)) {
+            this["utilization"] = 0;
+        }
+        if (!("critical" in $$source)) {
+            this["critical"] = false;
+        }
+        if (!("resetsAt" in $$source)) {
+            this["resetsAt"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new ConnectionQuotaPartVM instance from a string or object.
+     */
+    static createFrom($$source: any = {}): ConnectionQuotaPartVM {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new ConnectionQuotaPartVM($$parsedSource as Partial<ConnectionQuotaPartVM>);
+    }
+}
+
+export class ConnectionQuotaVM {
+    "state": string;
+    "summary": string;
+    "fetchedAt": string;
+    "windows": ConnectionQuotaPartVM[];
+
+    /** Creates a new ConnectionQuotaVM instance. */
+    constructor($$source: Partial<ConnectionQuotaVM> = {}) {
+        if (!("state" in $$source)) {
+            this["state"] = "";
+        }
+        if (!("summary" in $$source)) {
+            this["summary"] = "";
+        }
+        if (!("fetchedAt" in $$source)) {
+            this["fetchedAt"] = "";
+        }
+        if (!("windows" in $$source)) {
+            this["windows"] = [];
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new ConnectionQuotaVM instance from a string or object.
+     */
+    static createFrom($$source: any = {}): ConnectionQuotaVM {
+        const $$createField3_0 = $$createType1;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("windows" in $$parsedSource) {
+            $$parsedSource["windows"] = $$createField3_0($$parsedSource["windows"]);
+        }
+        return new ConnectionQuotaVM($$parsedSource as Partial<ConnectionQuotaVM>);
+    }
+}
+
 export class ConnectionVM {
     "id": string;
     "provider": string;
@@ -24,6 +94,7 @@ export class ConnectionVM {
     "canRefresh": boolean;
     "canReauth": boolean;
     "requesting": boolean;
+    "quota": ConnectionQuotaVM;
 
     /** Creates a new ConnectionVM instance. */
     constructor($$source: Partial<ConnectionVM> = {}) {
@@ -81,6 +152,9 @@ export class ConnectionVM {
         if (!("requesting" in $$source)) {
             this["requesting"] = false;
         }
+        if (!("quota" in $$source)) {
+            this["quota"] = (new ConnectionQuotaVM());
+        }
 
         Object.assign(this, $$source);
     }
@@ -89,7 +163,11 @@ export class ConnectionVM {
      * Creates a new ConnectionVM instance from a string or object.
      */
     static createFrom($$source: any = {}): ConnectionVM {
+        const $$createField18_0 = $$createType2;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("quota" in $$parsedSource) {
+            $$parsedSource["quota"] = $$createField18_0($$parsedSource["quota"]);
+        }
         return new ConnectionVM($$parsedSource as Partial<ConnectionVM>);
     }
 }
@@ -381,7 +459,7 @@ export class QuotaVM {
      * Creates a new QuotaVM instance from a string or object.
      */
     static createFrom($$source: any = {}): QuotaVM {
-        const $$createField6_0 = $$createType1;
+        const $$createField6_0 = $$createType4;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("windows" in $$parsedSource) {
             $$parsedSource["windows"] = $$createField6_0($$parsedSource["windows"]);
@@ -514,5 +592,8 @@ export class SettingsVM {
 }
 
 // Private type creation functions
-const $$createType0 = QuotaWindowVM.createFrom;
+const $$createType0 = ConnectionQuotaPartVM.createFrom;
 const $$createType1 = $Create.Array($$createType0);
+const $$createType2 = ConnectionQuotaVM.createFrom;
+const $$createType3 = QuotaWindowVM.createFrom;
+const $$createType4 = $Create.Array($$createType3);

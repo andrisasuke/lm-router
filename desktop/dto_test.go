@@ -91,3 +91,36 @@ func TestCodexQuotaVMUsesHumanReadableWindowNames(t *testing.T) {
 		t.Fatalf("unexpected quota window names: %+v", quota.Windows)
 	}
 }
+
+func TestConnectionQuotaVMSummarizesCardQuota(t *testing.T) {
+	primaryReset := time.Now().Add(time.Hour)
+	secondaryReset := time.Now().Add(24 * time.Hour)
+	view := connectionQuotaVM(codexQuotaState{Info: codex.QuotaInfo{
+		FetchedAt: time.Now(),
+		Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 15, ResetAt: primaryReset},
+		Secondary: &codex.QuotaWindow{WindowMinutes: 10080, UsedPercent: 15, ResetAt: secondaryReset},
+	}})
+	if view.State != quotaStateAvailable || view.Summary != "5h: 15% - Weekly: 15%" {
+		t.Fatalf("unexpected card quota: %+v", view)
+	}
+	if len(view.Windows) != 2 || view.Windows[0].Critical || view.Windows[1].Critical {
+		t.Fatalf("unexpected quota parts: %+v", view.Windows)
+	}
+	if view.Windows[0].ResetsAt != formatTime(primaryReset) || view.Windows[1].ResetsAt != formatTime(secondaryReset) {
+		t.Fatalf("quota reset times were not preserved: %+v", view.Windows)
+	}
+}
+
+func TestConnectionQuotaVMMarksOnlyWindowsAboveNinetyPercentCritical(t *testing.T) {
+	view := connectionQuotaVM(codexQuotaState{Info: codex.QuotaInfo{
+		FetchedAt: time.Now(),
+		Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 90},
+		Secondary: &codex.QuotaWindow{WindowMinutes: 10080, UsedPercent: 91},
+	}})
+	if view.Windows[0].Critical {
+		t.Fatal("90% must not be critical")
+	}
+	if !view.Windows[1].Critical {
+		t.Fatal("values above 90% must be critical")
+	}
+}

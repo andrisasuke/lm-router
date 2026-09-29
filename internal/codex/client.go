@@ -382,6 +382,18 @@ func (c *Client) FetchQuota(ctx context.Context, account store.Account) (QuotaIn
 	if info.Primary == nil && info.Secondary == nil {
 		c.logf("[quota] no x-codex-* headers account=%s headers=%s", refreshed.ID, formatHeaders(result.Header))
 	}
+	if result.Status >= 200 && result.Status < 300 {
+		if until, exhausted := QuotaCooldownUntil(info); exhausted {
+			if err := c.tokens.SetCooldown(ctx, refreshed.ID, until); err != nil {
+				return info, err
+			}
+		} else if (refreshed.CooldownUntil.Valid || refreshed.LastFailureAt.Valid || refreshed.ConsecutiveFailures > 0) &&
+			quotaWindowsRecovered(result.Header, info) {
+			if err := c.tokens.ResetFailureState(ctx, refreshed.ID); err != nil {
+				return info, err
+			}
+		}
+	}
 	return info, nil
 }
 
