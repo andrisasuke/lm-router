@@ -1,20 +1,18 @@
 # LM Router
 
-`lm-router` turns multiple OpenAI Codex and Anthropic Claude subscription OAuth connections into one local API endpoint.
-
-It provides model-prefix routing, provider-scoped priority and failover, local API-key authentication, a terminal UI, and SQLite persistence.
+`lm-router` combines multiple OpenAI Codex and Anthropic Claude subscription OAuth connections behind one local API endpoint. It provides model-prefix routing, provider-scoped failover, local API-key authentication, CLI/TUI/desktop interfaces, and SQLite persistence.
 
 > [!WARNING]
-> Claude subscriptions and the Anthropic API are separate products. Routing Claude subscription OAuth through a third-party router is not an officially licensed Anthropic API flow, may violate provider terms, and may put the connected account at risk. Automatic fallback across subscriptions can be viewed as combining or bypassing account capacity limits; it does not guarantee protection from provider restrictions. You must explicitly accept this risk before connecting an Anthropic Claude account.
+> Claude subscriptions and the Anthropic API are separate products. Routing Claude subscription OAuth through a third-party router may violate provider terms and put connected accounts at risk. Automatic fallback can also be viewed as combining account capacity. You must explicitly accept this risk before connecting a Claude account.
 
 ## Features
 
-- OpenAI-compatible endpoints: `POST /v1/responses`, `POST /v1/chat/completions`, `GET /v1/models`
-- Anthropic-compatible `POST /v1/messages` and `POST /v1/messages/count_tokens`, including streaming, thinking, tools, prompt caching, and Claude Code headers
-- Multiple Codex and Claude connections with provider-scoped priority and failover on retryable errors (`429`, upstream `5xx`)
-- Custom OpenAI/Anthropic-compatible connections routed by model prefix, authenticated with a static API key
-- Provider-specific OAuth refresh, account testing, and quota display
-- CLI and terminal UI for providers, API keys, settings, and logs; sensitive headers are redacted from logs
+- OpenAI-compatible `/v1/responses`, `/v1/chat/completions`, and `/v1/models`
+- Anthropic-compatible `/v1/messages` and `/v1/messages/count_tokens`
+- Streaming, multimodal input, thinking, tools, prompt caching, and Claude Code headers
+- Multiple Codex and Claude connections with priority, refresh, retry, quota, and failover
+- Custom OpenAI/Anthropic-compatible providers selected by model prefix
+- Local API keys, redacted logs, SQLite storage, TUI, and Wails desktop app
 
 ## Requirements
 
@@ -22,53 +20,50 @@ It provides model-prefix routing, provider-scoped priority and failover, local A
 - A browser for OAuth
 - At least one supported Codex or Claude account
 
+Desktop-specific requirements are listed under [Desktop App](#desktop-app).
+
 ## Quick Start
 
-Add a Codex account:
+Add a Codex connection:
 
 ```bash
 go run ./cmd/lm-router auth add openai-codex --name main --test
 ```
 
-Open the printed OAuth URL, authorize the account, and paste the callback URL into the terminal.
-
-To add a Claude connection, read the warning above and run:
+Open the printed OAuth URL, authorize the account, and paste the callback URL. To add Claude instead, acknowledge the warning above and run:
 
 ```bash
 go run ./cmd/lm-router auth add anthropic-claude --name main
 ```
 
-The CLI accepts `claude` as an input alias but stores `anthropic-claude`. Type the risk confirmation when prompted, then paste either the callback URL or the `code#state` value. For explicitly approved non-interactive use, pass `--accept-risk`. The OAuth URL is saved to `~/.lm-router/anthropic-claude-auth-url.txt`.
+The CLI accepts `claude` as an alias but stores `anthropic-claude`. For approved non-interactive use, add `--accept-risk`.
 
-Create a local API key:
+Create a client API key and save the printed secret:
 
 ```bash
 go run ./cmd/lm-router keys create --name local
 ```
 
-Save the printed `Secret`. This key authenticates clients to `lm-router`; it is not an OpenAI API key.
-
-Start the proxy:
+Start and verify the proxy:
 
 ```bash
 go run ./cmd/lm-router serve --host 127.0.0.1 --port 19090
-```
-
-Verify it:
-
-```bash
 curl http://127.0.0.1:19090/health
 ```
 
-## Use with Codex CLI
+The `sk-lm-router-...` secret authenticates clients to LM Router; it is not an upstream provider key.
 
-Keep `lm-router` running, then export the local key:
+## Client Setup
+
+### Codex CLI
+
+Export the local key:
 
 ```bash
 export LM_ROUTER_API_KEY="sk-lm-router-REPLACE_ME"
 ```
 
-Add the provider to the user-level `~/.codex/config.toml`. Merge it with any existing configuration:
+Merge the following into the user-level `~/.codex/config.toml`:
 
 ```toml
 model = "gpt-5.3-codex"
@@ -83,46 +78,21 @@ wire_api = "responses"
 http_headers = { "X-LM-Router-Codex-Mode" = "full", "X-LM-Router-Web-Search" = "live" }
 ```
 
-Use the user-level file: Codex ignores `model_provider` and `model_providers` in project-level `.codex/config.toml` files. See the [Codex configuration reference](https://developers.openai.com/codex/config-reference/).
+Codex ignores provider configuration in project-level `.codex/config.toml` files. Using `env_key` also preserves an existing Codex login in `~/.codex/auth.json`. See the [Codex configuration reference](https://developers.openai.com/codex/config-reference/).
 
-Using `env_key` keeps the router key separate from `~/.codex/auth.json`, preserving any existing Codex login.
+`X-LM-Router-Codex-Mode = "full"` preserves Responses input parts, tools, includes, and annotations that Codex normally removes for custom providers. `X-LM-Router-Web-Search` restores native web search: use `live`, `cached`, or `disabled`, and keep the top-level `web_search` value aligned with it. These headers are opt-in and do not affect other clients.
 
-Test the authenticated endpoint:
+Test authentication, then start Codex:
 
 ```bash
-curl \
-  -H "Authorization: Bearer $LM_ROUTER_API_KEY" \
+curl -H "Authorization: Bearer $LM_ROUTER_API_KEY" \
   http://127.0.0.1:19090/v1/models
-```
-
-Start a new Codex session:
-
-```bash
 codex
 ```
 
-Codex uses a reduced Responses contract for custom providers. The
-`X-LM-Router-Codex-Mode = "full"` provider header tells lm-router to remove the
-Responses Lite marker, preserving Responses input parts, tools, includes, and
-annotations supported by the upstream API. The `X-LM-Router-Web-Search` header
-separately restores the native `web_search` tool; `live` enables external
-access, while `cached` keeps it on the OpenAI-maintained index. Set both
-`X-LM-Router-Web-Search` and `web_search` to `disabled` to remove web search.
+### Hermes Agent
 
-Both router headers are opt-in and apply only to requests that explicitly send
-them. Claude Code, OpenCode, OpenAI SDK scripts, and other clients keep their
-existing behavior unless configured with these headers. Full mode does not add
-a Files API or change which local Codex skill the model chooses; local file
-paths continue to be read by Codex from the host workspace.
-
-## Use with Hermes Agent
-
-Hermes works best with lm-router through the Responses API. Export the local
-router key, then add a custom provider to `~/.hermes/config.yaml`:
-
-```bash
-export LM_ROUTER_API_KEY="sk-lm-router-REPLACE_ME"
-```
+Hermes works best through the Responses API. Export `LM_ROUTER_API_KEY`, then add this provider to `~/.hermes/config.yaml`:
 
 ```yaml
 providers:
@@ -142,52 +112,21 @@ model:
   api_mode: codex_responses
 ```
 
-Responses mode preserves function calls and multimodal input without a
-Chat Completions translation step. Hermes can also use `api_mode:
-chat_completions`; lm-router translates streamed function calls into standard
-`delta.tool_calls` chunks so tools such as `vision_analyze` execute instead of
-appearing as raw JSON assistant text.
+Responses mode preserves function calls and multimodal input directly. Hermes can also use `api_mode: chat_completions`; LM Router converts streamed function calls into standard `delta.tool_calls` chunks so tools such as `vision_analyze` execute instead of appearing as raw JSON.
 
-## Use with Claude Code
-
-Keep the router running and set Claude Code to the local endpoint:
+### Claude Code
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:19090"
 export ANTHROPIC_AUTH_TOKEN="sk-lm-router-REPLACE_ME"
-# Optional; it must retain the claude prefix:
+# Optional; retain the claude prefix:
 export ANTHROPIC_MODEL="claude-sonnet-4-6"
-
 claude
 ```
 
-You can print the same environment configuration without modifying user files:
+`ANTHROPIC_AUTH_TOKEN` is the local LM Router key. The router replaces it with the selected provider token and never forwards the local key upstream.
 
-```bash
-go run ./cmd/lm-router claude print-config \
-  --port 19090 \
-  --api-key sk-lm-router-REPLACE_ME \
-  --model claude-sonnet-4-6
-```
-
-`ANTHROPIC_AUTH_TOKEN` is the local `lm-router` API key, not the upstream OAuth token. The router replaces it with the selected provider token and never forwards the local key upstream.
-
-## Custom Providers
-
-Route a model prefix to any OpenAI-compatible or Anthropic-compatible HTTP endpoint using a static API key instead of OAuth:
-
-```bash
-go run ./cmd/lm-router auth add custom \
-  --name my-server --prefix myapi --base-url https://api.example.com/v1 \
-  --compat-type openai-compatible --api-type chat
-# prompts for the API key without echoing it
-```
-
-A request for model `myapi/gpt-4o` then routes to that connection, with the prefix stripped before forwarding. `--api-type` (`chat` or `responses`) only applies to `openai-compatible`; anthropic-compatible connections serve `/v1/messages`. Edit a saved connection with `auth edit <account-id> [--name] [--prefix] [--base-url] [--api-key] [--api-type]` (omit `--api-key` to keep the current one), or manage it from the TUI under `Providers > Custom Provider`.
-
-Custom connections are passthrough only: no format translation and no multi-key failover — one prefix maps to exactly one connection. See [Model Routing](#model-routing-failover-and-quota) below for the endpoint matrix.
-
-## Client URLs
+### SDK Base URLs
 
 | Client | Base URL | API |
 | --- | --- | --- |
@@ -195,9 +134,7 @@ Custom connections are passthrough only: no format translation and no multi-key 
 | OpenAI SDK | `http://127.0.0.1:19090/v1` | Responses or Chat Completions |
 | Anthropic SDK | `http://127.0.0.1:19090` | Messages |
 
-The Anthropic SDK base URL must not include `/v1`; the SDK appends the Messages path itself.
-
-Example with the OpenAI Python SDK:
+The Anthropic SDK base URL must omit `/v1` because the SDK appends the Messages path.
 
 ```python
 from openai import OpenAI
@@ -214,6 +151,23 @@ response = client.responses.create(
 print(response.output_text)
 ```
 
+## Custom Providers
+
+Route `<prefix>/<model>` to a static-key OpenAI- or Anthropic-compatible endpoint:
+
+```bash
+go run ./cmd/lm-router auth add custom \
+  --name my-server \
+  --prefix myapi \
+  --base-url https://api.example.com/v1 \
+  --compat-type openai-compatible \
+  --api-type chat
+```
+
+The command prompts for the API key without echoing it. A request for `myapi/gpt-4o` selects this connection and forwards `gpt-4o` upstream. `--api-type` (`chat` or `responses`) applies only to OpenAI-compatible providers; Anthropic-compatible providers serve `/v1/messages`.
+
+Custom providers are passthrough-only: there is no format translation or multi-key failover, and one prefix maps to one connection.
+
 ## Terminal UI
 
 ```bash
@@ -222,7 +176,7 @@ go run ./cmd/lm-router tui
 
 ![LM Router Terminal UI](./docs/images/lm-router-terminal-ui.png)
 
-Optional:
+Optional overrides:
 
 ```bash
 go run ./cmd/lm-router tui \
@@ -231,9 +185,76 @@ go run ./cmd/lm-router tui \
   --port 19090
 ```
 
-The TUI starts with `Providers > OpenAI Codex`, `Providers > Anthropic Claude`, or `Providers > Custom Provider`, then shows only that type's connections. Codex and Claude connections support alias editing, connection tests, quota, refresh, re-authentication, enable/disable, deletion, and Shift+Up/Down reordering; custom connections support edit, test, enable/disable, and deletion (no quota, refresh, or OAuth). Claude OAuth is gated by a risk confirmation page. The home screen includes read-only Codex and Claude configuration views.
+The TUI manages Codex, Claude, and custom connections; priorities; tests; quota; refresh/re-auth; API keys; settings; and client configuration. Long OAuth URLs are also written to `~/.lm-router/openai-codex-auth-url.txt` or `~/.lm-router/anthropic-claude-auth-url.txt`.
 
-Long OAuth URLs are saved to `~/.lm-router/openai-codex-auth-url.txt` or `~/.lm-router/anthropic-claude-auth-url.txt` to avoid terminal clipping.
+## Desktop App
+
+The Wails desktop app uses the same SQLite data and application services as the CLI/TUI. It manages connections, keys, settings, logs, OAuth, and its own in-process proxy.
+
+Requirements:
+
+- Wails v3.0.0-beta.16
+- Node.js 22+ and npm
+- macOS: Xcode command-line tools
+- Linux: GTK 3 and WebKitGTK 4.1 development packages
+
+Install Wails if needed:
+
+```bash
+go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.16
+```
+
+Run with hot reload:
+
+```bash
+make desktop-dev
+```
+
+Development runs as `LM Router Dev` with `~/.lm-router-dev` and port `19091`. The packaged app uses `~/.lm-router` and port `19090`, so both can run simultaneously. Override the development profile when needed:
+
+```bash
+make desktop-dev DESKTOP_DEV_DATA_DIR=/tmp/lm-router-dev DESKTOP_DEV_PORT=19191
+```
+
+Build a local application:
+
+```bash
+make desktop-mac
+# On a Linux build host:
+make desktop-linux
+```
+
+The macOS bundle is written to:
+
+```text
+desktop/build/bin/LM Router.app
+```
+
+Open it with:
+
+```bash
+open "desktop/build/bin/LM Router.app"
+```
+
+The shared Vue/TypeScript frontend lives in `frontend/`; `npm run build` writes the independent web assets to `frontend/dist` before they are embedded into the desktop binary.
+
+### Tray Menu
+
+The application creates a native tray/menu-bar item on macOS, Windows, and supported Linux desktop environments. Its menu provides:
+
+- `Open`
+- Server status and `Endpoint ip:port`
+- Start/stop server
+- Copy endpoint
+- `Quit`
+
+**Settings > Enable tray menu** controls whether the item is shown and defaults to enabled. With the tray enabled, closing the main window hides it while the proxy continues running. With the tray disabled, closing the window exits the application so it cannot remain inaccessible in the background.
+
+The setting applies immediately on macOS and Windows. Wails v3.0.0-beta.16 cannot hide an already-running Linux tray item, so Linux applies the disabled state after the application restarts. Linux also requires a desktop environment with StatusNotifier/AppIndicator support, such as the standard Ubuntu Desktop configuration.
+
+If the configured endpoint already responds to `/health`, the desktop app reports a port conflict instead of taking it over. Codex OAuth returns through loopback port `1455` when available; Claude uses its copy-and-paste callback flow.
+
+Desktop files use the `wailsapp` build tag, so CLI-only builds and tests do not require desktop dependencies.
 
 ## CLI Reference
 
@@ -243,24 +264,16 @@ go run ./cmd/lm-router version
 go run ./cmd/lm-router serve
 go run ./cmd/lm-router tui
 
-# Providers
+# Connections
 go run ./cmd/lm-router auth add openai-codex --name main
 go run ./cmd/lm-router auth add anthropic-claude --name main
-go run ./cmd/lm-router auth add claude --name backup --accept-risk
 go run ./cmd/lm-router auth list
-go run ./cmd/lm-router auth list --provider anthropic-claude
 go run ./cmd/lm-router auth test --provider openai-codex --name main
-go run ./cmd/lm-router auth test --provider anthropic-claude --name main
 go run ./cmd/lm-router auth refresh <account-id>
-go run ./cmd/lm-router auth refresh --provider anthropic-claude --name main
 go run ./cmd/lm-router auth enable <account-id>
 go run ./cmd/lm-router auth disable <account-id>
 go run ./cmd/lm-router auth move <account-id> --priority 1
 go run ./cmd/lm-router auth remove <account-id>
-
-# Custom providers
-go run ./cmd/lm-router auth add custom --name my-server --prefix myapi \
-  --base-url https://api.example.com/v1 --compat-type openai-compatible --api-type chat
 go run ./cmd/lm-router auth edit <account-id> --base-url https://api.example.com/v2
 
 # API keys
@@ -268,49 +281,41 @@ go run ./cmd/lm-router keys create --name local
 go run ./cmd/lm-router keys list
 go run ./cmd/lm-router keys revoke <key-id>
 
-# Codex config helper
+# Client config helpers
 go run ./cmd/lm-router codex print-config \
-  --port 19090 \
-  --api-key sk-lm-router-REPLACE_ME
-
-# Claude Code config helper
+  --port 19090 --api-key sk-lm-router-REPLACE_ME
 go run ./cmd/lm-router claude print-config \
-  --port 19090 \
-  --api-key sk-lm-router-REPLACE_ME \
-  --model claude-sonnet-4-6
+  --port 19090 --api-key sk-lm-router-REPLACE_ME --model claude-sonnet-4-6
 ```
 
-The config helper prints authentication material; treat its output as sensitive. Prefer the environment-variable setup above if you want to preserve an existing Codex login.
+Config helpers print authentication material; treat their output as sensitive.
 
-## Model Routing, Failover, and Quota
+## Routing, Failover, and Quota
 
-Routing uses the trimmed model prefix case-insensitively. A model containing a `/` (`<prefix>/<model_id>`) is matched against registered custom-provider connections instead:
+Routing matches the model prefix case-insensitively. `<prefix>/<model>` selects a registered custom provider.
 
-| Endpoint | `gpt*` | `claude*` | Matching custom prefix | Other prefix |
+| Endpoint | `gpt*` | `claude*` | Custom prefix | Other |
 | --- | --- | --- | --- | --- |
-| `/v1/messages` | Translate to Codex Responses | Native Anthropic Messages | Native passthrough (anthropic-compatible only) | `400` |
-| `/v1/messages/count_tokens` | Local estimate | Native Anthropic token count | Local estimate (anthropic-compatible only) | `400` |
-| `/v1/responses` | Codex Responses | `400`; use `/v1/messages` | Native passthrough (openai-compatible + responses only) | `400` |
-| `/v1/chat/completions` | Translate to Codex Responses | `400`; use `/v1/messages` | Native passthrough (openai-compatible + chat only) | `400` |
+| `/v1/messages` | Translate to Responses | Native Messages | Anthropic passthrough | `400` |
+| `/v1/messages/count_tokens` | Local estimate | Native token count | Local estimate | `400` |
+| `/v1/responses` | Native Responses | `400` | OpenAI Responses passthrough | `400` |
+| `/v1/chat/completions` | Translate to Responses | `400` | OpenAI Chat passthrough | `400` |
 
-`/v1/models` returns a static, informational list; it does not enumerate custom-provider models, and any `claude*` model is passed through without needing a router update.
+Enabled connections are tried in provider-scoped priority order. Network errors, `429`, upstream `5xx`, and persistent `401/403` after one refresh may fail over; other `4xx` responses stop immediately. `Retry-After` and rate-limit headers create per-account cooldowns, otherwise jittered exponential backoff ranges from two seconds to five minutes.
 
-For each request, the router tries enabled connections in priority order within the selected provider. Network errors, `429`, `5xx`, and persistent `401/403` after one refresh-and-retry can move to the next connection. Other `4xx` request errors stop immediately. `Retry-After` and rate-limit reset headers create per-account cooldowns; without them the router uses jittered exponential backoff from two seconds up to five minutes. A successful Claude fallback is promoted by atomically swapping its priority with the first failed connection; token-count calls never reorder connections. Once a successful streaming response starts, the router never switches accounts mid-stream.
+A successful Claude fallback swaps priority with the first failed connection. Token-count calls never reorder connections, and streaming responses never switch accounts after output begins. Retrying network failures can duplicate a request if the provider accepted it before the connection failed.
 
-Retrying a network failure can duplicate a request if Anthropic accepted it before the connection failed. Automatic rotation also combines the capacity of multiple subscriptions and does not prevent account limitations or other provider action.
-
-Claude connection tests and quota views call the OAuth usage endpoint without sending an inference prompt. They display the five-hour, weekly, and model-specific weekly windows returned by Anthropic. A quota `429` still counts as connected and does not block inference; the TUI waits three minutes before polling quota again, using state separate from inference cooldowns.
+Claude quota views show the five-hour, weekly, and model-specific windows returned by Anthropic. A quota `429` does not block inference and uses cooldown state separate from routing failures.
 
 ## Local Data
 
 State is stored under `~/.lm-router/` by default:
 
 - `lm-router.db`
-- `openai-codex-auth-url.txt`
-- `anthropic-claude-auth-url.txt`
-- SQLite `-wal` and `-shm` sidecar files when active
+- OAuth URL text files
+- Active SQLite `-wal` and `-shm` files
 
-Treat this directory as sensitive because it contains local account credentials.
+Treat this directory as sensitive because it contains local account credentials. Development desktop data is isolated under `~/.lm-router-dev/`.
 
 ## Development
 
@@ -320,9 +325,7 @@ go build ./cmd/lm-router
 go run ./cmd/lm-router version
 ```
 
-GitHub Actions builds Linux `amd64` and `arm64` artifacts on pushes to `main` and manual workflow runs.
-
-The project is local-first and does not currently include a web dashboard, Docker packaging, or cloud tunneling.
+GitHub Actions builds Linux `amd64` and `arm64` CLI artifacts on pushes to `main` and manual workflow runs. The project is local-first and does not include Docker packaging, a hosted dashboard, or built-in cloud tunneling.
 
 ## License
 

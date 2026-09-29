@@ -1,0 +1,173 @@
+version: '3'
+
+vars:
+  APP_NAME: lm-router-desktop
+  DEV_BINARY: desktop/build/bin/lm-router-desktop-dev
+  PROD_BINARY: desktop/build/bin/lm-router-desktop
+  PROD_APP: desktop/build/bin/LM Router.app
+  DEV_APP: desktop/build/bin/LM Router Dev.app
+  WAILS3: '{{.WAILS3 | default "wails3"}}'
+
+tasks:
+  go:mod:tidy:
+    internal: true
+    cmds:
+      - go mod tidy
+
+  frontend:install:
+    internal: true
+    dir: frontend
+    sources:
+      - package.json
+      - package-lock.json
+    generates:
+      - node_modules/**/*
+    cmds:
+      - npm install
+
+  generate:bindings:
+    summary: Generates Wails v3 TypeScript bindings
+    deps:
+      - go:mod:tidy
+    sources:
+      - desktop/**/*.go
+      - go.mod
+      - go.sum
+    generates:
+      - frontend/bindings/github.com/andrisasuke/lm-router/desktop/app.ts
+    cmds:
+      - '{{.WAILS3}} generate bindings -f ''-tags wailsapp'' -d frontend/bindings -clean -ts -names ./desktop'
+
+  frontend:build:dev:
+    internal: true
+    deps:
+      - frontend:install
+      - generate:bindings
+    dir: frontend
+    sources:
+      - src/**/*
+      - bindings/**/*
+      - index.html
+      - package.json
+      - package-lock.json
+      - tsconfig.json
+      - vite.config.ts
+    generates:
+      - dist/index.html
+    cmds:
+      - npm run build:dev
+
+  frontend:build:
+    summary: Builds the production web frontend
+    deps:
+      - frontend:install
+      - generate:bindings
+    dir: frontend
+    cmds:
+      - npm run build
+
+  frontend:dev:
+    internal: true
+    deps:
+      - frontend:install
+    dir: frontend
+    cmds:
+      - npm run dev
+
+  build:dev:
+    internal: true
+    deps:
+      - frontend:build:dev
+    cmds:
+      - go build -tags wailsapp -buildvcs=false -gcflags=all="-l" -o "{{.DEV_BINARY}}" ./desktop
+    env:
+      CGO_ENABLED: 1
+      CGO_CFLAGS: -mmacosx-version-min=12.0
+      CGO_LDFLAGS: -mmacosx-version-min=12.0
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+
+  run:dev:
+    internal: true
+    deps:
+      - build:dev
+      - generate:icons
+    cmds:
+      - rm -f "{{.DEV_APP}}/Contents/Resources/iconfile.icns" "{{.DEV_APP}}/Contents/Resources/icons.icns" "{{.DEV_APP}}/Contents/Resources/appicon.icns"
+      - mkdir -p "{{.DEV_APP}}/Contents/MacOS" "{{.DEV_APP}}/Contents/Resources"
+      - cp "{{.DEV_BINARY}}" "{{.DEV_APP}}/Contents/MacOS/lm-router-desktop-dev"
+      - cp desktop/build/darwin/appicon.icns "{{.DEV_APP}}/Contents/Resources/appicon.icns"
+      - cp desktop/build/darwin/Info.dev.plist "{{.DEV_APP}}/Contents/Info.plist"
+      - codesign --force --deep --sign - "{{.DEV_APP}}"
+      - touch "{{.DEV_APP}}"
+      - '"{{.DEV_APP}}/Contents/MacOS/lm-router-desktop-dev"'
+
+  generate:icons:
+    internal: true
+    dir: desktop/build
+    sources:
+      - appicon.png
+    generates:
+      - darwin/appicon.icns
+      - windows/icon.ico
+    cmds:
+      - mkdir -p darwin windows
+      - '{{.WAILS3}} generate icons -input appicon.png -macfilename darwin/appicon.icns -windowsfilename windows/icon.ico'
+
+  build:
+    summary: Builds a production binary for the current host
+    deps:
+      - frontend:build
+    cmds:
+      - go build -tags "wailsapp,production" -trimpath -buildvcs=false -ldflags="-w -s" -o "{{.PROD_BINARY}}" ./desktop
+
+  build:mac:
+    internal: true
+    cmds:
+      - go build -tags "wailsapp,production" -trimpath -buildvcs=false -ldflags="-w -s" -o "{{.OUTPUT}}" ./desktop
+    env:
+      GOOS: darwin
+      GOARCH: '{{.ARCH}}'
+      CGO_ENABLED: 1
+      CGO_CFLAGS: -mmacosx-version-min=12.0
+      CGO_LDFLAGS: -mmacosx-version-min=12.0
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+
+  build:mac:universal:
+    summary: Builds the universal macOS binary
+    deps:
+      - frontend:build
+    cmds:
+      - task: build:mac
+        vars:
+          ARCH: amd64
+          OUTPUT: desktop/build/bin/lm-router-desktop-amd64
+      - task: build:mac
+        vars:
+          ARCH: arm64
+          OUTPUT: desktop/build/bin/lm-router-desktop-arm64
+      - lipo -create -output "{{.PROD_BINARY}}" desktop/build/bin/lm-router-desktop-amd64 desktop/build/bin/lm-router-desktop-arm64
+
+  package:mac:universal:
+    summary: Packages the universal macOS application bundle
+    deps:
+      - build:mac:universal
+      - generate:icons
+    cmds:
+      - rm -f "{{.PROD_APP}}/Contents/Resources/iconfile.icns" "{{.PROD_APP}}/Contents/Resources/icons.icns" "{{.PROD_APP}}/Contents/Resources/appicon.icns"
+      - mkdir -p "{{.PROD_APP}}/Contents/MacOS" "{{.PROD_APP}}/Contents/Resources"
+      - cp "{{.PROD_BINARY}}" "{{.PROD_APP}}/Contents/MacOS/lm-router-desktop"
+      - cp desktop/build/darwin/appicon.icns "{{.PROD_APP}}/Contents/Resources/appicon.icns"
+      - cp desktop/build/darwin/Info.plist "{{.PROD_APP}}/Contents/Info.plist"
+      - codesign --force --deep --sign - "{{.PROD_APP}}"
+      - touch "{{.PROD_APP}}"
+
+  build:linux:
+    summary: Builds the Linux amd64 desktop binary
+    deps:
+      - frontend:build
+    cmds:
+      - go build -tags "wailsapp,production" -trimpath -buildvcs=false -ldflags="-w -s" -o desktop/build/bin/lm-router-desktop-linux-amd64 ./desktop
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      CGO_ENABLED: 1

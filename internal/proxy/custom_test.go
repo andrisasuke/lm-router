@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,6 +35,54 @@ func customTestAccount(id, prefix, baseURL, compatType, apiType string) store.Ac
 		ID: id, Provider: store.ProviderCustom, Name: id, Enabled: true,
 		AccessToken: "sk-custom-test", Prefix: prefix, BaseURL: baseURL,
 		CompatType: compatType, APIType: apiType,
+	}
+}
+
+func TestCustomProviderReportsAccountActivity(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "non-stream", true: "stream"}[stream], func(t *testing.T) {
+			db, apiKey := newTestDBWithKey(t)
+			var active atomic.Bool
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if !active.Load() {
+					t.Error("account should be active while custom upstream is handling the request")
+				}
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte("data: [DONE]\n\n"))
+					return
+				}
+				_, _ = w.Write([]byte(`{"id":"custom_active"}`))
+			}))
+			defer upstream.Close()
+
+			if err := db.UpsertAccount(context.Background(), customTestAccount("custom", "myapi", upstream.URL, store.CompatOpenAIStyle, store.CustomAPITypeChat)); err != nil {
+				t.Fatal(err)
+			}
+			events := &activityEvents{}
+			handler := New(ServerConfig{
+				Store: db, Codex: codex.NewClient("http://invalid", codex.NewTokenManager(db, nil)), RequireKey: true,
+				OnAccountActivity: func(accountID string, requesting bool) {
+					active.Store(requesting)
+					events.callback(accountID, requesting)
+				},
+			})
+			body := `{"model":"myapi/gpt-4o","messages":[],"stream":` + map[bool]string{false: "false", true: "true"}[stream] + `}`
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			request.Header.Set("Authorization", "Bearer "+apiKey)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if active.Load() {
+				t.Fatal("account should be idle after custom request finishes")
+			}
+			if got, want := events.snapshot(), []string{"custom:active", "custom:idle"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("events=%v, want %v", got, want)
+			}
+		})
 	}
 }
 

@@ -1,0 +1,16 @@
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleName</key><string>LM Router</string>
+    <key>CFBundleExecutable</key><string>lm-router-desktop</string>
+    <key>CFBundleIdentifier</key><string>com.lmrouter.desktop</string>
+    <key>CFBundleVersion</key><string>0.0.2</string>
+    <key>CFBundleShortVersionString</key><string>0.0.2</string>
+    <key>CFBundleGetInfoString</key><string>Local model switchboard for Codex and Claude</string>
+    <key>CFBundleIconFile</key><string>appicon</string>
+    <key>LSMinimumSystemVersion</key><string>12.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSHumanReadableCopyright</key><string>Copyright 2026 LM Router</string>
+  </dict>
+</plist>

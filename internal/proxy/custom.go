@@ -79,11 +79,14 @@ func isStreamRequested(body []byte) bool {
 func (s *Server) dispatchCustom(ctx context.Context, w http.ResponseWriter, route modelRoute, path string, body []byte, writeError func(status int, msg string)) {
 	params := customprovider.ExecuteParams{Account: route.Account, Path: path, Model: route.Model, Body: body}
 	if isStreamRequested(body) {
+		done := s.beginAccountActivity(route.Account.ID)
 		stream, err := s.custom.OpenStream(ctx, params)
 		if err != nil {
+			done()
 			writeError(http.StatusBadGateway, err.Error())
 			return
 		}
+		stream.Body = trackAccountStream(stream.Body, done)
 		defer stream.Body.Close()
 		w.Header().Set("Content-Type", contentTypeOrDefault(stream.Header.Get("Content-Type")))
 		w.Header().Set("Cache-Control", "no-cache")
@@ -92,7 +95,9 @@ func (s *Server) dispatchCustom(ctx context.Context, w http.ResponseWriter, rout
 		_ = codex.CopyStream(w, stream.Body)
 		return
 	}
-	result, err := s.custom.Execute(ctx, params)
+	result, err := trackAccountCall(s, route.Account.ID, func() (customprovider.ExecuteResult, error) {
+		return s.custom.Execute(ctx, params)
+	})
 	if err != nil {
 		writeError(http.StatusBadGateway, err.Error())
 		return
