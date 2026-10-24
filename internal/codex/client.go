@@ -19,6 +19,7 @@ import (
 
 const DefaultInstructions = "You are Codex, based on GPT-5. You are running as a coding agent in the Codex CLI on a user's computer."
 const logBodyLimit = 64 * 1024
+const DefaultUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 
 const (
 	CodexResponsesLiteHeader = "X-OpenAI-Internal-Codex-Responses-Lite"
@@ -28,6 +29,7 @@ const (
 
 type Client struct {
 	baseURL      string
+	usageURL     string
 	http         *http.Client
 	tokens       *TokenManager
 	logger       Logger
@@ -66,18 +68,34 @@ type StreamResult struct {
 }
 
 func NewClient(baseURL string, tokens *TokenManager) *Client {
-	return NewClientWithLogger(baseURL, tokens, stdLogger{}, logBodyLimit)
+	return NewClientWithUsageURL(baseURL, DefaultUsageURL, tokens)
 }
 
 func NewClientWithLogger(baseURL string, tokens *TokenManager, logger Logger, bodyLimit int) *Client {
+	return NewClientWithLoggerAndUsageURL(baseURL, DefaultUsageURL, tokens, logger, bodyLimit)
+}
+
+// NewClientWithUsageURL creates a client with a separately configurable
+// ChatGPT usage endpoint. The Responses and usage APIs have different paths,
+// so quota checks must not derive their URL from the inference endpoint.
+func NewClientWithUsageURL(baseURL, usageURL string, tokens *TokenManager) *Client {
+	return NewClientWithLoggerAndUsageURL(baseURL, usageURL, tokens, stdLogger{}, logBodyLimit)
+}
+
+func NewClientWithLoggerAndUsageURL(baseURL, usageURL string, tokens *TokenManager, logger Logger, bodyLimit int) *Client {
 	if logger == nil {
 		logger = stdLogger{}
 	}
 	if bodyLimit <= 0 {
 		bodyLimit = logBodyLimit
 	}
+	usageURL = strings.TrimSpace(usageURL)
+	if usageURL == "" {
+		usageURL = DefaultUsageURL
+	}
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
+		baseURL:  strings.TrimRight(baseURL, "/"),
+		usageURL: usageURL,
 		http: &http.Client{
 			Transport: &http.Transport{
 				DialContext: (&net.Dialer{
@@ -289,13 +307,15 @@ func (c *Client) openWithAccount(ctx context.Context, account store.Account, req
 		Body:      newLoggingReadCloser(resp.Body, account.ID, resp.StatusCode, start, c.logger, c.logBodyLimit),
 		Retryable: resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests,
 	}
-	if allowRefreshRetry && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && c.tokens != nil {
-		errorBody, _ := io.ReadAll(resp.Body)
+	var authErrorBody []byte
+	refreshed, retryAfterRefresh, refreshErr := c.refreshAfterAuthFailure(ctx, account, resp.StatusCode, allowRefreshRetry, func() {
+		authErrorBody, _ = io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		c.logf("[openai-api] response-body account=%s status=%d duration=%s body=%s", account.ID, resp.StatusCode, time.Since(start), formatBody(errorBody, c.logBodyLimit))
-		refreshed, refreshErr := c.tokens.RefreshNow(ctx, account.ID)
+		c.logf("[openai-api] response-body account=%s status=%d duration=%s body=%s", account.ID, resp.StatusCode, time.Since(start), formatBody(authErrorBody, c.logBodyLimit))
+	})
+	if retryAfterRefresh {
 		if refreshErr != nil {
-			result.ErrorBody = errorBody
+			result.ErrorBody = authErrorBody
 			return result, refreshErr
 		}
 		return c.openWithAccount(ctx, refreshed, reqBody, inboundHeaders, false)
@@ -362,39 +382,86 @@ func hasCodexProtocolHeaders(headers http.Header) bool {
 }
 
 func (c *Client) FetchQuota(ctx context.Context, account store.Account) (QuotaInfo, error) {
+	if c.tokens == nil {
+		return QuotaInfo{}, errors.New("Codex quota token manager is not configured")
+	}
 	refreshed, err := c.tokens.EnsureFresh(ctx, account.ID)
 	if err != nil {
 		return QuotaInfo{}, err
 	}
-	body, err := TransformRequest([]byte(`{"model":"gpt-5.5","input":"ping","stream":false}`))
+	info, err := c.fetchQuotaWithAccount(ctx, refreshed, true)
 	if err != nil {
 		return QuotaInfo{}, err
 	}
-	result, err := c.openWithAccount(ctx, refreshed, body, nil, true)
-	if err != nil {
-		return QuotaInfo{}, err
-	}
-	if result.Body != nil {
-		_ = result.Body.Close()
-	}
-	now := time.Now()
-	info := ParseQuotaHeaders(result.Header, now)
-	if info.Primary == nil && info.Secondary == nil {
-		c.logf("[quota] no x-codex-* headers account=%s headers=%s", refreshed.ID, formatHeaders(result.Header))
-	}
-	if result.Status >= 200 && result.Status < 300 {
-		if until, exhausted := QuotaCooldownUntil(info); exhausted {
-			if err := c.tokens.SetCooldown(ctx, refreshed.ID, until); err != nil {
-				return info, err
-			}
-		} else if (refreshed.CooldownUntil.Valid || refreshed.LastFailureAt.Valid || refreshed.ConsecutiveFailures > 0) &&
-			quotaWindowsRecovered(result.Header, info) {
-			if err := c.tokens.ResetFailureState(ctx, refreshed.ID); err != nil {
-				return info, err
-			}
+	if until, exhausted := QuotaCooldownUntil(info); exhausted {
+		if err := c.tokens.SetCooldown(ctx, refreshed.ID, until); err != nil {
+			return info, err
+		}
+	} else if (refreshed.CooldownUntil.Valid || refreshed.LastFailureAt.Valid || refreshed.ConsecutiveFailures > 0) &&
+		quotaWindowsRecovered(info) {
+		if err := c.tokens.ResetFailureState(ctx, refreshed.ID); err != nil {
+			return info, err
 		}
 	}
 	return info, nil
+}
+
+// fetchQuotaWithAccount gets quota from ChatGPT's usage endpoint. It mirrors
+// the Responses client's one-shot auth-refresh retry without making an
+// inference request or selecting a model.
+func (c *Client) fetchQuotaWithAccount(ctx context.Context, account store.Account, allowRefreshRetry bool) (QuotaInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.usageURL, nil)
+	if err != nil {
+		return QuotaInfo{}, errors.New("Codex quota request URL is invalid")
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+account.AccessToken)
+	applyCodexProtocolHeaders(req.Header, nil, account)
+
+	start := time.Now()
+	c.logf("[quota] request account=%s method=%s url=%s headers=%s",
+		account.ID, req.Method, req.URL.Redacted(), formatHeaders(req.Header))
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.logf("[quota] network error account=%s duration=%s", account.ID, time.Since(start))
+		return QuotaInfo{}, newQuotaNetworkError(err)
+	}
+	c.logf("[quota] response account=%s status=%d headers=%s duration=%s",
+		account.ID, resp.StatusCode, formatHeaders(resp.Header), time.Since(start))
+
+	refreshed, retryAfterRefresh, refreshErr := c.refreshAfterAuthFailure(ctx, account, resp.StatusCode, allowRefreshRetry, func() {
+		_ = resp.Body.Close()
+	})
+	if retryAfterRefresh {
+		if refreshErr != nil {
+			return QuotaInfo{}, refreshErr
+		}
+		return c.fetchQuotaWithAccount(ctx, refreshed, false)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return QuotaInfo{}, &QuotaHTTPError{Status: resp.StatusCode}
+	}
+	info, err := ParseQuotaUsage(resp.Body, time.Now())
+	if err != nil {
+		return QuotaInfo{}, err
+	}
+	return info, nil
+}
+
+// refreshAfterAuthFailure owns the shared one-shot 401/403 refresh decision.
+// Callers retain response-body ownership: release is invoked only when a retry
+// is warranted, before the refresh starts, so streaming bodies are never
+// buffered or retained by this helper.
+func (c *Client) refreshAfterAuthFailure(ctx context.Context, account store.Account, status int, allowRetry bool, release func()) (store.Account, bool, error) {
+	if !allowRetry || c.tokens == nil || (status != http.StatusUnauthorized && status != http.StatusForbidden) {
+		return store.Account{}, false, nil
+	}
+	if release != nil {
+		release()
+	}
+	refreshed, err := c.tokens.RefreshNow(ctx, account.ID)
+	return refreshed, true, err
 }
 
 func (c *Client) logf(format string, args ...any) {

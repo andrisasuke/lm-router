@@ -33,18 +33,19 @@ type pendingOAuth struct {
 }
 
 type App struct {
-	ctx         context.Context
-	db          *store.DB
-	logger      *appsvc.RingLogger
-	controller  *appsvc.ServerController
-	profile     desktopProfile
-	dataDir     string
-	initErr     error
-	desktopApp  *application.App
-	mainWindow  application.Window
-	tray        *trayController
-	activity    *appsvc.AccountActivityTracker
-	codexQuotas *codexQuotaTracker
+	ctx                context.Context
+	db                 *store.DB
+	logger             *appsvc.RingLogger
+	controller         *appsvc.ServerController
+	profile            desktopProfile
+	dataDir            string
+	initErr            error
+	desktopApp         *application.App
+	mainWindow         application.Window
+	tray               *trayController
+	activity           *appsvc.AccountActivityTracker
+	codexQuotas        *codexQuotaTracker
+	codexQuotaRecovery *appsvc.CodexQuotaRecoveryScheduler
 
 	codexQuotaFetcher func(context.Context, store.Account) (codex.QuotaInfo, error)
 	quotaContext      context.Context
@@ -121,6 +122,9 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 			}), nil
 		},
 	})
+	a.codexQuotaRecovery = appsvc.NewCodexQuotaRecoveryScheduler(a.db, a.providerService())
+	a.codexQuotaRecovery.Quota = a.refreshCodexQuota
+	a.configureCodexQuotaRecovery(settings)
 	a.quotaWorkers.Add(2)
 	go func() {
 		defer a.quotaWorkers.Done()
@@ -128,7 +132,7 @@ func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) 
 	}()
 	go func() {
 		defer a.quotaWorkers.Done()
-		a.monitorCodexQuotaResets(a.quotaContext)
+		a.recoverCodexQuotas(a.quotaContext)
 	}()
 	return nil
 }
@@ -149,6 +153,9 @@ func (a *App) ServiceShutdown() error {
 		cancel()
 	}
 	a.quotaWorkers.Wait()
+	if a.tray != nil {
+		a.tray.shutdown()
+	}
 	if a.db != nil {
 		_ = a.db.Close()
 	}
@@ -267,10 +274,10 @@ func (a *App) emitConnectionActivity(accountID string, requesting bool) {
 }
 
 func (a *App) emitConnectionQuota(accountID string, state codexQuotaState) {
-	if a.desktopApp == nil {
-		return
+	if a.desktopApp != nil {
+		a.desktopApp.Event.Emit("connection-quota", a.connectionQuotaEvent(accountID, state))
 	}
-	a.desktopApp.Event.Emit("connection-quota", a.connectionQuotaEvent(accountID, state))
+	a.refreshTray()
 }
 
 func (a *App) connectionQuotaEvent(accountID string, state codexQuotaState) ConnectionQuotaEventVM {
@@ -286,9 +293,9 @@ func (a *App) connectionQuotaEvent(accountID string, state codexQuotaState) Conn
 		return event
 	}
 	connection := connectionVM(account)
-	event.Status = connection.Status
-	event.CooldownUntil = connection.CooldownUntil
-	event.ConsecutiveFailures = connection.ConsecutiveFailures
+	event.Status = &connection.Status
+	event.CooldownUntil = &connection.CooldownUntil
+	event.ConsecutiveFailures = &connection.ConsecutiveFailures
 	return event
 }
 
@@ -378,28 +385,40 @@ func (a *App) RenameConnection(id, name string) error {
 	if err := a.ready(); err != nil {
 		return err
 	}
-	return humanError(a.providerService().Rename(a.context(), id, name))
+	if err := a.providerService().Rename(a.context(), id, name); err != nil {
+		return humanError(err)
+	}
+	return nil
 }
 
 func (a *App) SetEnabled(id string, enabled bool) error {
 	if err := a.ready(); err != nil {
 		return err
 	}
-	return humanError(a.providerService().SetEnabled(a.context(), id, enabled))
+	if err := a.providerService().SetEnabled(a.context(), id, enabled); err != nil {
+		return humanError(err)
+	}
+	return nil
 }
 
 func (a *App) Reorder(id string, delta int) error {
 	if err := a.ready(); err != nil {
 		return err
 	}
-	return humanError(a.providerService().Reorder(a.context(), id, delta))
+	if err := a.providerService().Reorder(a.context(), id, delta); err != nil {
+		return humanError(err)
+	}
+	return nil
 }
 
 func (a *App) DeleteConnection(id string) error {
 	if err := a.ready(); err != nil {
 		return err
 	}
-	return humanError(a.providerService().Delete(a.context(), id))
+	if err := a.providerService().Delete(a.context(), id); err != nil {
+		return humanError(err)
+	}
+	return nil
 }
 
 func (a *App) RefreshConnection(id string) (ConnectionVM, error) {
@@ -524,7 +543,12 @@ func (a *App) SaveSettings(settings SettingsVM) (SettingsVM, error) {
 	if a.tray != nil {
 		a.tray.setEnabled(storedSettings.TrayEnabled)
 	}
-	return a.GetSettings()
+	saved, err := a.GetSettings()
+	if err != nil {
+		return SettingsVM{}, err
+	}
+	a.configureCodexQuotaRecovery(saved.storeSettings())
+	return saved, nil
 }
 
 func (a *App) Logs(filter string) ([]LogVM, error) {
@@ -653,7 +677,11 @@ func (a *App) getPending(id string) (*pendingOAuth, error) {
 }
 
 func (a *App) providerService() appsvc.ProviderService {
-	return appsvc.ProviderService{DB: a.db, Logger: a.logger}
+	return appsvc.ProviderService{DB: a.db, Logger: a.logger, OnAccountChange: a.accountChanged}
+}
+
+func (a *App) accountChanged() {
+	a.refreshTray()
 }
 
 func (a *App) configInputs() (store.Settings, string, error) {
@@ -681,6 +709,16 @@ func (a *App) settings() (store.Settings, error) {
 		return store.Settings{}, err
 	}
 	return a.profile.applySettings(settings), nil
+}
+
+func (a *App) configureCodexQuotaRecovery(settings store.Settings) {
+	if a.codexQuotaRecovery == nil {
+		return
+	}
+	a.codexQuotaRecovery.Configure(
+		settings.CodexQuotaRecoveryEnabled,
+		time.Duration(settings.CodexQuotaRecoveryIntervalSeconds)*time.Second,
+	)
 }
 
 func (a *App) ready() error {
@@ -717,26 +755,47 @@ func (a *App) refreshTray() {
 	if a.tray == nil {
 		return
 	}
+	accounts := a.trayCodexAccounts()
+	status := ServerStatusVM{State: string(appsvc.ServerStarting)}
 	if a.initErr != nil {
-		a.tray.refresh(ServerStatusVM{State: string(appsvc.ServerError), Error: a.initErr.Error()})
-		return
+		status = ServerStatusVM{State: string(appsvc.ServerError), Error: a.initErr.Error()}
+	} else if a.db != nil && a.controller != nil {
+		settings, err := a.settings()
+		if err != nil {
+			status = ServerStatusVM{State: string(appsvc.ServerError), Error: err.Error()}
+		} else {
+			status = serverStatusVM(a.controller.Status(), settings)
+		}
 	}
-	if a.db == nil || a.controller == nil {
-		a.tray.refresh(ServerStatusVM{State: string(appsvc.ServerStarting)})
-		return
-	}
-	settings, err := a.settings()
-	if err != nil {
-		a.tray.refresh(ServerStatusVM{State: string(appsvc.ServerError), Error: err.Error()})
-		return
-	}
-	a.tray.refresh(serverStatusVM(a.controller.Status(), settings))
+	a.tray.refresh(status, accounts)
 }
 
 func (a *App) updateTray(status ServerStatusVM) {
 	if a.tray != nil {
-		a.tray.refresh(status)
+		a.tray.refresh(status, a.trayCodexAccounts())
 	}
+}
+
+func (a *App) trayCodexAccounts() []trayCodexAccount {
+	if a.db == nil {
+		return nil
+	}
+	accounts, err := a.db.ListAccountsByProvider(a.context(), store.ProviderOpenAICodex)
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Printf("[tray] list Codex accounts: %v", err)
+		}
+		return nil
+	}
+	result := make([]trayCodexAccount, 0, len(accounts))
+	for _, account := range accounts {
+		state := codexQuotaState{}
+		if a.codexQuotas != nil {
+			state = a.codexQuotas.Snapshot(account.ID)
+		}
+		result = append(result, trayCodexAccount{Account: account, Quota: state})
+	}
+	return result
 }
 
 func marshalDesktopError(err error) []byte {

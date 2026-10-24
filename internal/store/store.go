@@ -80,26 +80,56 @@ type APIKey struct {
 }
 
 type Settings struct {
-	Host                   string
-	Port                   int
-	TrayEnabled            bool
-	LogRequests            bool
-	LogUpstream            bool
-	LogBodyLimit           int
-	DefaultModel           string
-	UpstreamTimeoutSeconds int
+	Host                              string
+	Port                              int
+	TrayEnabled                       bool
+	LogRequests                       bool
+	LogUpstream                       bool
+	LogBodyLimit                      int
+	DefaultModel                      string
+	UpstreamTimeoutSeconds            int
+	CodexQuotaRecoveryEnabled         bool
+	CodexQuotaRecoveryIntervalSeconds int
+}
+
+const (
+	DefaultCodexQuotaRecoveryIntervalSeconds = 10
+)
+
+var codexQuotaRecoveryIntervals = [...]int{5, 10, 15, 30, 60, 300, 900, 1200}
+
+func ValidCodexQuotaRecoveryIntervals() []int {
+	return append([]int(nil), codexQuotaRecoveryIntervals[:]...)
+}
+
+func IsValidCodexQuotaRecoveryIntervalSeconds(seconds int) bool {
+	for _, valid := range codexQuotaRecoveryIntervals {
+		if seconds == valid {
+			return true
+		}
+	}
+	return false
+}
+
+func NormalizeCodexQuotaRecoveryIntervalSeconds(seconds int) int {
+	if IsValidCodexQuotaRecoveryIntervalSeconds(seconds) {
+		return seconds
+	}
+	return DefaultCodexQuotaRecoveryIntervalSeconds
 }
 
 func DefaultSettings() Settings {
 	return Settings{
-		Host:                   "127.0.0.1",
-		Port:                   19090,
-		TrayEnabled:            true,
-		LogRequests:            true,
-		LogUpstream:            true,
-		LogBodyLimit:           64 * 1024,
-		DefaultModel:           "gpt-5.3-codex",
-		UpstreamTimeoutSeconds: 300,
+		Host:                              "127.0.0.1",
+		Port:                              19090,
+		TrayEnabled:                       true,
+		LogRequests:                       true,
+		LogUpstream:                       true,
+		LogBodyLimit:                      64 * 1024,
+		DefaultModel:                      "gpt-5.3-codex",
+		UpstreamTimeoutSeconds:            300,
+		CodexQuotaRecoveryEnabled:         true,
+		CodexQuotaRecoveryIntervalSeconds: DefaultCodexQuotaRecoveryIntervalSeconds,
 	}
 }
 
@@ -366,6 +396,13 @@ func (db *DB) GetSettings(ctx context.Context) (Settings, error) {
 			if _, err := fmt.Sscanf(value, "%d", &t); err == nil && t > 0 {
 				settings.UpstreamTimeoutSeconds = t
 			}
+		case "codex_quota_recovery_enabled":
+			settings.CodexQuotaRecoveryEnabled = value != "false"
+		case "codex_quota_recovery_interval_seconds":
+			var interval int
+			if _, err := fmt.Sscanf(value, "%d", &interval); err == nil {
+				settings.CodexQuotaRecoveryIntervalSeconds = NormalizeCodexQuotaRecoveryIntervalSeconds(interval)
+			}
 		}
 	}
 	return settings, rows.Err()
@@ -387,15 +424,18 @@ func (db *DB) SaveSettings(ctx context.Context, settings Settings) error {
 	if settings.UpstreamTimeoutSeconds <= 0 {
 		settings.UpstreamTimeoutSeconds = 300
 	}
+	settings.CodexQuotaRecoveryIntervalSeconds = NormalizeCodexQuotaRecoveryIntervalSeconds(settings.CodexQuotaRecoveryIntervalSeconds)
 	values := map[string]string{
-		"host":                     settings.Host,
-		"port":                     fmt.Sprintf("%d", settings.Port),
-		"tray_enabled":             fmt.Sprintf("%t", settings.TrayEnabled),
-		"log_requests":             fmt.Sprintf("%t", settings.LogRequests),
-		"log_upstream":             fmt.Sprintf("%t", settings.LogUpstream),
-		"log_body_limit":           fmt.Sprintf("%d", settings.LogBodyLimit),
-		"default_model":            settings.DefaultModel,
-		"upstream_timeout_seconds": fmt.Sprintf("%d", settings.UpstreamTimeoutSeconds),
+		"host":                                  settings.Host,
+		"port":                                  fmt.Sprintf("%d", settings.Port),
+		"tray_enabled":                          fmt.Sprintf("%t", settings.TrayEnabled),
+		"log_requests":                          fmt.Sprintf("%t", settings.LogRequests),
+		"log_upstream":                          fmt.Sprintf("%t", settings.LogUpstream),
+		"log_body_limit":                        fmt.Sprintf("%d", settings.LogBodyLimit),
+		"default_model":                         settings.DefaultModel,
+		"upstream_timeout_seconds":              fmt.Sprintf("%d", settings.UpstreamTimeoutSeconds),
+		"codex_quota_recovery_enabled":          fmt.Sprintf("%t", settings.CodexQuotaRecoveryEnabled),
+		"codex_quota_recovery_interval_seconds": fmt.Sprintf("%d", settings.CodexQuotaRecoveryIntervalSeconds),
 	}
 	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {

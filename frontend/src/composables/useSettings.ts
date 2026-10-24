@@ -12,6 +12,8 @@ const initialSettings: Settings = {
   logBodyLimit: 65536,
   defaultModel: 'gpt-5.3-codex',
   upstreamTimeoutSeconds: 300,
+  codexQuotaRecoveryEnabled: true,
+  codexQuotaRecoveryIntervalSeconds: 10,
 }
 
 export function useSettings(onSaved?: () => void | Promise<void>) {

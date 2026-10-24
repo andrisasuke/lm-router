@@ -79,6 +79,8 @@ export interface Settings {
   logBodyLimit: number
   defaultModel: string
   upstreamTimeoutSeconds: number
+  codexQuotaRecoveryEnabled: boolean
+  codexQuotaRecoveryIntervalSeconds: number
 }
 
 export interface LogEntry {

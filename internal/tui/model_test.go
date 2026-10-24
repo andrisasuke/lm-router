@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,6 +36,85 @@ func TestHomeNavigationMovesSelectionAndOpensProviders(t *testing.T) {
 	if model.screen != screenProviderTypes {
 		t.Fatalf("screen=%v", model.screen)
 	}
+}
+
+func TestSettingsViewShowsCodexQuotaRecoveryControls(t *testing.T) {
+	model := NewTestModel()
+	model.screen = screenSettings
+	view := model.viewSettings()
+	if !strings.Contains(view, "Codex quota recovery: true") || !strings.Contains(view, "Codex recovery interval: 10s") {
+		t.Fatalf("settings view missing quota recovery controls: %s", view)
+	}
+	if got := model.itemCount(); got != settingsSave+1 {
+		t.Fatalf("settings item count=%d, want %d", got, settingsSave+1)
+	}
+}
+
+func TestSettingsToggleAndIntervalCycle(t *testing.T) {
+	model := NewTestModel()
+	model.screen = screenSettings
+	model.selected = settingsCodexQuotaRecoveryEnabled
+	next, _ := model.activateSettings()
+	model = next.(Model)
+	if model.settings.CodexQuotaRecoveryEnabled {
+		t.Fatal("quota recovery toggle did not turn off")
+	}
+	model.selected = settingsCodexQuotaRecoveryInterval
+	intervals := store.ValidCodexQuotaRecoveryIntervals()
+	model.settings.CodexQuotaRecoveryIntervalSeconds = intervals[0]
+	for i := 1; i <= len(intervals); i++ {
+		want := intervals[i%len(intervals)]
+		next, _ = model.activateSettings()
+		model = next.(Model)
+		if got := model.settings.CodexQuotaRecoveryIntervalSeconds; got != want {
+			t.Fatalf("cycle %d interval=%d, want %d", i, got, want)
+		}
+	}
+}
+
+func TestSettingsSavePersistsAndAppliesCodexQuotaRecoveryConfig(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	settings := store.DefaultSettings()
+	model := New(ctx, db, app.NewRingLogger(10, nil), app.NewServerController(app.ServerControllerConfig{}), settings)
+	config := &recordingQuotaRecoveryConfigurator{}
+	model.quotaRecovery = config
+	model.screen = screenSettings
+	model.selected = settingsSave
+	model.settings.CodexQuotaRecoveryEnabled = false
+	model.settings.CodexQuotaRecoveryIntervalSeconds = 17
+	next, _ := model.activateSettings()
+	model = next.(Model)
+	if !strings.Contains(model.statusLine, "settings saved") {
+		t.Fatalf("save status=%q", model.statusLine)
+	}
+	got, err := db.GetSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CodexQuotaRecoveryEnabled || got.CodexQuotaRecoveryIntervalSeconds != store.DefaultCodexQuotaRecoveryIntervalSeconds {
+		t.Fatalf("saved quota recovery settings=%+v", got)
+	}
+	if model.settings.CodexQuotaRecoveryEnabled || model.settings.CodexQuotaRecoveryIntervalSeconds != store.DefaultCodexQuotaRecoveryIntervalSeconds {
+		t.Fatalf("model did not adopt normalized settings=%+v", model.settings)
+	}
+	if config.enabled || config.interval != 10*time.Second {
+		t.Fatalf("scheduler received enabled=%t interval=%s", config.enabled, config.interval)
+	}
+}
+
+type recordingQuotaRecoveryConfigurator struct {
+	enabled  bool
+	interval time.Duration
+}
+
+func (r *recordingQuotaRecoveryConfigurator) Configure(enabled bool, interval time.Duration) {
+	r.enabled = enabled
+	r.interval = interval
 }
 
 func TestProvidersViewShowsDefaultModelAndPassThroughRouting(t *testing.T) {
@@ -274,7 +354,7 @@ func TestAuthViewsSeparateSavedURLWithBlankLine(t *testing.T) {
 	}
 }
 
-func TestProviderDetailShowsQuotaHeaderDiagnostics(t *testing.T) {
+func TestProviderDetailQuotaStates(t *testing.T) {
 	model := NewTestModel()
 	model.accounts = []store.Account{{
 		ID:        "acct_1",
@@ -284,16 +364,162 @@ func TestProviderDetailShowsQuotaHeaderDiagnostics(t *testing.T) {
 	}}
 	model.screen = screenProviderDetail
 	model.selectedAccount = 0
-	model.providerQuota = &codex.QuotaInfo{
-		HeaderKeys: []string{"x-request-id", "x-ratelimit-limit"},
+	model.providerQuotaLoading = true
+	next, _ := model.Update(providerQuotaDoneMsg{info: codex.QuotaInfo{
+		FetchedAt: time.Now(),
+		Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 10},
+		Secondary: &codex.QuotaWindow{WindowMinutes: 10080, UsedPercent: 20},
+	}})
+	model = next.(Model)
+	if model.providerQuotaLoading || model.providerQuotaErr != nil || model.providerQuota == nil {
+		t.Fatalf("success state loading=%t error=%v quota=%+v", model.providerQuotaLoading, model.providerQuotaErr, model.providerQuota)
+	}
+	if view := model.View(); !strings.Contains(view, "Quota:      5h (10%)") || !strings.Contains(view, "weekly (20%)") {
+		t.Fatalf("success view=%s", view)
 	}
 
-	view := model.View()
-	if !strings.Contains(view, "Quota:      no data (no x-codex-*-used-percent header)") {
-		t.Fatalf("missing quota diagnostic: %s", view)
+	model.providerQuotaLoading = true
+	next, _ = model.Update(providerQuotaDoneMsg{err: errors.New("quota request failed")})
+	model = next.(Model)
+	if model.providerQuotaLoading || model.providerQuotaErr == nil {
+		t.Fatalf("error state loading=%t error=%v", model.providerQuotaLoading, model.providerQuotaErr)
 	}
-	if !strings.Contains(view, "x-* headers seen: x-request-id, x-ratelimit-limit") {
-		t.Fatalf("missing observed header keys: %s", view)
+	if view := model.View(); !strings.Contains(view, "Quota:      error: quota request failed") {
+		t.Fatalf("error view=%s", view)
+	}
+
+	model.providerQuotaLoading = true
+	next, _ = model.Update(providerQuotaDoneMsg{info: codex.QuotaInfo{FetchedAt: time.Now()}})
+	model = next.(Model)
+	if model.providerQuotaLoading || model.providerQuotaErr != nil {
+		t.Fatalf("empty state loading=%t error=%v", model.providerQuotaLoading, model.providerQuotaErr)
+	}
+	view := model.View()
+	if !strings.Contains(view, "Quota:      no usage windows returned") || strings.Contains(view, "x-codex-") {
+		t.Fatalf("empty quota view=%s", view)
+	}
+}
+
+func TestManualCodexQuotaResultReloadsCachedAccountByID(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	account := store.Account{ID: "codex", Provider: store.ProviderOpenAICodex, Name: "main", Enabled: true}
+	if err := db.UpsertAccount(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordRetryableFailure(ctx, account.ID, time.Now(), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	cached, err := db.MustGetAccount(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ResetFailureState(ctx, account.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	model := New(ctx, db, app.NewRingLogger(10, nil), app.NewServerController(app.ServerControllerConfig{}), store.DefaultSettings())
+	model.accounts = []store.Account{cached}
+	model.providerQuotaLoading = true
+	next, _ := model.Update(providerQuotaDoneMsg{
+		accountID: account.ID,
+		info:      codex.QuotaInfo{Primary: &codex.QuotaWindow{UsedPercent: 1}, Secondary: &codex.QuotaWindow{UsedPercent: 2}},
+	})
+	model = next.(Model)
+	updated := model.accounts[0]
+	if updated.CooldownUntil.Valid || updated.LastFailureAt.Valid || updated.ConsecutiveFailures != 0 {
+		t.Fatalf("manual quota result did not refresh cached account: %+v", updated)
+	}
+}
+
+func TestBackgroundCodexQuotaRecoveryRefreshesCachedAccountThroughMessage(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	account := store.Account{ID: "codex", Provider: store.ProviderOpenAICodex, Name: "main", Enabled: true}
+	if err := db.UpsertAccount(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordRetryableFailure(ctx, account.ID, time.Now(), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	cached, err := db.MustGetAccount(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ResetFailureState(ctx, account.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	model := New(ctx, db, app.NewRingLogger(10, nil), app.NewServerController(app.ServerControllerConfig{}), store.DefaultSettings())
+	model.accounts = []store.Account{cached}
+	next, cmd := model.Update(codexQuotaRecoveryMsg{result: app.CodexQuotaRecoveryResult{AccountID: account.ID}})
+	model = next.(Model)
+	if cmd == nil {
+		t.Fatal("background recovery must continue waiting for Bubble Tea messages")
+	}
+	updated := model.accounts[0]
+	if updated.CooldownUntil.Valid || updated.LastFailureAt.Valid || updated.ConsecutiveFailures != 0 {
+		t.Fatalf("background recovery did not refresh cached account: %+v", updated)
+	}
+}
+
+func TestBackgroundCodexQuotaRecoveryUpdatesSelectedCodexDetailQuota(t *testing.T) {
+	model := NewTestModel()
+	model.screen = screenProviderDetail
+	model.selectedAccount = 0
+	model.accounts = []store.Account{{ID: "codex", Provider: store.ProviderOpenAICodex, Name: "main", Enabled: true, ExpiresAt: time.Now().Add(time.Hour)}}
+	model.providerQuota = &codex.QuotaInfo{
+		Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 100},
+		Secondary: &codex.QuotaWindow{WindowMinutes: 10080, UsedPercent: 100},
+	}
+	next, cmd := model.Update(codexQuotaRecoveryMsg{result: app.CodexQuotaRecoveryResult{
+		AccountID: "codex",
+		Info: codex.QuotaInfo{
+			Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 12},
+			Secondary: &codex.QuotaWindow{WindowMinutes: 10080, UsedPercent: 34},
+		},
+	}})
+	model = next.(Model)
+	if cmd == nil || model.providerQuota == nil || model.providerQuota.Primary.UsedPercent != 12 || model.providerQuota.Secondary.UsedPercent != 34 {
+		t.Fatalf("selected recovery quota=%+v cmd_nil=%t", model.providerQuota, cmd == nil)
+	}
+	if model.providerQuotaErr != nil {
+		t.Fatalf("successful recovery retained quota error: %v", model.providerQuotaErr)
+	}
+	view := model.View()
+	if !strings.Contains(view, "Status:     Active") || !strings.Contains(view, "Quota:      5h (12%)") || strings.Contains(view, "5h (100%)") {
+		t.Fatalf("selected recovery view=%s", view)
+	}
+}
+
+func TestBackgroundCodexQuotaRecoveryErrorKeepsSelectedQuota(t *testing.T) {
+	model := NewTestModel()
+	model.screen = screenProviderDetail
+	model.selectedAccount = 0
+	model.accounts = []store.Account{{ID: "codex", Provider: store.ProviderOpenAICodex, Name: "main", Enabled: true, ExpiresAt: time.Now().Add(time.Hour)}}
+	model.providerQuota = &codex.QuotaInfo{
+		Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 12},
+		Secondary: &codex.QuotaWindow{WindowMinutes: 10080, UsedPercent: 34},
+	}
+	next, cmd := model.Update(codexQuotaRecoveryMsg{result: app.CodexQuotaRecoveryResult{AccountID: "codex", Err: errors.New("offline")}})
+	model = next.(Model)
+	if cmd == nil || model.providerQuota == nil || model.providerQuota.Primary.UsedPercent != 12 || model.providerQuota.Secondary.UsedPercent != 34 {
+		t.Fatalf("failed recovery changed quota=%+v cmd_nil=%t", model.providerQuota, cmd == nil)
+	}
+	if model.providerQuotaErr != nil {
+		t.Fatalf("failed background recovery should retain visible quota, got error=%v", model.providerQuotaErr)
+	}
+	view := model.View()
+	if !strings.Contains(view, "Quota:      5h (12%)") || strings.Contains(view, "Quota:      error:") {
+		t.Fatalf("failed recovery view=%s", view)
 	}
 }
 

@@ -74,9 +74,9 @@ type ConnectionQuotaPartVM struct {
 type ConnectionQuotaEventVM struct {
 	ID                  string            `json:"id"`
 	Quota               ConnectionQuotaVM `json:"quota"`
-	Status              string            `json:"status,omitempty"`
-	CooldownUntil       string            `json:"cooldownUntil,omitempty"`
-	ConsecutiveFailures int               `json:"consecutiveFailures,omitempty"`
+	Status              *string           `json:"status,omitempty"`
+	CooldownUntil       *string           `json:"cooldownUntil,omitempty"`
+	ConsecutiveFailures *int              `json:"consecutiveFailures,omitempty"`
 }
 
 type KeyVM struct {
@@ -92,14 +92,16 @@ type CreatedKeyVM struct {
 }
 
 type SettingsVM struct {
-	Host                   string `json:"host"`
-	Port                   int    `json:"port"`
-	TrayEnabled            bool   `json:"trayEnabled"`
-	LogRequests            bool   `json:"logRequests"`
-	LogUpstream            bool   `json:"logUpstream"`
-	LogBodyLimit           int    `json:"logBodyLimit"`
-	DefaultModel           string `json:"defaultModel"`
-	UpstreamTimeoutSeconds int    `json:"upstreamTimeoutSeconds"`
+	Host                              string `json:"host"`
+	Port                              int    `json:"port"`
+	TrayEnabled                       bool   `json:"trayEnabled"`
+	LogRequests                       bool   `json:"logRequests"`
+	LogUpstream                       bool   `json:"logUpstream"`
+	LogBodyLimit                      int    `json:"logBodyLimit"`
+	DefaultModel                      string `json:"defaultModel"`
+	UpstreamTimeoutSeconds            int    `json:"upstreamTimeoutSeconds"`
+	CodexQuotaRecoveryEnabled         bool   `json:"codexQuotaRecoveryEnabled"`
+	CodexQuotaRecoveryIntervalSeconds int    `json:"codexQuotaRecoveryIntervalSeconds"`
 }
 
 type LogVM struct {
@@ -207,7 +209,9 @@ func settingsVM(settings store.Settings) SettingsVM {
 		TrayEnabled: settings.TrayEnabled,
 		LogRequests: settings.LogRequests, LogUpstream: settings.LogUpstream,
 		LogBodyLimit: settings.LogBodyLimit, DefaultModel: settings.DefaultModel,
-		UpstreamTimeoutSeconds: settings.UpstreamTimeoutSeconds,
+		UpstreamTimeoutSeconds:            settings.UpstreamTimeoutSeconds,
+		CodexQuotaRecoveryEnabled:         settings.CodexQuotaRecoveryEnabled,
+		CodexQuotaRecoveryIntervalSeconds: settings.CodexQuotaRecoveryIntervalSeconds,
 	}
 }
 
@@ -217,7 +221,9 @@ func (settings SettingsVM) storeSettings() store.Settings {
 		TrayEnabled: settings.TrayEnabled,
 		LogRequests: settings.LogRequests, LogUpstream: settings.LogUpstream,
 		LogBodyLimit: settings.LogBodyLimit, DefaultModel: settings.DefaultModel,
-		UpstreamTimeoutSeconds: settings.UpstreamTimeoutSeconds,
+		UpstreamTimeoutSeconds:            settings.UpstreamTimeoutSeconds,
+		CodexQuotaRecoveryEnabled:         settings.CodexQuotaRecoveryEnabled,
+		CodexQuotaRecoveryIntervalSeconds: settings.CodexQuotaRecoveryIntervalSeconds,
 	}
 }
 
@@ -238,10 +244,7 @@ func codexQuotaVM(info codex.QuotaInfo) QuotaVM {
 	}
 	message := ""
 	if len(windows) == 0 {
-		message = "Quota headers were not returned"
-		if len(info.HeaderKeys) > 0 {
-			message += "; available headers: " + strings.Join(info.HeaderKeys, ", ")
-		}
+		message = "No usage windows returned"
 	}
 	return QuotaVM{Connected: true, Available: len(windows) > 0, FetchedAt: formatTime(info.FetchedAt), Message: message, Windows: windows}
 }
@@ -252,8 +255,13 @@ func connectionQuotaVM(state codexQuotaState) ConnectionQuotaVM {
 		view.FetchedAt = formatTime(state.Info.FetchedAt)
 	}
 	if hasCodexQuota(state.Info) {
-		view.State = quotaStateAvailable
-		view.Summary = codexQuotaSummary(state.Info)
+		if state.Error != "" {
+			view.State = quotaStateError
+			view.Summary = "Quota refresh failed; showing last known quota"
+		} else {
+			view.State = quotaStateAvailable
+			view.Summary = codexQuotaSummary(state.Info)
+		}
 		view.Windows = codexQuotaParts(state.Info)
 		return view
 	}

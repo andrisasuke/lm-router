@@ -3,8 +3,11 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -79,6 +82,84 @@ func TestSettingsVMPreservesTrayPreference(t *testing.T) {
 	}
 }
 
+func TestSettingsVMRoundTripsCodexQuotaRecovery(t *testing.T) {
+	settings := store.DefaultSettings()
+	settings.CodexQuotaRecoveryEnabled = false
+	settings.CodexQuotaRecoveryIntervalSeconds = 300
+
+	view := settingsVM(settings)
+	got := view.storeSettings()
+	if got.CodexQuotaRecoveryEnabled || got.CodexQuotaRecoveryIntervalSeconds != 300 {
+		t.Fatalf("quota recovery preference was lost: %+v", got)
+	}
+}
+
+func TestSaveSettingsConfiguresCodexQuotaRecovery(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	scheduler := appsvc.NewCodexQuotaRecoveryScheduler(db, appsvc.ProviderService{DB: db})
+	now := time.Now().UTC()
+	if err := db.UpsertAccount(ctx, store.Account{
+		ID: "due", Provider: store.ProviderOpenAICodex, Name: "due", Priority: 1, Enabled: true,
+		CooldownUntil: sql.NullTime{Time: now.Add(-time.Second), Valid: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	scheduler.Now = func() time.Time { return now }
+	scheduler.Quota = func(context.Context, store.Account) (codex.QuotaInfo, error) {
+		calls.Add(1)
+		return codex.QuotaInfo{}, nil
+	}
+	application := &App{
+		ctx:                ctx,
+		db:                 db,
+		controller:         appsvc.NewServerController(appsvc.ServerControllerConfig{}),
+		profile:            desktopProfile{},
+		codexQuotaRecovery: scheduler,
+	}
+	if _, err := application.SaveSettings(SettingsVM{
+		CodexQuotaRecoveryEnabled:         false,
+		CodexQuotaRecoveryIntervalSeconds: 300,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		scheduler.Run(runCtx)
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("disabled SaveSettings still allowed recovery calls=%d", got)
+	}
+	if _, err := application.SaveSettings(SettingsVM{
+		CodexQuotaRecoveryEnabled:         true,
+		CodexQuotaRecoveryIntervalSeconds: 5,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not stop")
+	}
+	if calls.Load() == 0 {
+		t.Fatal("runtime SaveSettings did not re-enable quota recovery")
+	}
+}
+
 func TestCodexQuotaVMUsesHumanReadableWindowNames(t *testing.T) {
 	quota := codexQuotaVM(codex.QuotaInfo{
 		Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 15},
@@ -89,6 +170,13 @@ func TestCodexQuotaVMUsesHumanReadableWindowNames(t *testing.T) {
 	}
 	if quota.Windows[0].Name != "5h" || quota.Windows[1].Name != "weekly" {
 		t.Fatalf("unexpected quota window names: %+v", quota.Windows)
+	}
+}
+
+func TestCodexQuotaVMEmptyUsagePayload(t *testing.T) {
+	quota := codexQuotaVM(codex.QuotaInfo{FetchedAt: time.Now()})
+	if quota.Available || quota.Message != "No usage windows returned" || len(quota.Windows) != 0 {
+		t.Fatalf("quota=%+v", quota)
 	}
 }
 

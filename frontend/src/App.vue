@@ -38,8 +38,10 @@ onMounted(async () => {
         <ConnectionsSection v-if="activeSection === 'connections'" />
         <ApiKeysSection v-else-if="activeSection === 'keys'" />
         <SettingsSection v-else-if="activeSection === 'settings'" @saved="server.refresh" />
-        <LogsSection v-else-if="activeSection === 'logs'" />
-        <ClientSetupSection v-else />
+        <KeepAlive>
+          <LogsSection v-if="activeSection === 'logs'" />
+        </KeepAlive>
+        <ClientSetupSection v-if="activeSection === 'setup'" />
       </main>
     </div>
   </div>

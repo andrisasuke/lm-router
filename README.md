@@ -259,7 +259,10 @@ The app creates a native tray/menu-bar item on macOS, Windows, and supported Lin
 - Server status and `Endpoint ip:port`
 - Start or stop server
 - Copy endpoint
+- A `Codex` submenu, ordered by provider priority, with each account's remaining five-hour and seven-day quota. Disabled, re-authentication-required, unavailable, and stale readings are marked without hiding the account.
 - `Quit`
+
+The tray icon is neutral while the server is stopped, starting, or has errored, and uses the LM Router orange brand color while it is running.
 
 **Settings > Enable tray menu** controls whether the item is shown and defaults to enabled.
 
@@ -291,16 +294,19 @@ A successful Claude fallback swaps priority with the first failed connection. To
 
 ## Quota Behavior
 
-Codex quota uses the upstream primary five-hour and secondary weekly response headers.
+Codex quota checks use the authenticated ChatGPT usage endpoint and do not send an inference prompt or select a model. Normal Codex responses still update quota from primary five-hour and secondary weekly response headers when the upstream includes them.
 
-- Desktop startup loads Codex quota asynchronously with at most two concurrent probes.
+- Desktop startup still loads Codex quota asynchronously with at most two concurrent probes.
+- The TUI and desktop run the same background recovery scan when enabled, immediately at startup and every 10 seconds by default. Settings can disable recovery and choose 5s, 10s, 15s, 30s, 1m, 5m, 15m, or 20m. Re-enabling recovery performs an immediate scan; changing the interval resets the next scan from the time the setting is applied.
 - Normal proxy responses update the matching connection card without blocking the UI.
 - Clicking **Quota** refreshes only the selected Codex connection.
 - If either the five-hour or weekly window reaches `100%`, the account enters cooldown.
 - If both windows are exhausted, cooldown follows the later reset time.
-- After a displayed reset reaches `0m`, the desktop app refreshes that account within approximately five seconds.
-- If the provider still reports an exhausted window, retries are limited to once per minute.
+- After a displayed reset reaches `0m`, the background recovery scheduler refreshes that account on the next configured scan.
+- If a quota check fails or the provider still reports an exhausted window, retries remain throttled to once per minute.
 - The account returns to active only after both quota windows are below `100%`.
+- Failed or incomplete quota checks leave the existing cooldown and failure state unchanged.
+- If a desktop refresh fails after a prior successful read, the card retains the last known windows and marks them as stale.
 
 Claude quota views show the five-hour, weekly, and model-specific windows returned by Anthropic. A Claude quota `429` does not block inference and uses cooldown state separate from routing failures.
 

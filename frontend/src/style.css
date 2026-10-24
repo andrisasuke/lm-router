@@ -28,9 +28,10 @@ body {
   user-select: none;
 }
 
-button, input, textarea { font: inherit; }
+button, input, select, textarea { font: inherit; }
 
 input,
+select,
 textarea {
   -webkit-user-select: text;
   user-select: text;
@@ -282,7 +283,7 @@ h2 { margin-bottom: 8px; font-size: 18px; font-weight: 600; }
 .meter { height: 5px; margin-top: 6px; background: var(--seam); }
 .meter span { display: block; height: 100%; background: var(--signal); }
 
-input, textarea {
+input, select, textarea {
   width: 100%;
   border: 1px solid #38414c;
   border-radius: 0;
@@ -292,6 +293,8 @@ input, textarea {
   font-family: "IBM Plex Mono", monospace;
   font-size: 11px;
 }
+select { cursor: pointer; }
+select:disabled { cursor: not-allowed; opacity: .48; }
 textarea { resize: vertical; line-height: 1.5; }
 input::placeholder, textarea::placeholder { color: #555e69; }
 
@@ -846,6 +849,12 @@ body {
   font-weight: 400;
 }
 
+.channel-quota .quota-stale {
+  color: var(--fault);
+  font-size: 9px;
+  font-weight: 500;
+}
+
 .channel-quota .quota-critical {
   color: var(--fault);
 }
@@ -945,6 +954,55 @@ body {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, .025), 0 10px 25px rgba(0, 0, 0, .09);
 }
 
+.log-toolbar {
+  border-radius: 10px 10px 0 0;
+  overflow: hidden;
+}
+
+.log-console {
+  border-radius: 0 0 10px 10px;
+}
+
+.log-line {
+  position: relative;
+  padding-right: 42px;
+  content-visibility: auto;
+  contain: layout paint style;
+  contain-intrinsic-size: auto 31px;
+}
+
+.log-copy-button {
+  position: absolute;
+  top: 7px;
+  right: 10px;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: #626b76;
+  cursor: pointer;
+  transition: color 140ms ease, background 140ms ease, border-color 140ms ease;
+}
+
+.log-copy-button:hover {
+  border-color: rgba(171, 176, 190, .26);
+  background: rgba(255, 255, 255, .06);
+  color: var(--text);
+}
+
+.log-copy-button:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 2px;
+}
+
+.log-copy-button.copied {
+  color: var(--signal);
+}
+
 .settings-section {
   min-height: 100%;
   padding-bottom: 24px;
@@ -966,10 +1024,11 @@ body {
 .settings-form label > span { gap: 2px; font-size: 11px; }
 .settings-form label small { font-size: 9px; }
 
-.settings-form input:not([type="checkbox"]) {
-  min-height: 36px;
-  padding-top: 8px;
-  padding-bottom: 8px;
+.settings-form input:not([type="checkbox"]),
+.settings-form select {
+	min-height: 36px;
+	padding-top: 8px;
+	padding-bottom: 8px;
 }
 
 .settings-form .form-actions {
@@ -978,6 +1037,7 @@ body {
 }
 
 input,
+select,
 textarea {
   border-color: rgba(177, 182, 195, .28);
   border-radius: 7px;

@@ -75,11 +75,12 @@ function dropOn(targetID: string) {
         :class="`quota-${connection.quota.state}`"
         :title="connection.quota.fetchedAt ? `Updated ${connection.quota.fetchedAt}` : ''"
       >
-        <template v-if="connection.quota.state === 'available' && connection.quota.windows.length">
+        <template v-if="connection.quota.windows.length">
           <span v-for="window in connection.quota.windows" :key="window.label" class="quota-window">
             <span :class="{ 'quota-critical': window.critical }">{{ window.label }}: {{ Math.round(window.utilization) }}%</span>
             <span class="quota-reset"> - {{ formatQuotaReset(window.resetsAt, quotaClock) }}</span>
           </span>
+          <span v-if="connection.quota.state === 'error'" class="quota-stale">{{ connection.quota.summary }}</span>
         </template>
         <template v-else>{{ connection.quota.summary || 'Loading quota...' }}</template>
       </span>

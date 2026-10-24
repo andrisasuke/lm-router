@@ -551,6 +551,8 @@ export class SettingsVM {
     "logBodyLimit": number;
     "defaultModel": string;
     "upstreamTimeoutSeconds": number;
+    "codexQuotaRecoveryEnabled": boolean;
+    "codexQuotaRecoveryIntervalSeconds": number;
 
     /** Creates a new SettingsVM instance. */
     constructor($$source: Partial<SettingsVM> = {}) {
@@ -577,6 +579,12 @@ export class SettingsVM {
         }
         if (!("upstreamTimeoutSeconds" in $$source)) {
             this["upstreamTimeoutSeconds"] = 0;
+        }
+        if (!("codexQuotaRecoveryEnabled" in $$source)) {
+            this["codexQuotaRecoveryEnabled"] = false;
+        }
+        if (!("codexQuotaRecoveryIntervalSeconds" in $$source)) {
+            this["codexQuotaRecoveryIntervalSeconds"] = 0;
         }
 
         Object.assign(this, $$source);
