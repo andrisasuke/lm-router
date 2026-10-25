@@ -1,31 +1,34 @@
-import { onActivated, onBeforeUnmount, onDeactivated, ref, watch } from 'vue'
-import { ClearLogs, Logs } from '../backend'
-import type { LogEntry } from '../types'
+import { onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
+import { ClearLogs, Logs, LogText } from '../backend'
+import type { LogEntry, LogPage, LogQuery } from '../types'
 import { errorText } from '../utils'
 import { useConfirmDialog } from './useConfirmDialog'
 
+const pageSize = 100
+const pollIntervalMs = 1500
+
 export interface LogRow {
+  id: number
   key: string
   time: string
   source: string
   sourceClass: string
   message: string
-  clipboardValue: string
+  truncated: boolean
 }
 
 export function useLogs() {
-  const logs = ref<LogEntry[]>([])
-  const rows = ref<LogRow[]>([])
+  const rows = shallowRef<LogRow[]>([])
   const filter = ref<'all' | 'proxy' | 'openai'>('all')
+  const available = ref(0)
+  const hasOlder = ref(false)
+  const loadingOlder = ref(false)
   const error = ref('')
   const confirmDialog = useConfirmDialog()
   let timer: number | undefined
   let active = false
-  let activeGeneration = 0
-  let inFlight = false
-  let pendingLoad = false
-  let pendingResolvers: Array<() => void> = []
-  let requestID = 0
+  let generation = 0
+  let latestID = 0
 
   function clearTimer() {
     if (timer === undefined) return
@@ -33,121 +36,162 @@ export function useLogs() {
     timer = undefined
   }
 
-  function buildRows(snapshot: LogEntry[]): LogRow[] {
-    return snapshot.map((entry) => {
-      const time = new Date(entry.time).toLocaleTimeString()
+  function schedulePoll(currentGeneration: number) {
+    clearTimer()
+    if (!active || generation !== currentGeneration) return
+    timer = window.setTimeout(() => {
+      timer = undefined
+      void loadNewer(currentGeneration)
+    }, pollIntervalMs)
+  }
+
+  function query(afterId = 0, beforeId = 0): LogQuery {
+    return { filter: filter.value, afterId, beforeId, limit: pageSize }
+  }
+
+  function buildRows(entries: LogEntry[]): LogRow[] {
+    return entries.map((entry) => {
       const source = entry.source.toUpperCase()
       return {
-        key: JSON.stringify([entry.time, entry.source, entry.message]),
-        time,
+        id: entry.id,
+        key: String(entry.id),
+        time: new Date(entry.time).toLocaleTimeString(),
         source,
         sourceClass: `source-${entry.source}`,
         message: entry.message,
-        clipboardValue: `${time} ${source} ${entry.message}`,
+        truncated: entry.truncated,
       }
     })
   }
 
-  function sameSnapshot(previous: LogEntry[], next: LogEntry[]) {
-    if (previous.length !== next.length) return false
-    return previous.every((entry, index) => {
-      const candidate = next[index]
-      return entry.time === candidate.time && entry.source === candidate.source && entry.message === candidate.message
-    })
+  function replacePage(page: LogPage) {
+    rows.value = buildRows(page.entries)
+    latestID = page.latestId
+    available.value = page.available
+    hasOlder.value = page.hasOlder
   }
 
-  function schedule(generation: number) {
-    clearTimer()
-    if (!active || generation !== activeGeneration) return
-    timer = window.setTimeout(() => {
-      timer = undefined
-      queueLoad()
-    }, 1000)
+  function appendPage(page: LogPage) {
+    if (page.reset) {
+      replacePage(page)
+      return
+    }
+    const next = page.oldestId > 0
+      ? rows.value.filter((row) => row.id >= page.oldestId)
+      : []
+    if (page.entries.length > 0) next.push(...buildRows(page.entries))
+    rows.value = next
+    latestID = page.latestId
+    available.value = page.available
   }
 
-  function resolvePendingLoads() {
-    const resolvers = pendingResolvers
-    pendingResolvers = []
-    for (const resolve of resolvers) resolve()
-  }
-
-  async function load() {
-    if (!active || inFlight) return
-    inFlight = true
-    pendingLoad = false
-    const generation = activeGeneration
-    const requestedFilter = filter.value
-    const currentRequestID = ++requestID
+  async function loadLatest(currentGeneration: number) {
     error.value = ''
     try {
-      const snapshot = await Logs(requestedFilter) as unknown as LogEntry[]
-      if (!active || generation !== activeGeneration || currentRequestID !== requestID || requestedFilter !== filter.value) return
-      if (!sameSnapshot(logs.value, snapshot)) {
-        logs.value = snapshot
-        rows.value = buildRows(snapshot)
-      }
+      const page = await Logs(query()) as unknown as LogPage
+      if (!active || generation !== currentGeneration) return
+      error.value = ''
+      replacePage(page)
     } catch (cause) {
-      if (active && generation === activeGeneration && currentRequestID === requestID && requestedFilter === filter.value) {
-        error.value = errorText(cause)
-      }
+      if (active && generation === currentGeneration) error.value = errorText(cause)
     } finally {
-      inFlight = false
-      if (!active) {
-        resolvePendingLoads()
-        return
-      }
-      if (generation !== activeGeneration) {
-        pendingLoad = false
-        queueLoad()
-        return
-      }
-      if (pendingLoad) {
-        queueLoad()
-      } else {
-        schedule(generation)
-        resolvePendingLoads()
-      }
+      schedulePoll(currentGeneration)
     }
   }
 
-  function queueLoad(immediate = false): Promise<void> {
-    if (!active) return Promise.resolve()
-    if (immediate) clearTimer()
-    if (inFlight) {
-      pendingLoad = true
-      return new Promise((resolve) => pendingResolvers.push(resolve))
+  async function loadNewer(currentGeneration: number) {
+    if (!active || generation !== currentGeneration) return
+    try {
+      const page = await Logs(query(latestID)) as unknown as LogPage
+      if (!active || generation !== currentGeneration) return
+      error.value = ''
+      appendPage(page)
+    } catch (cause) {
+      if (active && generation === currentGeneration) error.value = errorText(cause)
+    } finally {
+      schedulePoll(currentGeneration)
     }
-    return load()
+  }
+
+  async function loadOlder() {
+    if (!active || loadingOlder.value || !hasOlder.value || rows.value.length === 0) return
+    const currentGeneration = generation
+    const beforeID = rows.value[0].id
+    loadingOlder.value = true
+    try {
+      const page = await Logs(query(0, beforeID)) as unknown as LogPage
+      if (!active || generation !== currentGeneration) return
+      error.value = ''
+      const existing = new Set(rows.value.map((row) => row.id))
+      const older = buildRows(page.entries).filter((row) => !existing.has(row.id))
+      rows.value = [...older, ...rows.value]
+      available.value = page.available
+      hasOlder.value = page.hasOlder
+    } catch (cause) {
+      if (active && generation === currentGeneration) error.value = errorText(cause)
+    } finally {
+      if (generation === currentGeneration) loadingOlder.value = false
+    }
+  }
+
+  async function clipboardValue(row: LogRow) {
+    let message = row.message
+    if (row.truncated) {
+      try {
+        message = await LogText(row.id)
+      } catch {
+        // The ring may evict an old entry between rendering and copying.
+      }
+    }
+    return `${row.time} ${row.source} ${message}`
+  }
+
+  function resetAndReload() {
+    generation += 1
+    clearTimer()
+    latestID = 0
+    rows.value = []
+    available.value = 0
+    hasOlder.value = false
+    loadingOlder.value = false
+    if (active) void loadLatest(generation)
   }
 
   function requestClear() {
     confirmDialog.request('Clear recent logs?', 'The in-memory 500-entry log ring will be emptied.', async () => {
+      generation += 1
+      clearTimer()
       await ClearLogs()
-      await queueLoad(true)
+      latestID = 0
+      rows.value = []
+      available.value = 0
+      hasOlder.value = false
+      if (active) await loadLatest(generation)
     })
   }
 
-  watch(filter, () => queueLoad(true))
-  onActivated(() => {
+  watch(filter, resetAndReload)
+  onMounted(() => {
     active = true
-    activeGeneration += 1
-    pendingLoad = false
-    queueLoad(true)
-  })
-  onDeactivated(() => {
-    active = false
-    activeGeneration += 1
-    pendingLoad = false
-    clearTimer()
-    resolvePendingLoads()
+    generation += 1
+    void loadLatest(generation)
   })
   onBeforeUnmount(() => {
     active = false
-    activeGeneration += 1
-    pendingLoad = false
+    generation += 1
     clearTimer()
-    resolvePendingLoads()
   })
 
-  return { logs, rows, filter, error, confirmDialog, requestClear }
+  return {
+    rows,
+    filter,
+    available,
+    hasOlder,
+    loadingOlder,
+    error,
+    confirmDialog,
+    loadOlder,
+    clipboardValue,
+    requestClear,
+  }
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/andrisasuke/lm-router/internal/anthropic"
 	appsvc "github.com/andrisasuke/lm-router/internal/app"
@@ -105,9 +106,27 @@ type SettingsVM struct {
 }
 
 type LogVM struct {
-	Time    string `json:"time"`
-	Source  string `json:"source"`
-	Message string `json:"message"`
+	ID        uint64 `json:"id"`
+	Time      string `json:"time"`
+	Source    string `json:"source"`
+	Message   string `json:"message"`
+	Truncated bool   `json:"truncated"`
+}
+
+type LogQueryVM struct {
+	Filter   string `json:"filter"`
+	AfterID  uint64 `json:"afterId"`
+	BeforeID uint64 `json:"beforeId"`
+	Limit    int    `json:"limit"`
+}
+
+type LogPageVM struct {
+	Entries   []LogVM `json:"entries"`
+	LatestID  uint64  `json:"latestId"`
+	OldestID  uint64  `json:"oldestId"`
+	Available int     `json:"available"`
+	HasOlder  bool    `json:"hasOlder"`
+	Reset     bool    `json:"reset"`
 }
 
 type ProviderTestVM struct {
@@ -201,6 +220,100 @@ func connectionVM(account store.Account) ConnectionVM {
 
 func keyVM(key store.APIKey) KeyVM {
 	return KeyVM{ID: key.ID, Name: key.Name, Prefix: key.Prefix, CreatedAt: key.CreatedAt.UTC().Format(time.RFC3339)}
+}
+
+const (
+	desktopLogPageLimit    = 100
+	desktopLogPageMaxLimit = 100
+	desktopLogPreviewBytes = 4 * 1024
+)
+
+func logPageVM(entries []appsvc.LogEntry, query LogQueryVM) LogPageVM {
+	limit := query.Limit
+	if limit <= 0 || limit > desktopLogPageMaxLimit {
+		limit = desktopLogPageLimit
+	}
+	filter := strings.ToLower(strings.TrimSpace(query.Filter))
+	filtered := make([]appsvc.LogEntry, 0, len(entries))
+	for _, entry := range entries {
+		if filter == "" || filter == "all" || entry.Source == filter {
+			filtered = append(filtered, entry)
+		}
+	}
+
+	page := LogPageVM{Available: len(filtered)}
+	if len(entries) > 0 {
+		page.OldestID = entries[0].ID
+		page.LatestID = entries[len(entries)-1].ID
+	}
+
+	selected := filtered
+	switch {
+	case query.AfterID > 0:
+		if page.OldestID > 0 && query.AfterID < page.OldestID {
+			page.Reset = true
+			selected = latestLogEntries(filtered, limit)
+			break
+		}
+		selected = make([]appsvc.LogEntry, 0, len(filtered))
+		for _, entry := range filtered {
+			if entry.ID > query.AfterID {
+				selected = append(selected, entry)
+			}
+		}
+		if len(selected) > limit {
+			page.Reset = true
+			selected = latestLogEntries(filtered, limit)
+		}
+	case query.BeforeID > 0:
+		selected = make([]appsvc.LogEntry, 0, len(filtered))
+		for _, entry := range filtered {
+			if entry.ID < query.BeforeID {
+				selected = append(selected, entry)
+			}
+		}
+		selected = latestLogEntries(selected, limit)
+	default:
+		page.Reset = true
+		selected = latestLogEntries(filtered, limit)
+	}
+
+	if len(selected) > 0 {
+		firstID := selected[0].ID
+		for _, entry := range filtered {
+			if entry.ID < firstID {
+				page.HasOlder = true
+				break
+			}
+		}
+	}
+	page.Entries = make([]LogVM, 0, len(selected))
+	for _, entry := range selected {
+		message, truncated := desktopLogPreview(entry.Message)
+		page.Entries = append(page.Entries, LogVM{
+			ID: entry.ID, Time: entry.Time.UTC().Format(time.RFC3339Nano),
+			Source: entry.Source, Message: message, Truncated: truncated,
+		})
+	}
+	return page
+}
+
+func latestLogEntries(entries []appsvc.LogEntry, limit int) []appsvc.LogEntry {
+	if len(entries) <= limit {
+		return entries
+	}
+	return entries[len(entries)-limit:]
+}
+
+func desktopLogPreview(message string) (string, bool) {
+	if len(message) <= desktopLogPreviewBytes {
+		return message, false
+	}
+	end := desktopLogPreviewBytes
+	for end > 0 && !utf8.RuneStart(message[end]) {
+		end--
+	}
+	return message[:end] + "…", true
 }
 
 func settingsVM(settings store.Settings) SettingsVM {

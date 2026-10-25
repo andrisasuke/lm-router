@@ -26,6 +26,12 @@ func TestRingLoggerKeepsRecentEntriesAndRedactsAuthorization(t *testing.T) {
 	if !strings.Contains(joined, "two") || !strings.Contains(joined, "three") {
 		t.Fatalf("missing expected entries: %s", joined)
 	}
+	if entries[0].ID == 0 || entries[1].ID != entries[0].ID+1 {
+		t.Fatalf("unexpected entry IDs: %+v", entries)
+	}
+	if entry, ok := logger.Entry(entries[0].ID); !ok || entry.Message != entries[0].Message {
+		t.Fatalf("entry lookup failed: ok=%t entry=%+v", ok, entry)
+	}
 }
 
 func TestRingLoggerAcceptsStandardLoggerOutput(t *testing.T) {
@@ -41,5 +47,20 @@ func TestRingLoggerAcceptsStandardLoggerOutput(t *testing.T) {
 	entries := logger.Entries()
 	if len(entries) != 1 || entries[0].Message != "http: internal server error" {
 		t.Fatalf("unexpected entries: %+v", entries)
+	}
+}
+
+func TestRingLoggerIDsRemainMonotonicAfterClear(t *testing.T) {
+	logger := NewRingLogger(2, nil)
+	logger.Printf("one")
+	first := logger.Entries()[0].ID
+	logger.Clear()
+	logger.Printf("two")
+	second := logger.Entries()[0].ID
+	if second <= first {
+		t.Fatalf("entry ID did not advance after clear: first=%d second=%d", first, second)
+	}
+	if _, ok := logger.Entry(first); ok {
+		t.Fatal("cleared entry remained addressable")
 	}
 }

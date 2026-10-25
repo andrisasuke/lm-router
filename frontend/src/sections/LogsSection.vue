@@ -2,7 +2,7 @@
 import { Check, Copy } from '@lucide/vue'
 import { onBeforeUnmount, ref } from 'vue'
 import ConfirmDialog from '../components/dialogs/ConfirmDialog.vue'
-import { useLogs } from '../composables/useLogs'
+import { useLogs, type LogRow } from '../composables/useLogs'
 import { copyText } from '../utils'
 
 const state = useLogs()
@@ -13,13 +13,15 @@ function isCopied(key: string) {
   return copiedRows.value.has(key)
 }
 
-async function copyLogEntry(key: string, value: string) {
+async function copyLogEntry(row: LogRow) {
   try {
+    const value = await state.clipboardValue(row)
     await copyText(value)
   } catch {
     return
   }
 
+  const key = row.key
   copiedRows.value = new Set(copiedRows.value).add(key)
   const existingTimer = copiedResetTimers.get(key)
   if (existingTimer !== undefined) window.clearTimeout(existingTimer)
@@ -46,9 +48,18 @@ onBeforeUnmount(() => {
     <div v-if="state.error.value || state.confirmDialog.error.value" class="notice fault">{{ state.error.value || state.confirmDialog.error.value }}</div>
     <div class="log-toolbar">
       <button v-for="filter in ['all', 'proxy', 'openai'] as const" :key="filter" :class="{ active: state.filter.value === filter }" @click="state.filter.value = filter">{{ filter }}</button>
-      <span role="status" aria-live="polite">{{ state.rows.value.length }} visible</span>
+      <span role="status" aria-live="polite">{{ state.rows.value.length }} of {{ state.available.value }} loaded</span>
     </div>
     <div class="log-console">
+      <button
+        v-if="state.hasOlder.value"
+        type="button"
+        class="log-load-older"
+        :disabled="state.loadingOlder.value"
+        @click="state.loadOlder"
+      >
+        {{ state.loadingOlder.value ? 'Loading…' : 'Load older logs' }}
+      </button>
       <div v-for="row in state.rows.value" :key="row.key" v-memo="[row.key, isCopied(row.key)]" class="log-line">
         <time>{{ row.time }}</time><span :class="row.sourceClass">{{ row.source }}</span><p>{{ row.message }}</p>
         <button
@@ -57,7 +68,7 @@ onBeforeUnmount(() => {
           :class="{ copied: isCopied(row.key) }"
           :aria-label="isCopied(row.key) ? 'Copied log entry' : 'Copy log entry'"
           :title="isCopied(row.key) ? 'Copied log entry' : 'Copy log entry'"
-          @click="copyLogEntry(row.key, row.clipboardValue)"
+          @click="copyLogEntry(row)"
         >
           <Check v-if="isCopied(row.key)" :size="14" />
           <Copy v-else :size="14" />

@@ -14,6 +14,8 @@ export {
     CustomProviderInput,
     CustomProviderUpdate,
     KeyVM,
+    LogPageVM,
+    LogQueryVM,
     LogVM,
     OAuthSessionVM,
     ProviderTestVM,

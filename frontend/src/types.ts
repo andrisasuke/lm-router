@@ -84,9 +84,27 @@ export interface Settings {
 }
 
 export interface LogEntry {
+  id: number
   time: string
   source: 'app' | 'proxy' | 'openai'
   message: string
+  truncated: boolean
+}
+
+export interface LogQuery {
+  filter: 'all' | 'proxy' | 'openai'
+  afterId: number
+  beforeId: number
+  limit: number
+}
+
+export interface LogPage {
+  entries: LogEntry[]
+  latestId: number
+  oldestId: number
+  available: number
+  hasOlder: boolean
+  reset: boolean
 }
 
 export interface TestResult {

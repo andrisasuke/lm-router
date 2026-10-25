@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	appsvc "github.com/andrisasuke/lm-router/internal/app"
 	"github.com/andrisasuke/lm-router/internal/codex"
@@ -210,5 +211,71 @@ func TestConnectionQuotaVMMarksOnlyWindowsAboveNinetyPercentCritical(t *testing.
 	}
 	if !view.Windows[1].Critical {
 		t.Fatal("values above 90% must be critical")
+	}
+}
+
+func TestLogPageVMReturnsBoundedIncrementalPages(t *testing.T) {
+	entries := make([]appsvc.LogEntry, 0, 150)
+	for i := 1; i <= 150; i++ {
+		source := "app"
+		if i%2 == 0 {
+			source = "proxy"
+		}
+		entries = append(entries, appsvc.LogEntry{ID: uint64(i), Time: time.Unix(int64(i), 0), Source: source, Message: "entry"})
+	}
+
+	initial := logPageVM(entries, LogQueryVM{Filter: "all", Limit: 100})
+	if !initial.Reset || len(initial.Entries) != 100 || initial.Entries[0].ID != 51 || initial.LatestID != 150 || !initial.HasOlder {
+		t.Fatalf("initial page=%+v", initial)
+	}
+
+	incremental := logPageVM(entries, LogQueryVM{Filter: "proxy", AfterID: 140, Limit: 100})
+	if incremental.Reset || len(incremental.Entries) != 5 || incremental.Entries[0].ID != 142 || incremental.Entries[4].ID != 150 {
+		t.Fatalf("incremental page=%+v", incremental)
+	}
+
+	older := logPageVM(entries, LogQueryVM{Filter: "all", BeforeID: 51, Limit: 25})
+	if older.Reset || len(older.Entries) != 25 || older.Entries[0].ID != 26 || older.Entries[24].ID != 50 || !older.HasOlder {
+		t.Fatalf("older page=%+v", older)
+	}
+}
+
+func TestLogPageVMResetsAfterRingRolloverAndTruncatesPreview(t *testing.T) {
+	message := strings.Repeat("界", 2000)
+	entries := []appsvc.LogEntry{
+		{ID: 501, Time: time.Now(), Source: "app", Message: message},
+		{ID: 502, Time: time.Now(), Source: "proxy", Message: "latest"},
+	}
+	page := logPageVM(entries, LogQueryVM{Filter: "all", AfterID: 10, Limit: 100})
+	if !page.Reset || len(page.Entries) != 2 || !page.Entries[0].Truncated {
+		t.Fatalf("rollover page=%+v", page)
+	}
+	if !strings.HasSuffix(page.Entries[0].Message, "…") || !utf8.ValidString(page.Entries[0].Message) {
+		t.Fatalf("invalid preview=%q", page.Entries[0].Message)
+	}
+}
+
+func TestLogPageVMBoundsLargeRingPayload(t *testing.T) {
+	entries := make([]appsvc.LogEntry, 0, 500)
+	message := strings.Repeat("x", 64*1024)
+	for i := 1; i <= 500; i++ {
+		entries = append(entries, appsvc.LogEntry{
+			ID: uint64(i), Time: time.Unix(int64(i), 0), Source: "openai", Message: message,
+		})
+	}
+	page := logPageVM(entries, LogQueryVM{Filter: "all", Limit: 100})
+	if len(page.Entries) != 100 {
+		t.Fatalf("page entries=%d, want 100", len(page.Entries))
+	}
+	payload, err := json.Marshal(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) > 500*1024 {
+		t.Fatalf("bounded page payload=%d bytes", len(payload))
+	}
+	unchanged := logPageVM(entries, LogQueryVM{Filter: "all", AfterID: 500, Limit: 100})
+	if len(unchanged.Entries) != 0 || unchanged.LatestID != 500 {
+		t.Fatalf("unchanged poll=%+v", unchanged)
 	}
 }

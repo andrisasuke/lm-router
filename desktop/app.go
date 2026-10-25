@@ -551,20 +551,22 @@ func (a *App) SaveSettings(settings SettingsVM) (SettingsVM, error) {
 	return saved, nil
 }
 
-func (a *App) Logs(filter string) ([]LogVM, error) {
+func (a *App) Logs(query LogQueryVM) (LogPageVM, error) {
 	if err := a.ready(); err != nil {
-		return nil, err
+		return LogPageVM{}, err
 	}
-	filter = strings.ToLower(strings.TrimSpace(filter))
-	entries := a.logger.Entries()
-	result := make([]LogVM, 0, len(entries))
-	for _, entry := range entries {
-		if filter != "" && filter != "all" && entry.Source != filter {
-			continue
-		}
-		result = append(result, LogVM{Time: entry.Time.UTC().Format(time.RFC3339Nano), Source: entry.Source, Message: entry.Message})
+	return logPageVM(a.logger.Entries(), query), nil
+}
+
+func (a *App) LogText(id uint64) (string, error) {
+	if err := a.ready(); err != nil {
+		return "", err
 	}
-	return result, nil
+	entry, ok := a.logger.Entry(id)
+	if !ok {
+		return "", humanError(errors.New("log entry is no longer available"))
+	}
+	return entry.Message, nil
 }
 
 func (a *App) ClearLogs() error {
