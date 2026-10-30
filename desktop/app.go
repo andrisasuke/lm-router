@@ -257,7 +257,9 @@ func (a *App) connectionView(account store.Account) ConnectionVM {
 		}
 		result.Quota = connectionQuotaVM(state)
 		if account.NeedsReauth && result.Quota.State == quotaStateUnknown {
-			result.Quota = ConnectionQuotaVM{State: quotaStateUnavailable, Summary: "Quota unavailable"}
+			result.Quota = emptyConnectionQuotaVM()
+			result.Quota.State = quotaStateUnavailable
+			result.Quota.Summary = "Quota unavailable"
 		}
 	}
 	return result

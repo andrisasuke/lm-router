@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { GripVertical } from '@lucide/vue'
 import { onMounted, onUnmounted, ref } from 'vue'
-import type { Connection } from '../../types'
+import type { Connection, ConnectionQuota, ConnectionQuotaPart } from '../../types'
 import { formatQuotaReset } from '../../utils'
 
 defineProps<{
@@ -21,6 +21,13 @@ const draggedID = ref('')
 const quotaClock = ref(Date.now())
 let quotaClockTimer: number | undefined
 
+const emptyQuota: ConnectionQuota = {
+  state: 'unknown',
+  summary: '',
+  fetchedAt: '',
+  windows: [],
+}
+
 onMounted(() => {
   quotaClockTimer = window.setInterval(() => {
     quotaClock.value = Date.now()
@@ -34,6 +41,18 @@ onUnmounted(() => {
 function dropOn(targetID: string) {
   emit('drop', draggedID.value, targetID)
   draggedID.value = ''
+}
+
+function quotaFor(connection: Connection): ConnectionQuota {
+  const quota = connection.quota
+  return quota !== null && typeof quota === 'object' && !Array.isArray(quota) ? quota : emptyQuota
+}
+
+function quotaWindows(connection: Connection): ConnectionQuotaPart[] {
+  const windows = quotaFor(connection).windows
+  return Array.isArray(windows)
+    ? windows.filter((window): window is ConnectionQuotaPart => window !== null && typeof window === 'object' && !Array.isArray(window))
+    : []
 }
 </script>
 
@@ -72,17 +91,17 @@ function dropOn(targetID: string) {
       <span
         v-if="connection.provider === 'openai-codex'"
         class="channel-quota"
-        :class="`quota-${connection.quota.state}`"
-        :title="connection.quota.fetchedAt ? `Updated ${connection.quota.fetchedAt}` : ''"
+        :class="`quota-${quotaFor(connection).state}`"
+        :title="quotaFor(connection).fetchedAt ? `Updated ${quotaFor(connection).fetchedAt}` : ''"
       >
-        <template v-if="connection.quota.windows.length">
-          <span v-for="window in connection.quota.windows" :key="window.label" class="quota-window">
+        <template v-if="quotaWindows(connection).length">
+          <span v-for="window in quotaWindows(connection)" :key="window.label" class="quota-window">
             <span :class="{ 'quota-critical': window.critical }">{{ window.label }}: {{ Math.round(window.utilization) }}%</span>
             <span class="quota-reset"> - {{ formatQuotaReset(window.resetsAt, quotaClock) }}</span>
           </span>
-          <span v-if="connection.quota.state === 'error'" class="quota-stale">{{ connection.quota.summary }}</span>
+          <span v-if="quotaFor(connection).state === 'error'" class="quota-stale">{{ quotaFor(connection).summary }}</span>
         </template>
-        <template v-else>{{ connection.quota.summary || 'Loading quota...' }}</template>
+        <template v-else>{{ quotaFor(connection).summary || 'Loading quota...' }}</template>
       </span>
       <span class="channel-status">{{ connection.status }}</span>
       <GripVertical class="drag-handle" :size="17" :stroke-width="2" aria-hidden="true" />

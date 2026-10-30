@@ -215,6 +215,7 @@ func connectionVM(account store.Account) ConnectionVM {
 		CanQuota:            !custom,
 		CanRefresh:          !custom,
 		CanReauth:           !custom,
+		Quota:               emptyConnectionQuotaVM(),
 	}
 }
 
@@ -363,7 +364,7 @@ func codexQuotaVM(info codex.QuotaInfo) QuotaVM {
 }
 
 func connectionQuotaVM(state codexQuotaState) ConnectionQuotaVM {
-	view := ConnectionQuotaVM{State: quotaStateUnknown}
+	view := emptyConnectionQuotaVM()
 	if !state.Info.FetchedAt.IsZero() {
 		view.FetchedAt = formatTime(state.Info.FetchedAt)
 	}
@@ -393,6 +394,13 @@ func connectionQuotaVM(state codexQuotaState) ConnectionQuotaVM {
 		view.Summary = "Quota unavailable"
 	}
 	return view
+}
+
+func emptyConnectionQuotaVM() ConnectionQuotaVM {
+	return ConnectionQuotaVM{
+		State:   quotaStateUnknown,
+		Windows: make([]ConnectionQuotaPartVM, 0),
+	}
 }
 
 func codexQuotaSummary(info codex.QuotaInfo) string {

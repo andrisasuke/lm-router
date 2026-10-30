@@ -49,6 +49,101 @@ func TestConnectionViewIncludesCurrentRequestActivity(t *testing.T) {
 	}
 }
 
+func TestConnectionQuotaVMPayloadsUseEmptyWindowsArraysWithoutQuotaData(t *testing.T) {
+	tests := []struct {
+		name  string
+		state codexQuotaState
+		want  string
+	}{
+		{name: "unknown", want: quotaStateUnknown},
+		{name: "loading", state: codexQuotaState{Loading: true}, want: quotaStateLoading},
+		{name: "error", state: codexQuotaState{Error: "offline"}, want: quotaStateError},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload, err := json.Marshal(ConnectionQuotaEventVM{
+				ID:    "account",
+				Quota: connectionQuotaVM(test.state),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var event struct {
+				Quota struct {
+					State   string          `json:"state"`
+					Windows json.RawMessage `json:"windows"`
+				} `json:"quota"`
+			}
+			if err := json.Unmarshal(payload, &event); err != nil {
+				t.Fatal(err)
+			}
+			if event.Quota.State != test.want || string(event.Quota.Windows) != "[]" {
+				t.Fatalf("quota event=%s", payload)
+			}
+		})
+	}
+}
+
+func TestConnectionVMPayloadUsesEmptyQuotaWindowsArray(t *testing.T) {
+	payload, err := json.Marshal([]ConnectionVM{connectionVM(store.Account{
+		ID: "custom", Provider: store.ProviderCustom,
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var connections []struct {
+		Quota struct {
+			Windows json.RawMessage `json:"windows"`
+		} `json:"quota"`
+	}
+	if err := json.Unmarshal(payload, &connections); err != nil {
+		t.Fatal(err)
+	}
+	if len(connections) != 1 || string(connections[0].Quota.Windows) != "[]" {
+		t.Fatalf("connections=%s", payload)
+	}
+}
+
+func TestConnectionViewPayloadUsesEmptyQuotaWindowsArrayForDefaultAndReauth(t *testing.T) {
+	application := &App{}
+	tests := []struct {
+		name    string
+		account store.Account
+		want    string
+	}{
+		{
+			name:    "default",
+			account: store.Account{ID: "default", Provider: store.ProviderOpenAICodex},
+			want:    quotaStateUnknown,
+		},
+		{
+			name:    "reauth",
+			account: store.Account{ID: "reauth", Provider: store.ProviderOpenAICodex, NeedsReauth: true},
+			want:    quotaStateUnavailable,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload, err := json.Marshal(application.connectionView(test.account))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var connection struct {
+				Quota struct {
+					State   string          `json:"state"`
+					Windows json.RawMessage `json:"windows"`
+				} `json:"quota"`
+			}
+			if err := json.Unmarshal(payload, &connection); err != nil {
+				t.Fatal(err)
+			}
+			if connection.Quota.State != test.want || string(connection.Quota.Windows) != "[]" {
+				t.Fatalf("connection=%s", payload)
+			}
+		})
+	}
+}
+
 func TestKeyVMOnlyExposesPrefix(t *testing.T) {
 	key := store.APIKey{ID: "key", Name: "local", Prefix: "sk-lm-router-abc", Secret: "full-secret", CreatedAt: time.Now()}
 	payload, err := json.Marshal(keyVM(key))
