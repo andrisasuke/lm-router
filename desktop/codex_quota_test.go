@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -64,28 +65,6 @@ func TestCodexQuotaTrackerKeepsNewestObservation(t *testing.T) {
 	state := tracker.Snapshot("account")
 	if state.Loading || state.Info.Primary == nil || state.Info.Primary.UsedPercent != 20 {
 		t.Fatalf("older probe replaced newer proxy observation: %+v", state)
-	}
-}
-
-func TestCodexQuotaTrackerFindsOnlyExhaustedWindowsPastReset(t *testing.T) {
-	now := time.Now()
-	tracker := newCodexQuotaTracker(nil)
-	tracker.Observe("due", codex.QuotaInfo{
-		FetchedAt: now.Add(-time.Hour),
-		Secondary: &codex.QuotaWindow{WindowMinutes: 10080, UsedPercent: 100, ResetAt: now.Add(-time.Second)},
-	})
-	tracker.Observe("future", codex.QuotaInfo{
-		FetchedAt: now,
-		Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 100, ResetAt: now.Add(time.Hour)},
-	})
-	tracker.Observe("available", codex.QuotaInfo{
-		FetchedAt: now,
-		Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 99, ResetAt: now.Add(-time.Second)},
-	})
-
-	due := tracker.ExhaustedDue(now)
-	if len(due) != 1 || due[0] != "due" {
-		t.Fatalf("due=%v, want [due]", due)
 	}
 }
 
@@ -195,82 +174,6 @@ func TestWarmCodexQuotasUsesBoundedConcurrencyAndSkipsReauth(t *testing.T) {
 	}
 }
 
-func TestRefreshDueCodexQuotasRefreshesExpiredWindow(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.Open(ctx, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	account := store.Account{
-		ID: "account", Provider: store.ProviderOpenAICodex, Name: "main", Priority: 1, Enabled: true,
-		AccessToken: "token", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour),
-	}
-	if err := db.UpsertAccount(ctx, account); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now()
-	tracker := newCodexQuotaTracker(nil)
-	tracker.Observe(account.ID, codex.QuotaInfo{
-		FetchedAt: now.Add(-time.Hour),
-		Secondary: &codex.QuotaWindow{WindowMinutes: 10080, UsedPercent: 100, ResetAt: now.Add(-time.Second)},
-	})
-	var calls atomic.Int32
-	application := &App{ctx: ctx, db: db, codexQuotas: tracker}
-	application.codexQuotaFetcher = func(context.Context, store.Account) (codex.QuotaInfo, error) {
-		calls.Add(1)
-		return codex.QuotaInfo{
-			FetchedAt: time.Now(),
-			Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 4},
-			Secondary: &codex.QuotaWindow{WindowMinutes: 10080, UsedPercent: 0},
-		}, nil
-	}
-
-	application.refreshDueCodexQuotas(ctx, now, make(map[string]time.Time))
-	if calls.Load() != 1 {
-		t.Fatalf("quota refresh calls=%d, want 1", calls.Load())
-	}
-	state := tracker.Snapshot(account.ID)
-	if state.Info.Secondary == nil || state.Info.Secondary.UsedPercent != 0 {
-		t.Fatalf("quota state was not refreshed: %+v", state.Info)
-	}
-}
-
-func TestRefreshDueCodexQuotasRateLimitsFailedRetry(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.Open(ctx, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	account := store.Account{
-		ID: "account", Provider: store.ProviderOpenAICodex, Name: "main", Priority: 1, Enabled: true,
-		AccessToken: "token", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour),
-	}
-	if err := db.UpsertAccount(ctx, account); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now()
-	tracker := newCodexQuotaTracker(nil)
-	tracker.Observe(account.ID, codex.QuotaInfo{
-		FetchedAt: now.Add(-time.Hour),
-		Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 100, ResetAt: now.Add(-time.Second)},
-	})
-	var calls atomic.Int32
-	application := &App{ctx: ctx, db: db, codexQuotas: tracker}
-	application.codexQuotaFetcher = func(context.Context, store.Account) (codex.QuotaInfo, error) {
-		calls.Add(1)
-		return codex.QuotaInfo{}, errors.New("offline")
-	}
-	retryAfter := make(map[string]time.Time)
-
-	application.refreshDueCodexQuotas(ctx, now, retryAfter)
-	application.refreshDueCodexQuotas(ctx, now.Add(codexQuotaResetPollInterval), retryAfter)
-	if calls.Load() != 1 {
-		t.Fatalf("quota refresh calls=%d, want one retry per minute", calls.Load())
-	}
-}
-
 func TestCodexQuotaTrackerReportsErrorWithoutCachedQuota(t *testing.T) {
 	tracker := newCodexQuotaTracker(nil)
 	flight, _ := tracker.Begin("account")
@@ -278,6 +181,75 @@ func TestCodexQuotaTrackerReportsErrorWithoutCachedQuota(t *testing.T) {
 	view := connectionQuotaVM(tracker.Snapshot("account"))
 	if view.State != quotaStateError || view.Summary != "Quota unavailable" {
 		t.Fatalf("view=%+v", view)
+	}
+}
+
+func TestCodexQuotaTrackerKeepsCachedQuotaOnRefreshFailure(t *testing.T) {
+	tracker := newCodexQuotaTracker(nil)
+	fetchedAt := time.Now()
+	tracker.Observe("account", codex.QuotaInfo{
+		FetchedAt: fetchedAt,
+		Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 25},
+		Secondary: &codex.QuotaWindow{WindowMinutes: 10080, UsedPercent: 35},
+	})
+	flight, leader := tracker.Begin("account")
+	if !leader {
+		t.Fatal("expected refresh leader")
+	}
+	tracker.Finish("account", flight, codex.QuotaInfo{}, errors.New("offline"))
+	state := tracker.Snapshot("account")
+	if state.Loading || state.Error != "offline" || state.Info.Primary == nil || state.Info.Secondary == nil {
+		t.Fatalf("cached quota was lost: %+v", state)
+	}
+	if state.Info.Primary.UsedPercent != 25 || state.Info.Secondary.UsedPercent != 35 || !state.Info.FetchedAt.Equal(fetchedAt) {
+		t.Fatalf("cached quota changed: %+v", state.Info)
+	}
+	if view := connectionQuotaVM(state); view.State != quotaStateError || view.Summary != "Quota refresh failed; showing last known quota" || len(view.Windows) != 2 {
+		t.Fatalf("cached quota view=%+v", view)
+	}
+}
+
+func TestCodexQuotaTrackerKeepsStaleTrayStateDuringRetry(t *testing.T) {
+	tracker := newCodexQuotaTracker(nil)
+	tracker.Observe("account", codex.QuotaInfo{
+		FetchedAt: time.Unix(100, 0),
+		Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 25},
+		Secondary: &codex.QuotaWindow{WindowMinutes: 10080, UsedPercent: 35},
+	})
+	flight, leader := tracker.Begin("account")
+	if !leader {
+		t.Fatal("initial refresh should become leader")
+	}
+	tracker.Finish("account", flight, codex.QuotaInfo{}, errors.New("offline"))
+
+	retry, leader := tracker.Begin("account")
+	if !leader || retry == nil {
+		t.Fatal("retry should become leader")
+	}
+	state := tracker.Snapshot("account")
+	if !state.Loading || state.Error != "offline" {
+		t.Fatalf("retry state=%+v, want loading with the previous error", state)
+	}
+	rows := trayCodexRows([]trayCodexAccount{{
+		Account: store.Account{Name: "main", Enabled: true},
+		Quota:   state,
+	}})
+	if want := "main [stale] - 5h(75%) 7d(65%)"; len(rows) != 1 || rows[0] != want {
+		t.Fatalf("retry rows=%q, want %q", rows, want)
+	}
+
+	tracker.Finish("account", retry, codex.QuotaInfo{
+		FetchedAt: time.Unix(200, 0),
+		Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 10},
+		Secondary: &codex.QuotaWindow{WindowMinutes: 10080, UsedPercent: 20},
+	}, nil)
+	state = tracker.Snapshot("account")
+	rows = trayCodexRows([]trayCodexAccount{{
+		Account: store.Account{Name: "main", Enabled: true},
+		Quota:   state,
+	}})
+	if want := "main - 5h(90%) 7d(80%)"; len(rows) != 1 || rows[0] != want {
+		t.Fatalf("recovered rows=%q, want %q", rows, want)
 	}
 }
 
@@ -346,14 +318,69 @@ func TestConnectionQuotaEventIncludesCurrentCooldownStatus(t *testing.T) {
 		FetchedAt: time.Now(),
 		Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 100, ResetAt: cooldownUntil},
 	}})
-	if event.Status != "Cooldown" {
-		t.Fatalf("status=%q, want Cooldown", event.Status)
+	if event.Status == nil || *event.Status != "Cooldown" {
+		t.Fatalf("status=%v, want Cooldown", event.Status)
 	}
-	if event.CooldownUntil == "" {
+	if event.CooldownUntil == nil || *event.CooldownUntil == "" {
 		t.Fatal("cooldown timestamp was not included")
 	}
 	if event.Quota.State != quotaStateAvailable || len(event.Quota.Windows) != 1 {
 		t.Fatalf("quota=%+v", event.Quota)
+	}
+}
+
+func TestConnectionQuotaEventSerializesRecoveryResetFields(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	account := store.Account{ID: "account", Provider: store.ProviderOpenAICodex, Name: "main", Priority: 1, Enabled: true}
+	if err := db.UpsertAccount(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordRetryableFailure(ctx, account.ID, time.Now(), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ResetFailureState(ctx, account.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	application := &App{ctx: ctx, db: db}
+	payload, err := json.Marshal(application.connectionQuotaEvent(account.ID, codexQuotaState{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var event map[string]any
+	if err := json.Unmarshal(payload, &event); err != nil {
+		t.Fatal(err)
+	}
+	if event["status"] != "Active" || event["cooldownUntil"] != "" || event["consecutiveFailures"] != float64(0) {
+		t.Fatalf("recovery event=%s", payload)
+	}
+}
+
+func TestConnectionQuotaEventDoesNotClearStateWhenAccountReloadFails(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	application := &App{ctx: ctx, db: db}
+	payload, err := json.Marshal(application.connectionQuotaEvent("missing", codexQuotaState{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var event map[string]any
+	if err := json.Unmarshal(payload, &event); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"status", "cooldownUntil", "consecutiveFailures"} {
+		if _, ok := event[field]; ok {
+			t.Fatalf("reload failure incorrectly emitted %s in %s", field, payload)
+		}
 	}
 }
 

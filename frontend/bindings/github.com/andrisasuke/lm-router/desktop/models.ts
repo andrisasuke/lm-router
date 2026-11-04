@@ -320,13 +320,96 @@ export class KeyVM {
     }
 }
 
+export class LogPageVM {
+    "entries": LogVM[];
+    "latestId": number;
+    "oldestId": number;
+    "available": number;
+    "hasOlder": boolean;
+    "reset": boolean;
+
+    /** Creates a new LogPageVM instance. */
+    constructor($$source: Partial<LogPageVM> = {}) {
+        if (!("entries" in $$source)) {
+            this["entries"] = [];
+        }
+        if (!("latestId" in $$source)) {
+            this["latestId"] = 0;
+        }
+        if (!("oldestId" in $$source)) {
+            this["oldestId"] = 0;
+        }
+        if (!("available" in $$source)) {
+            this["available"] = 0;
+        }
+        if (!("hasOlder" in $$source)) {
+            this["hasOlder"] = false;
+        }
+        if (!("reset" in $$source)) {
+            this["reset"] = false;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new LogPageVM instance from a string or object.
+     */
+    static createFrom($$source: any = {}): LogPageVM {
+        const $$createField0_0 = $$createType4;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("entries" in $$parsedSource) {
+            $$parsedSource["entries"] = $$createField0_0($$parsedSource["entries"]);
+        }
+        return new LogPageVM($$parsedSource as Partial<LogPageVM>);
+    }
+}
+
+export class LogQueryVM {
+    "filter": string;
+    "afterId": number;
+    "beforeId": number;
+    "limit": number;
+
+    /** Creates a new LogQueryVM instance. */
+    constructor($$source: Partial<LogQueryVM> = {}) {
+        if (!("filter" in $$source)) {
+            this["filter"] = "";
+        }
+        if (!("afterId" in $$source)) {
+            this["afterId"] = 0;
+        }
+        if (!("beforeId" in $$source)) {
+            this["beforeId"] = 0;
+        }
+        if (!("limit" in $$source)) {
+            this["limit"] = 0;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new LogQueryVM instance from a string or object.
+     */
+    static createFrom($$source: any = {}): LogQueryVM {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new LogQueryVM($$parsedSource as Partial<LogQueryVM>);
+    }
+}
+
 export class LogVM {
+    "id": number;
     "time": string;
     "source": string;
     "message": string;
+    "truncated": boolean;
 
     /** Creates a new LogVM instance. */
     constructor($$source: Partial<LogVM> = {}) {
+        if (!("id" in $$source)) {
+            this["id"] = 0;
+        }
         if (!("time" in $$source)) {
             this["time"] = "";
         }
@@ -335,6 +418,9 @@ export class LogVM {
         }
         if (!("message" in $$source)) {
             this["message"] = "";
+        }
+        if (!("truncated" in $$source)) {
+            this["truncated"] = false;
         }
 
         Object.assign(this, $$source);
@@ -459,7 +545,7 @@ export class QuotaVM {
      * Creates a new QuotaVM instance from a string or object.
      */
     static createFrom($$source: any = {}): QuotaVM {
-        const $$createField6_0 = $$createType4;
+        const $$createField6_0 = $$createType6;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("windows" in $$parsedSource) {
             $$parsedSource["windows"] = $$createField6_0($$parsedSource["windows"]);
@@ -551,6 +637,8 @@ export class SettingsVM {
     "logBodyLimit": number;
     "defaultModel": string;
     "upstreamTimeoutSeconds": number;
+    "codexQuotaRecoveryEnabled": boolean;
+    "codexQuotaRecoveryIntervalSeconds": number;
 
     /** Creates a new SettingsVM instance. */
     constructor($$source: Partial<SettingsVM> = {}) {
@@ -578,6 +666,12 @@ export class SettingsVM {
         if (!("upstreamTimeoutSeconds" in $$source)) {
             this["upstreamTimeoutSeconds"] = 0;
         }
+        if (!("codexQuotaRecoveryEnabled" in $$source)) {
+            this["codexQuotaRecoveryEnabled"] = false;
+        }
+        if (!("codexQuotaRecoveryIntervalSeconds" in $$source)) {
+            this["codexQuotaRecoveryIntervalSeconds"] = 0;
+        }
 
         Object.assign(this, $$source);
     }
@@ -595,5 +689,7 @@ export class SettingsVM {
 const $$createType0 = ConnectionQuotaPartVM.createFrom;
 const $$createType1 = $Create.Array($$createType0);
 const $$createType2 = ConnectionQuotaVM.createFrom;
-const $$createType3 = QuotaWindowVM.createFrom;
+const $$createType3 = LogVM.createFrom;
 const $$createType4 = $Create.Array($$createType3);
+const $$createType5 = QuotaWindowVM.createFrom;
+const $$createType6 = $Create.Array($$createType5);

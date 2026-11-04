@@ -62,6 +62,20 @@ const (
 
 const statusTimeout = 3 * time.Second
 
+const (
+	settingsBack = iota
+	settingsHost
+	settingsPort
+	settingsLogRequests
+	settingsLogUpstream
+	settingsBodyLogLimit
+	settingsDefaultModel
+	settingsUpstreamTimeout
+	settingsCodexQuotaRecoveryEnabled
+	settingsCodexQuotaRecoveryInterval
+	settingsSave
+)
+
 type Model struct {
 	ctx        context.Context
 	db         *store.DB
@@ -113,6 +127,12 @@ type Model struct {
 	claudeQuotaRetryAt   map[string]time.Time
 	providerQuotaErr     error
 	providerQuotaLoading bool
+	quotaRecoveryResults chan app.CodexQuotaRecoveryResult
+	quotaRecovery        codexQuotaRecoveryConfigurator
+}
+
+type codexQuotaRecoveryConfigurator interface {
+	Configure(bool, time.Duration)
 }
 
 func New(ctx context.Context, db *store.DB, logger *app.RingLogger, server *app.ServerController, settings store.Settings) Model {
@@ -151,23 +171,24 @@ func NewWithDataDir(ctx context.Context, db *store.DB, logger *app.RingLogger, s
 	customAPIKey.Width = 60
 	customAPIKey.EchoMode = textinput.EchoPassword
 	return Model{
-		ctx:                ctx,
-		db:                 db,
-		logger:             logger,
-		server:             server,
-		settings:           settings,
-		screen:             screenHome,
-		dataDir:            dataDir,
-		providerNameInput:  nameInput,
-		callbackInput:      cb,
-		aliasInput:         aliasInput,
-		settingInput:       settingInput,
-		logFilter:          "all",
-		claudeQuotaRetryAt: make(map[string]time.Time),
-		customNameInput:    customName,
-		customPrefixInput:  customPrefix,
-		customBaseURLInput: customBaseURL,
-		customAPIKeyInput:  customAPIKey,
+		ctx:                  ctx,
+		db:                   db,
+		logger:               logger,
+		server:               server,
+		settings:             settings,
+		screen:               screenHome,
+		dataDir:              dataDir,
+		providerNameInput:    nameInput,
+		callbackInput:        cb,
+		aliasInput:           aliasInput,
+		settingInput:         settingInput,
+		logFilter:            "all",
+		claudeQuotaRetryAt:   make(map[string]time.Time),
+		quotaRecoveryResults: make(chan app.CodexQuotaRecoveryResult, 16),
+		customNameInput:      customName,
+		customPrefixInput:    customPrefix,
+		customBaseURLInput:   customBaseURL,
+		customAPIKeyInput:    customAPIKey,
 	}
 }
 
@@ -179,7 +200,7 @@ func (m Model) Init() tea.Cmd {
 	if m.db == nil {
 		return nil
 	}
-	return tea.Batch(m.loadProvidersCmd(), m.loadKeysCmd())
+	return tea.Batch(m.loadProvidersCmd(), m.loadKeysCmd(), m.waitCodexQuotaRecoveryCmd())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -286,6 +307,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case providerQuotaDoneMsg:
 		m.providerQuotaLoading = false
+		m.reloadCachedAccount(msg.accountID)
 		if msg.err != nil {
 			m.providerQuotaErr = msg.err
 		} else if msg.claude != nil {
@@ -307,6 +329,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.claudeQuota = nil
 			m.providerQuotaErr = nil
 		}
+	case codexQuotaRecoveryMsg:
+		// The scheduler runs independently, but all Bubble Tea model mutation
+		// stays on this Update path. Reloading from SQLite also captures the
+		// ProviderService.Quota cooldown/failure-state transition atomically.
+		m.reloadCachedAccount(msg.result.AccountID)
+		if msg.result.Err == nil && m.selectedCodexAccount(msg.result.AccountID) {
+			quota := msg.result.Info
+			m.providerQuota = &quota
+			m.claudeQuota = nil
+			m.providerQuotaErr = nil
+		}
+		return m, m.waitCodexQuotaRecoveryCmd()
 	case loadProvidersMsg:
 		if msg.seq != m.providerLoadSeq || msg.provider != m.selectedProvider {
 			break
@@ -971,7 +1005,7 @@ func (m Model) activateProviderDetail() (tea.Model, tea.Cmd) {
 		}
 		return m, func() tea.Msg {
 			info, err := (app.ProviderService{DB: m.db, Logger: m.logger}).Quota(m.ctx, account)
-			return providerQuotaDoneMsg{info: info, err: err}
+			return providerQuotaDoneMsg{accountID: account.ID, info: info, err: err}
 		}
 	case detailRefresh:
 		refreshed, err := (app.ProviderService{DB: m.db}).Refresh(m.ctx, account.ID)
@@ -1123,24 +1157,44 @@ func (m Model) activateServer() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) activateSettings() (tea.Model, tea.Cmd) {
-	if m.selected == 0 {
+	if m.selected == settingsBack {
 		return m.back(), nil
 	}
 	switch m.selected {
-	case 1, 2, 5, 6, 7:
+	case settingsHost, settingsPort, settingsBodyLogLimit, settingsDefaultModel, settingsUpstreamTimeout:
 		m.settingSelected = m.selected
 		m.settingInput.SetValue(m.settingValue(m.selected))
 		m.settingInput.Focus()
 		m.settingEditing = true
 		return m, textinput.Blink
-	case 3:
+	case settingsLogRequests:
 		m.settings.LogRequests = !m.settings.LogRequests
-	case 4:
+	case settingsLogUpstream:
 		m.settings.LogUpstream = !m.settings.LogUpstream
-	case 8:
+	case settingsCodexQuotaRecoveryEnabled:
+		m.settings.CodexQuotaRecoveryEnabled = !m.settings.CodexQuotaRecoveryEnabled
+	case settingsCodexQuotaRecoveryInterval:
+		m.settings.CodexQuotaRecoveryIntervalSeconds = nextCodexQuotaRecoveryInterval(m.settings.CodexQuotaRecoveryIntervalSeconds)
+	case settingsSave:
+		if m.db == nil {
+			m.statusLine = "Error: settings store is unavailable"
+			return m, nil
+		}
 		if err := m.db.SaveSettings(m.ctx, m.settings); err != nil {
 			m.statusLine = "Error: " + err.Error()
 		} else {
+			saved, err := m.db.GetSettings(m.ctx)
+			if err != nil {
+				m.statusLine = "Error: " + err.Error()
+				return m, nil
+			}
+			m.settings = saved
+			if m.quotaRecovery != nil {
+				m.quotaRecovery.Configure(
+					saved.CodexQuotaRecoveryEnabled,
+					time.Duration(saved.CodexQuotaRecoveryIntervalSeconds)*time.Second,
+				)
+			}
 			m.statusLine = "Success: settings saved"
 		}
 	}
@@ -1262,7 +1316,7 @@ func (m Model) itemCount() int {
 	case screenServer:
 		return 3
 	case screenSettings:
-		return 9
+		return settingsSave + 1
 	case screenLogs:
 		return 3
 	case screenCodexConfig:
@@ -1302,28 +1356,71 @@ func (m Model) loadKeysCmd() tea.Cmd {
 	}
 }
 
+func (m Model) waitCodexQuotaRecoveryCmd() tea.Cmd {
+	return func() tea.Msg {
+		return waitCodexQuotaRecovery(m.ctx, m.quotaRecoveryResults)
+	}
+}
+
+func (m Model) selectedCodexAccount(accountID string) bool {
+	return m.selectedAccount >= 0 && m.selectedAccount < len(m.accounts) &&
+		m.accounts[m.selectedAccount].ID == accountID &&
+		m.accounts[m.selectedAccount].Provider == store.ProviderOpenAICodex
+}
+
+func waitCodexQuotaRecovery(ctx context.Context, results <-chan app.CodexQuotaRecoveryResult) tea.Msg {
+	if ctx == nil || results == nil {
+		return nil
+	}
+	select {
+	case result := <-results:
+		return codexQuotaRecoveryMsg{result: result}
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+// reloadCachedAccount refreshes the current list by stable account ID instead
+// of a selected index, which can point at a different row after a list reload.
+// A failed reload intentionally leaves the cached fields untouched.
+func (m *Model) reloadCachedAccount(accountID string) {
+	if m.db == nil || accountID == "" {
+		return
+	}
+	account, err := m.db.MustGetAccount(m.ctx, accountID)
+	if err != nil {
+		return
+	}
+	for i := range m.accounts {
+		if m.accounts[i].ID == accountID {
+			m.accounts[i] = account
+			return
+		}
+	}
+}
+
 func (m *Model) applySettingInput() {
 	value := strings.TrimSpace(m.settingInput.Value())
 	switch m.settingSelected {
-	case 1:
+	case settingsHost:
 		if value != "" {
 			m.settings.Host = value
 		}
-	case 2:
+	case settingsPort:
 		var port int
 		if _, err := fmt.Sscanf(value, "%d", &port); err == nil && port > 0 {
 			m.settings.Port = port
 		}
-	case 5:
+	case settingsBodyLogLimit:
 		var limit int
 		if _, err := fmt.Sscanf(value, "%d", &limit); err == nil && limit > 0 {
 			m.settings.LogBodyLimit = limit
 		}
-	case 6:
+	case settingsDefaultModel:
 		if value != "" {
 			m.settings.DefaultModel = value
 		}
-	case 7:
+	case settingsUpstreamTimeout:
 		var t int
 		if _, err := fmt.Sscanf(value, "%d", &t); err == nil && t > 0 {
 			m.settings.UpstreamTimeoutSeconds = t
@@ -1333,15 +1430,15 @@ func (m *Model) applySettingInput() {
 
 func (m Model) settingValue(selected int) string {
 	switch selected {
-	case 1:
+	case settingsHost:
 		return m.settings.Host
-	case 2:
+	case settingsPort:
 		return fmt.Sprintf("%d", m.settings.Port)
-	case 5:
+	case settingsBodyLogLimit:
 		return fmt.Sprintf("%d", m.settings.LogBodyLimit)
-	case 6:
+	case settingsDefaultModel:
 		return m.settings.DefaultModel
-	case 7:
+	case settingsUpstreamTimeout:
 		return fmt.Sprintf("%d", m.settings.UpstreamTimeoutSeconds)
 	default:
 		return ""
@@ -1701,10 +1798,7 @@ func (m Model) viewProviderDetail() string {
 		}
 	case m.providerQuota != nil:
 		if m.providerQuota.Primary == nil && m.providerQuota.Secondary == nil {
-			lines = append(lines, "Quota:      no data (no x-codex-*-used-percent header)")
-			if keys := m.providerQuota.HeaderKeys; len(keys) > 0 {
-				lines = append(lines, "            x-* headers seen: "+strings.Join(keys, ", "))
-			}
+			lines = append(lines, "Quota:      no usage windows returned")
 		} else {
 			if s := codex.FormatQuotaWindow(m.providerQuota.Primary); s != "" {
 				lines = append(lines, "Quota:      "+s)
@@ -1799,12 +1893,31 @@ func (m Model) viewSettings() string {
 		fmt.Sprintf("Body log limit: %d", m.settings.LogBodyLimit),
 		"Default model: " + m.settings.DefaultModel,
 		fmt.Sprintf("Upstream timeout (s): %d", m.settings.UpstreamTimeoutSeconds),
+		fmt.Sprintf("Codex quota recovery: %t", m.settings.CodexQuotaRecoveryEnabled),
+		"Codex recovery interval: " + formatCodexQuotaRecoveryInterval(m.settings.CodexQuotaRecoveryIntervalSeconds),
 		"Save",
 	}
 	if m.settingEditing {
 		values[m.settingSelected] = strings.Split(values[m.settingSelected], ":")[0] + ": " + m.settingInput.View()
 	}
 	return strings.Join(renderMenu(m.selected, values), "\n")
+}
+
+func nextCodexQuotaRecoveryInterval(current int) int {
+	intervals := store.ValidCodexQuotaRecoveryIntervals()
+	for i, interval := range intervals {
+		if interval == current {
+			return intervals[(i+1)%len(intervals)]
+		}
+	}
+	return intervals[0]
+}
+
+func formatCodexQuotaRecoveryInterval(seconds int) string {
+	if seconds%60 == 0 {
+		return fmt.Sprintf("%dm", seconds/60)
+	}
+	return fmt.Sprintf("%ds", seconds)
 }
 
 func (m Model) viewLogs() string {
@@ -1934,6 +2047,10 @@ type providerQuotaDoneMsg struct {
 	info      codex.QuotaInfo
 	claude    *anthropic.UsageInfo
 	err       error
+}
+
+type codexQuotaRecoveryMsg struct {
+	result app.CodexQuotaRecoveryResult
 }
 
 type reauthDoneMsg struct {

@@ -81,15 +81,19 @@ export function ListKeys(): $CancellablePromise<$models.KeyVM[]> {
     });
 }
 
-export function Logs(filter: string): $CancellablePromise<$models.LogVM[]> {
-    return $Call.ByName("main.App.Logs", filter).then(($result: any) => {
-        return $$createType8($result);
+export function LogText(id: number): $CancellablePromise<string> {
+    return $Call.ByName("main.App.LogText", id);
+}
+
+export function Logs(query: $models.LogQueryVM): $CancellablePromise<$models.LogPageVM> {
+    return $Call.ByName("main.App.Logs", query).then(($result: any) => {
+        return $$createType7($result);
     });
 }
 
 export function Quota(id: string): $CancellablePromise<$models.QuotaVM> {
     return $Call.ByName("main.App.Quota", id).then(($result: any) => {
-        return $$createType9($result);
+        return $$createType8($result);
     });
 }
 
@@ -109,7 +113,7 @@ export function Reorder(id: string, delta: number): $CancellablePromise<void> {
 
 export function RestartServer(): $CancellablePromise<$models.ServerStatusVM> {
     return $Call.ByName("main.App.RestartServer").then(($result: any) => {
-        return $$createType10($result);
+        return $$createType9($result);
     });
 }
 
@@ -121,7 +125,7 @@ export function SaveSettings(settings: $models.SettingsVM): $CancellablePromise<
 
 export function ServerStatus(): $CancellablePromise<$models.ServerStatusVM> {
     return $Call.ByName("main.App.ServerStatus").then(($result: any) => {
-        return $$createType10($result);
+        return $$createType9($result);
     });
 }
 
@@ -131,13 +135,13 @@ export function SetEnabled(id: string, enabled: boolean): $CancellablePromise<vo
 
 export function StartServer(): $CancellablePromise<$models.ServerStatusVM> {
     return $Call.ByName("main.App.StartServer").then(($result: any) => {
-        return $$createType10($result);
+        return $$createType9($result);
     });
 }
 
 export function StopServer(): $CancellablePromise<$models.ServerStatusVM> {
     return $Call.ByName("main.App.StopServer").then(($result: any) => {
-        return $$createType10($result);
+        return $$createType9($result);
     });
 }
 
@@ -149,7 +153,7 @@ export function SubmitCallback(sessionID: string, name: string, callbackURL: str
 
 export function TestConnection(id: string, model: string): $CancellablePromise<$models.ProviderTestVM> {
     return $Call.ByName("main.App.TestConnection", id, model).then(($result: any) => {
-        return $$createType11($result);
+        return $$createType10($result);
     });
 }
 
@@ -171,8 +175,7 @@ const $$createType3 = $models.SettingsVM.createFrom;
 const $$createType4 = $Create.Array($$createType0);
 const $$createType5 = $models.KeyVM.createFrom;
 const $$createType6 = $Create.Array($$createType5);
-const $$createType7 = $models.LogVM.createFrom;
-const $$createType8 = $Create.Array($$createType7);
-const $$createType9 = $models.QuotaVM.createFrom;
-const $$createType10 = $models.ServerStatusVM.createFrom;
-const $$createType11 = $models.ProviderTestVM.createFrom;
+const $$createType7 = $models.LogPageVM.createFrom;
+const $$createType8 = $models.QuotaVM.createFrom;
+const $$createType9 = $models.ServerStatusVM.createFrom;
+const $$createType10 = $models.ProviderTestVM.createFrom;

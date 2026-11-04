@@ -24,6 +24,7 @@ import type {
   ConnectionActivity,
   ConnectionQuota,
   ConnectionQuotaEvent,
+  ConnectionQuotaPart,
   CustomProviderInput,
   OAuthSession,
   Provider,
@@ -33,6 +34,62 @@ import type {
 } from '../types'
 import { errorText } from '../utils'
 import { useConfirmDialog } from './useConfirmDialog'
+
+const connectionQuotaStates = new Set<ConnectionQuota['state']>([
+  'unknown', 'loading', 'available', 'unavailable', 'error',
+])
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object'
+}
+
+function isConnectionQuotaState(value: unknown): value is ConnectionQuota['state'] {
+  return typeof value === 'string' && connectionQuotaStates.has(value as ConnectionQuota['state'])
+}
+
+function isConnectionStatus(value: unknown): value is Connection['status'] {
+  return value === 'Active' || value === 'Cooldown' || value === 'Needs re-auth' || value === 'Disabled'
+}
+
+function normalizeConnectionQuotaPart(value: unknown): ConnectionQuotaPart | null {
+  if (!isRecord(value)
+    || typeof value.label !== 'string'
+    || typeof value.utilization !== 'number'
+    || typeof value.critical !== 'boolean'
+    || typeof value.resetsAt !== 'string') {
+    return null
+  }
+  return {
+    label: value.label,
+    utilization: value.utilization,
+    critical: value.critical,
+    resetsAt: value.resetsAt,
+  }
+}
+
+function normalizeConnectionQuota(value: unknown): ConnectionQuota {
+  const quota = isRecord(value) ? value : {}
+  return {
+    state: isConnectionQuotaState(quota.state) ? quota.state : 'unknown',
+    summary: typeof quota.summary === 'string' ? quota.summary : '',
+    fetchedAt: typeof quota.fetchedAt === 'string' ? quota.fetchedAt : '',
+    windows: Array.isArray(quota.windows)
+      ? quota.windows.map(normalizeConnectionQuotaPart).filter((part): part is ConnectionQuotaPart => part !== null)
+      : [],
+  }
+}
+
+function normalizeConnectionQuotaEvent(value: unknown): ConnectionQuotaEvent | null {
+  if (!isRecord(value) || typeof value.id !== 'string' || !isRecord(value.quota)) return null
+  const event: ConnectionQuotaEvent = {
+    id: value.id,
+    quota: normalizeConnectionQuota(value.quota),
+  }
+  if (isConnectionStatus(value.status)) event.status = value.status
+  if (typeof value.cooldownUntil === 'string') event.cooldownUntil = value.cooldownUntil
+  if (typeof value.consecutiveFailures === 'number') event.consecutiveFailures = value.consecutiveFailures
+  return event
+}
 
 export function useConnections() {
   const activeProvider = ref<Provider>('openai-codex')
@@ -70,10 +127,6 @@ export function useConnections() {
   const providerInfo = computed(() => providers.find((provider) => provider.id === activeProvider.value)!)
   const detailBusy = computed(() => busy.value || quotaBusyIDs.value.has(selectedID.value))
 
-  function isConnectionStatus(value: unknown): value is Connection['status'] {
-    return value === 'Active' || value === 'Cooldown' || value === 'Needs re-auth' || value === 'Disabled'
-  }
-
   watch(selectedConnection, () => {
     testResult.value = null
     quotaResult.value = null
@@ -92,7 +145,7 @@ export function useConnections() {
       connections.value = loaded.map((connection) => ({
         ...connection,
         requesting: requestingByID.get(connection.id) ?? connection.requesting,
-        quota: quotaByID.get(connection.id) ?? connection.quota,
+        quota: quotaByID.get(connection.id) ?? normalizeConnectionQuota(connection.quota),
       }))
       if (!connections.value.some((connection) => connection.id === selectedID.value)) {
         selectedID.value = connections.value[0]?.id ?? ''
@@ -345,8 +398,8 @@ export function useConnections() {
       if (connection) connection.requesting = activity.requesting
     })
     stopQuotaListener = Events.On('connection-quota', (event) => {
-      const update = event.data as ConnectionQuotaEvent
-      if (!update || typeof update.id !== 'string' || !update.quota || typeof update.quota.summary !== 'string') return
+      const update = normalizeConnectionQuotaEvent(event.data)
+      if (!update) return
       quotaByID.set(update.id, update.quota)
       const connection = connections.value.find((item) => item.id === update.id)
       if (connection) {

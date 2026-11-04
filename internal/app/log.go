@@ -14,6 +14,7 @@ type Logger interface {
 }
 
 type LogEntry struct {
+	ID      uint64
 	Time    time.Time
 	Source  string
 	Message string
@@ -23,6 +24,7 @@ type RingLogger struct {
 	mu      sync.Mutex
 	limit   int
 	entries []LogEntry
+	nextID  uint64
 	stdout  io.Writer
 }
 
@@ -38,9 +40,10 @@ func (l *RingLogger) Printf(format string, args ...any) {
 		return
 	}
 	msg := redactSecrets(fmt.Sprintf(format, args...))
-	entry := LogEntry{Time: time.Now(), Source: detectSource(msg), Message: msg}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.nextID++
+	entry := LogEntry{ID: l.nextID, Time: time.Now(), Source: detectSource(msg), Message: msg}
 	if len(l.entries) == l.limit {
 		copy(l.entries, l.entries[1:])
 		l.entries[len(l.entries)-1] = entry
@@ -68,6 +71,20 @@ func (l *RingLogger) Entries() []LogEntry {
 	out := make([]LogEntry, len(l.entries))
 	copy(out, l.entries)
 	return out
+}
+
+func (l *RingLogger) Entry(id uint64) (LogEntry, bool) {
+	if l == nil || id == 0 {
+		return LogEntry{}, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, entry := range l.entries {
+		if entry.ID == id {
+			return entry, true
+		}
+	}
+	return LogEntry{}, false
 }
 
 func (l *RingLogger) Clear() {

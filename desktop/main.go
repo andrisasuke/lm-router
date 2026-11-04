@@ -15,8 +15,11 @@ import (
 //go:embed build/appicon.png
 var appIcon []byte
 
-//go:embed build/trayicon.png
-var trayIcon []byte
+//go:embed build/tray-idle.png
+var trayIdleIcon []byte
+
+//go:embed build/tray-running.png
+var trayRunningIcon []byte
 
 func main() {
 	profile, err := loadDesktopProfile()
@@ -61,7 +64,7 @@ func main() {
 			Appearance: application.NSAppearanceNameDarkAqua,
 		},
 	})
-	tray := newTrayController(app, desktop, mainWindow, profile, trayIcon, appIcon)
+	tray := newTrayController(app, desktop, mainWindow, profile, trayIdleIcon, trayRunningIcon)
 	mainWindow.RegisterHook(events.Common.WindowClosing, func(event *application.WindowEvent) {
 		if !tray.isEnabled() {
 			app.Quit()

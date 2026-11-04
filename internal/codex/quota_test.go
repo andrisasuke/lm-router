@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -107,6 +108,111 @@ func TestParseQuotaHeaders_collectsXHeaderKeysWhenQuotaMissing(t *testing.T) {
 	want := []string{"x-ratelimit-limit", "x-request-id"}
 	if !slices.Equal(info.HeaderKeys, want) {
 		t.Errorf("HeaderKeys: got %v, want %v", info.HeaderKeys, want)
+	}
+}
+
+func TestParseQuotaUsage(t *testing.T) {
+	now := time.Date(2026, 5, 12, 10, 0, 0, 0, time.UTC)
+	info, err := ParseQuotaUsage(strings.NewReader(`{
+		"rate_limit": {
+			"primary_window": {
+				"used_percent": 40,
+				"limit_window_seconds": 18000,
+				"reset_after_seconds": 3600,
+				"reset_at": 1770000000
+			},
+			"secondary_window": {
+				"used_percent": 25,
+				"limit_window_seconds": 604800,
+				"reset_after_seconds": 86400,
+				"reset_at": 1770086400
+			}
+		}
+	}`), now)
+	if err != nil {
+		t.Fatalf("parse usage: %v", err)
+	}
+	if !info.FetchedAt.Equal(now) || info.Primary == nil || info.Secondary == nil {
+		t.Fatalf("info=%+v", info)
+	}
+	if got := info.Primary; got.UsedPercent != 40 || got.WindowMinutes != 300 || got.ResetAfterSecs != 3600 || got.ResetAt.Unix() != 1770000000 {
+		t.Fatalf("primary=%+v", got)
+	}
+	if got := info.Secondary; got.UsedPercent != 25 || got.WindowMinutes != 10080 || got.ResetAfterSecs != 86400 || got.ResetAt.Unix() != 1770086400 {
+		t.Fatalf("secondary=%+v", got)
+	}
+}
+
+func TestParseQuotaUsageAllowsNullOrMissingWindows(t *testing.T) {
+	now := time.Date(2026, 5, 12, 10, 0, 0, 0, time.UTC)
+	for _, payload := range []string{
+		`{}`,
+		`{"rate_limit":{"primary_window":null,"secondary_window":null}}`,
+		`{"rate_limit":{"primary_window":null}}`,
+	} {
+		info, err := ParseQuotaUsage(strings.NewReader(payload), now)
+		if err != nil {
+			t.Fatalf("parse %s: %v", payload, err)
+		}
+		if !info.FetchedAt.Equal(now) || info.Primary != nil || info.Secondary != nil {
+			t.Fatalf("payload=%s info=%+v", payload, info)
+		}
+	}
+}
+
+func TestParseQuotaUsageRequiresValidUsedPercent(t *testing.T) {
+	now := time.Date(2026, 5, 12, 10, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name          string
+		payload       string
+		wantPrimary   bool
+		wantSecondary bool
+	}{
+		{
+			name:    "both windows missing used percent",
+			payload: `{"rate_limit":{"primary_window":{"limit_window_seconds":18000},"secondary_window":{"limit_window_seconds":604800}}}`,
+		},
+		{
+			name:    "both windows null used percent",
+			payload: `{"rate_limit":{"primary_window":{"used_percent":null},"secondary_window":{"used_percent":null}}}`,
+		},
+		{
+			name:          "partial payload",
+			payload:       `{"rate_limit":{"primary_window":{"used_percent":0},"secondary_window":{"reset_after_seconds":60}}}`,
+			wantPrimary:   true,
+			wantSecondary: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			info, err := ParseQuotaUsage(strings.NewReader(test.payload), now)
+			if err != nil {
+				t.Fatalf("parse usage: %v", err)
+			}
+			if (info.Primary != nil) != test.wantPrimary || (info.Secondary != nil) != test.wantSecondary {
+				t.Fatalf("info=%+v, want primary=%t secondary=%t", info, test.wantPrimary, test.wantSecondary)
+			}
+			if quotaWindowsRecovered(info) {
+				t.Fatal("incomplete quota data must not count as recovered")
+			}
+		})
+	}
+}
+
+func TestParseQuotaUsagePreservesPercentBelowExhaustion(t *testing.T) {
+	info, err := ParseQuotaUsage(strings.NewReader(`{
+		"rate_limit": {
+			"primary_window": {"used_percent": 99.9},
+			"secondary_window": {"used_percent": 0}
+		}
+	}`), time.Now())
+	if err != nil {
+		t.Fatalf("parse usage: %v", err)
+	}
+	if info.Primary == nil || info.Primary.UsedPercent != 99.9 {
+		t.Fatalf("primary=%+v", info.Primary)
+	}
+	if _, exhausted := QuotaCooldownUntil(info); exhausted {
+		t.Fatal("quota below 100% must not enter cooldown")
 	}
 }
 

@@ -3,10 +3,14 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	appsvc "github.com/andrisasuke/lm-router/internal/app"
 	"github.com/andrisasuke/lm-router/internal/codex"
@@ -45,6 +49,101 @@ func TestConnectionViewIncludesCurrentRequestActivity(t *testing.T) {
 	}
 }
 
+func TestConnectionQuotaVMPayloadsUseEmptyWindowsArraysWithoutQuotaData(t *testing.T) {
+	tests := []struct {
+		name  string
+		state codexQuotaState
+		want  string
+	}{
+		{name: "unknown", want: quotaStateUnknown},
+		{name: "loading", state: codexQuotaState{Loading: true}, want: quotaStateLoading},
+		{name: "error", state: codexQuotaState{Error: "offline"}, want: quotaStateError},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload, err := json.Marshal(ConnectionQuotaEventVM{
+				ID:    "account",
+				Quota: connectionQuotaVM(test.state),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var event struct {
+				Quota struct {
+					State   string          `json:"state"`
+					Windows json.RawMessage `json:"windows"`
+				} `json:"quota"`
+			}
+			if err := json.Unmarshal(payload, &event); err != nil {
+				t.Fatal(err)
+			}
+			if event.Quota.State != test.want || string(event.Quota.Windows) != "[]" {
+				t.Fatalf("quota event=%s", payload)
+			}
+		})
+	}
+}
+
+func TestConnectionVMPayloadUsesEmptyQuotaWindowsArray(t *testing.T) {
+	payload, err := json.Marshal([]ConnectionVM{connectionVM(store.Account{
+		ID: "custom", Provider: store.ProviderCustom,
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var connections []struct {
+		Quota struct {
+			Windows json.RawMessage `json:"windows"`
+		} `json:"quota"`
+	}
+	if err := json.Unmarshal(payload, &connections); err != nil {
+		t.Fatal(err)
+	}
+	if len(connections) != 1 || string(connections[0].Quota.Windows) != "[]" {
+		t.Fatalf("connections=%s", payload)
+	}
+}
+
+func TestConnectionViewPayloadUsesEmptyQuotaWindowsArrayForDefaultAndReauth(t *testing.T) {
+	application := &App{}
+	tests := []struct {
+		name    string
+		account store.Account
+		want    string
+	}{
+		{
+			name:    "default",
+			account: store.Account{ID: "default", Provider: store.ProviderOpenAICodex},
+			want:    quotaStateUnknown,
+		},
+		{
+			name:    "reauth",
+			account: store.Account{ID: "reauth", Provider: store.ProviderOpenAICodex, NeedsReauth: true},
+			want:    quotaStateUnavailable,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload, err := json.Marshal(application.connectionView(test.account))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var connection struct {
+				Quota struct {
+					State   string          `json:"state"`
+					Windows json.RawMessage `json:"windows"`
+				} `json:"quota"`
+			}
+			if err := json.Unmarshal(payload, &connection); err != nil {
+				t.Fatal(err)
+			}
+			if connection.Quota.State != test.want || string(connection.Quota.Windows) != "[]" {
+				t.Fatalf("connection=%s", payload)
+			}
+		})
+	}
+}
+
 func TestKeyVMOnlyExposesPrefix(t *testing.T) {
 	key := store.APIKey{ID: "key", Name: "local", Prefix: "sk-lm-router-abc", Secret: "full-secret", CreatedAt: time.Now()}
 	payload, err := json.Marshal(keyVM(key))
@@ -79,6 +178,84 @@ func TestSettingsVMPreservesTrayPreference(t *testing.T) {
 	}
 }
 
+func TestSettingsVMRoundTripsCodexQuotaRecovery(t *testing.T) {
+	settings := store.DefaultSettings()
+	settings.CodexQuotaRecoveryEnabled = false
+	settings.CodexQuotaRecoveryIntervalSeconds = 300
+
+	view := settingsVM(settings)
+	got := view.storeSettings()
+	if got.CodexQuotaRecoveryEnabled || got.CodexQuotaRecoveryIntervalSeconds != 300 {
+		t.Fatalf("quota recovery preference was lost: %+v", got)
+	}
+}
+
+func TestSaveSettingsConfiguresCodexQuotaRecovery(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	scheduler := appsvc.NewCodexQuotaRecoveryScheduler(db, appsvc.ProviderService{DB: db})
+	now := time.Now().UTC()
+	if err := db.UpsertAccount(ctx, store.Account{
+		ID: "due", Provider: store.ProviderOpenAICodex, Name: "due", Priority: 1, Enabled: true,
+		CooldownUntil: sql.NullTime{Time: now.Add(-time.Second), Valid: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	scheduler.Now = func() time.Time { return now }
+	scheduler.Quota = func(context.Context, store.Account) (codex.QuotaInfo, error) {
+		calls.Add(1)
+		return codex.QuotaInfo{}, nil
+	}
+	application := &App{
+		ctx:                ctx,
+		db:                 db,
+		controller:         appsvc.NewServerController(appsvc.ServerControllerConfig{}),
+		profile:            desktopProfile{},
+		codexQuotaRecovery: scheduler,
+	}
+	if _, err := application.SaveSettings(SettingsVM{
+		CodexQuotaRecoveryEnabled:         false,
+		CodexQuotaRecoveryIntervalSeconds: 300,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		scheduler.Run(runCtx)
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("disabled SaveSettings still allowed recovery calls=%d", got)
+	}
+	if _, err := application.SaveSettings(SettingsVM{
+		CodexQuotaRecoveryEnabled:         true,
+		CodexQuotaRecoveryIntervalSeconds: 5,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not stop")
+	}
+	if calls.Load() == 0 {
+		t.Fatal("runtime SaveSettings did not re-enable quota recovery")
+	}
+}
+
 func TestCodexQuotaVMUsesHumanReadableWindowNames(t *testing.T) {
 	quota := codexQuotaVM(codex.QuotaInfo{
 		Primary:   &codex.QuotaWindow{WindowMinutes: 300, UsedPercent: 15},
@@ -89,6 +266,13 @@ func TestCodexQuotaVMUsesHumanReadableWindowNames(t *testing.T) {
 	}
 	if quota.Windows[0].Name != "5h" || quota.Windows[1].Name != "weekly" {
 		t.Fatalf("unexpected quota window names: %+v", quota.Windows)
+	}
+}
+
+func TestCodexQuotaVMEmptyUsagePayload(t *testing.T) {
+	quota := codexQuotaVM(codex.QuotaInfo{FetchedAt: time.Now()})
+	if quota.Available || quota.Message != "No usage windows returned" || len(quota.Windows) != 0 {
+		t.Fatalf("quota=%+v", quota)
 	}
 }
 
@@ -122,5 +306,71 @@ func TestConnectionQuotaVMMarksOnlyWindowsAboveNinetyPercentCritical(t *testing.
 	}
 	if !view.Windows[1].Critical {
 		t.Fatal("values above 90% must be critical")
+	}
+}
+
+func TestLogPageVMReturnsBoundedIncrementalPages(t *testing.T) {
+	entries := make([]appsvc.LogEntry, 0, 150)
+	for i := 1; i <= 150; i++ {
+		source := "app"
+		if i%2 == 0 {
+			source = "proxy"
+		}
+		entries = append(entries, appsvc.LogEntry{ID: uint64(i), Time: time.Unix(int64(i), 0), Source: source, Message: "entry"})
+	}
+
+	initial := logPageVM(entries, LogQueryVM{Filter: "all", Limit: 100})
+	if !initial.Reset || len(initial.Entries) != 100 || initial.Entries[0].ID != 51 || initial.LatestID != 150 || !initial.HasOlder {
+		t.Fatalf("initial page=%+v", initial)
+	}
+
+	incremental := logPageVM(entries, LogQueryVM{Filter: "proxy", AfterID: 140, Limit: 100})
+	if incremental.Reset || len(incremental.Entries) != 5 || incremental.Entries[0].ID != 142 || incremental.Entries[4].ID != 150 {
+		t.Fatalf("incremental page=%+v", incremental)
+	}
+
+	older := logPageVM(entries, LogQueryVM{Filter: "all", BeforeID: 51, Limit: 25})
+	if older.Reset || len(older.Entries) != 25 || older.Entries[0].ID != 26 || older.Entries[24].ID != 50 || !older.HasOlder {
+		t.Fatalf("older page=%+v", older)
+	}
+}
+
+func TestLogPageVMResetsAfterRingRolloverAndTruncatesPreview(t *testing.T) {
+	message := strings.Repeat("界", 2000)
+	entries := []appsvc.LogEntry{
+		{ID: 501, Time: time.Now(), Source: "app", Message: message},
+		{ID: 502, Time: time.Now(), Source: "proxy", Message: "latest"},
+	}
+	page := logPageVM(entries, LogQueryVM{Filter: "all", AfterID: 10, Limit: 100})
+	if !page.Reset || len(page.Entries) != 2 || !page.Entries[0].Truncated {
+		t.Fatalf("rollover page=%+v", page)
+	}
+	if !strings.HasSuffix(page.Entries[0].Message, "…") || !utf8.ValidString(page.Entries[0].Message) {
+		t.Fatalf("invalid preview=%q", page.Entries[0].Message)
+	}
+}
+
+func TestLogPageVMBoundsLargeRingPayload(t *testing.T) {
+	entries := make([]appsvc.LogEntry, 0, 500)
+	message := strings.Repeat("x", 64*1024)
+	for i := 1; i <= 500; i++ {
+		entries = append(entries, appsvc.LogEntry{
+			ID: uint64(i), Time: time.Unix(int64(i), 0), Source: "openai", Message: message,
+		})
+	}
+	page := logPageVM(entries, LogQueryVM{Filter: "all", Limit: 100})
+	if len(page.Entries) != 100 {
+		t.Fatalf("page entries=%d, want 100", len(page.Entries))
+	}
+	payload, err := json.Marshal(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) > 500*1024 {
+		t.Fatalf("bounded page payload=%d bytes", len(payload))
+	}
+	unchanged := logPageVM(entries, LogQueryVM{Filter: "all", AfterID: 500, Limit: 100})
+	if len(unchanged.Entries) != 0 || unchanged.LatestID != 500 {
+		t.Fatalf("unchanged poll=%+v", unchanged)
 	}
 }

@@ -8,14 +8,13 @@ import (
 	"sync"
 	"time"
 
+	appsvc "github.com/andrisasuke/lm-router/internal/app"
 	"github.com/andrisasuke/lm-router/internal/codex"
 	"github.com/andrisasuke/lm-router/internal/store"
 )
 
 const (
-	codexQuotaWorkers            = 2
-	codexQuotaResetPollInterval  = 5 * time.Second
-	codexQuotaResetRetryInterval = time.Minute
+	codexQuotaWorkers = appsvc.CodexQuotaRecoveryWorkers
 )
 
 type codexQuotaState struct {
@@ -62,7 +61,6 @@ func (t *codexQuotaTracker) Begin(accountID string) (*codexQuotaFlight, bool) {
 	}
 	flight := &codexQuotaFlight{done: make(chan struct{})}
 	state.Loading = true
-	state.Error = ""
 	state.flight = flight
 	t.states[accountID] = state
 	view := cloneCodexQuotaState(state)
@@ -92,9 +90,7 @@ func (t *codexQuotaTracker) Finish(accountID string, flight *codexQuotaFlight, i
 	state.flight = nil
 	state.Loading = false
 	if err != nil {
-		if !hasCodexQuota(state.Info) {
-			state.Error = err.Error()
-		}
+		state.Error = err.Error()
 	} else {
 		state.Error = ""
 		if hasCodexQuota(info) || !hasCodexQuota(state.Info) {
@@ -142,25 +138,6 @@ func (t *codexQuotaTracker) Snapshot(accountID string) codexQuotaState {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return cloneCodexQuotaState(t.states[accountID])
-}
-
-func (t *codexQuotaTracker) ExhaustedDue(now time.Time) []string {
-	if t == nil {
-		return nil
-	}
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	var result []string
-	for accountID, state := range t.states {
-		if state.Loading {
-			continue
-		}
-		until, exhausted := codex.QuotaCooldownUntil(state.Info)
-		if exhausted && !until.After(now) {
-			result = append(result, accountID)
-		}
-	}
-	return result
 }
 
 func (t *codexQuotaTracker) notify(accountID string, state codexQuotaState) {
@@ -247,43 +224,14 @@ func (a *App) warmCodexQuotas(ctx context.Context) {
 	a.refreshCodexQuotaAccounts(ctx, eligible)
 }
 
-func (a *App) monitorCodexQuotaResets(ctx context.Context) {
-	ticker := time.NewTicker(codexQuotaResetPollInterval)
-	defer ticker.Stop()
-	retryAfter := make(map[string]time.Time)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case now := <-ticker.C:
-			a.refreshDueCodexQuotas(ctx, now, retryAfter)
-		}
+// recoverCodexQuotas delegates persisted cooldown recovery to the shared
+// scheduler. Its quota hook preserves this UI's tracker single-flight: startup
+// warming, manual checks, proxy observations, and recovery all coalesce per
+// account while the underlying fetch remains ProviderService.Quota.
+func (a *App) recoverCodexQuotas(ctx context.Context) {
+	if a.codexQuotaRecovery != nil {
+		a.codexQuotaRecovery.Run(ctx)
 	}
-}
-
-func (a *App) refreshDueCodexQuotas(ctx context.Context, now time.Time, retryAfter map[string]time.Time) {
-	if a.codexQuotas == nil || a.db == nil {
-		return
-	}
-	var accounts []store.Account
-	for _, accountID := range a.codexQuotas.ExhaustedDue(now) {
-		if retryAfter[accountID].After(now) {
-			continue
-		}
-		retryAfter[accountID] = now.Add(codexQuotaResetRetryInterval)
-		account, err := a.db.MustGetAccount(ctx, accountID)
-		if err != nil {
-			if ctx.Err() == nil && a.logger != nil {
-				a.logger.Printf("[quota] load reset account=%s error=%v", accountID, err)
-			}
-			continue
-		}
-		if !account.Enabled || account.NeedsReauth {
-			continue
-		}
-		accounts = append(accounts, account)
-	}
-	a.refreshCodexQuotaAccounts(ctx, accounts)
 }
 
 func (a *App) refreshCodexQuotaAccounts(ctx context.Context, accounts []store.Account) {

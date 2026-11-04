@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -296,7 +297,7 @@ func TestApplyCodexProtocolHeadersUsesSafeFallbacksForMissingMetadata(t *testing
 	}
 }
 
-func TestFetchQuotaUsesGPT55ProbeModel(t *testing.T) {
+func TestFetchQuotaUsesUsageEndpointAndIdentityHeaders(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir())
 	if err != nil {
@@ -312,31 +313,169 @@ func TestFetchQuotaUsesGPT55ProbeModel(t *testing.T) {
 		AccessToken:  "access-token",
 		RefreshToken: "refresh-token",
 		ExpiresAt:    time.Now().Add(time.Hour),
+		MetadataJSON: `{"chatgpt_account_id":"workspace-account"}`,
 	}
 	if err := db.UpsertAccount(ctx, account); err != nil {
 		t.Fatalf("upsert account: %v", err)
 	}
 
-	requestBody := make(chan []byte, 1)
+	type observedRequest struct {
+		method  string
+		path    string
+		auth    string
+		account string
+		body    []byte
+	}
+	requests := make(chan observedRequest, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		requestBody <- body
-		w.Header().Set("x-codex-primary-used-percent", "10")
-		w.WriteHeader(http.StatusOK)
+		requests <- observedRequest{
+			method: r.Method, path: r.URL.Path, auth: r.Header.Get("Authorization"),
+			account: r.Header.Get("ChatGPT-Account-Id"), body: body,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":3600,"reset_at":1770000000},"secondary_window":{"used_percent":20,"limit_window_seconds":604800,"reset_after_seconds":7200,"reset_at":1770003600}}}`))
 	}))
 	defer upstream.Close()
 
-	client := NewClient(upstream.URL, NewTokenManager(db, nil))
-	if _, err := client.FetchQuota(ctx, account); err != nil {
+	client := NewClientWithUsageURL("https://inference.invalid/responses", upstream.URL+"/backend-api/wham/usage", NewTokenManager(db, nil))
+	info, err := client.FetchQuota(ctx, account)
+	if err != nil {
 		t.Fatalf("fetch quota: %v", err)
 	}
-
-	var body map[string]any
-	if err := json.Unmarshal(<-requestBody, &body); err != nil {
-		t.Fatalf("decode request body: %v", err)
+	got := <-requests
+	if got.method != http.MethodGet || got.path != "/backend-api/wham/usage" {
+		t.Fatalf("request=%s %s, want GET /backend-api/wham/usage", got.method, got.path)
 	}
-	if got := body["model"]; got != "gpt-5.5" {
-		t.Errorf("probe model: got %v, want gpt-5.5", got)
+	if got.auth != "Bearer access-token" || got.account != "workspace-account" {
+		t.Fatalf("identity headers auth=%q account=%q", got.auth, got.account)
+	}
+	if len(got.body) != 0 {
+		t.Fatalf("usage request unexpectedly sent a body: %q", got.body)
+	}
+	if info.Primary == nil || info.Primary.WindowMinutes != 300 || info.Primary.UsedPercent != 10 || info.Primary.ResetAfterSecs != 3600 || info.Primary.ResetAt.Unix() != 1770000000 {
+		t.Fatalf("primary=%+v", info.Primary)
+	}
+	if info.Secondary == nil || info.Secondary.WindowMinutes != 10080 || info.Secondary.UsedPercent != 20 || info.Secondary.ResetAfterSecs != 7200 || info.Secondary.ResetAt.Unix() != 1770003600 {
+		t.Fatalf("secondary=%+v", info.Secondary)
+	}
+}
+
+func TestFetchQuotaRetriesOnceAfterAuthFailure(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			ctx := context.Background()
+			db, err := store.Open(ctx, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			account := store.Account{
+				ID: "acct_1", Provider: store.ProviderOpenAICodex, Name: "main", Enabled: true,
+				AccessToken: "old-access", RefreshToken: "refresh-token", ExpiresAt: time.Now().Add(time.Hour),
+				MetadataJSON: `{"chatgpt_account_id":"workspace-account"}`,
+			}
+			if err := db.UpsertAccount(ctx, account); err != nil {
+				t.Fatal(err)
+			}
+			authorizations := make(chan string, 2)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				authorizations <- r.Header.Get("Authorization") + ":" + r.Header.Get("ChatGPT-Account-Id")
+				if r.Header.Get("Authorization") == "Bearer old-access" {
+					w.WriteHeader(status)
+					return
+				}
+				_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":1},"secondary_window":{"used_percent":2}}}`))
+			}))
+			defer upstream.Close()
+			manager := NewTokenManager(db, RefreshFunc(func(context.Context, string) (TokenSet, error) {
+				return TokenSet{AccessToken: "new-access", ExpiresAt: time.Now().Add(time.Hour)}, nil
+			}))
+			client := NewClientWithUsageURL("https://inference.invalid/responses", upstream.URL, manager)
+			if _, err := client.FetchQuota(ctx, account); err != nil {
+				t.Fatalf("fetch quota: %v", err)
+			}
+			if first, second := <-authorizations, <-authorizations; first != "Bearer old-access:workspace-account" || second != "Bearer new-access:workspace-account" {
+				t.Fatalf("authorization retry=%q, %q", first, second)
+			}
+		})
+	}
+}
+
+func TestFetchQuotaHTTPErrorsAreSafe(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusForbidden, http.StatusTooManyRequests, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			ctx := context.Background()
+			db, err := store.Open(ctx, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			account := store.Account{
+				ID: "acct_1", Provider: store.ProviderOpenAICodex, Name: "main", Enabled: true,
+				AccessToken: "access-token", RefreshToken: "refresh-token", ExpiresAt: time.Now().Add(time.Hour),
+			}
+			if err := db.UpsertAccount(ctx, account); err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls++
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{"message":"access-token workspace-account"}`))
+			}))
+			defer upstream.Close()
+
+			client := NewClientWithUsageURL("https://inference.invalid/responses", upstream.URL, NewTokenManager(db, nil))
+			info, err := client.FetchQuota(ctx, account)
+			if err == nil {
+				t.Fatal("expected quota error")
+			}
+			var quotaErr *QuotaHTTPError
+			if !errors.As(err, &quotaErr) || quotaErr.Status != status {
+				t.Fatalf("error=%v, want HTTP %d quota error", err, status)
+			}
+			if info.Primary != nil || info.Secondary != nil || info.FetchedAt != (time.Time{}) {
+				t.Fatalf("failed request returned quota info: %+v", info)
+			}
+			if strings.Contains(err.Error(), "access-token") || strings.Contains(err.Error(), "workspace-account") {
+				t.Fatalf("error leaked upstream body: %v", err)
+			}
+			wantCalls := 1
+			if status == http.StatusForbidden {
+				wantCalls = 2
+			}
+			if calls != wantCalls {
+				t.Fatalf("calls=%d, want %d", calls, wantCalls)
+			}
+		})
+	}
+}
+
+func TestFetchQuotaNetworkFailureIsDistinctFromEmptyPayload(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	account := store.Account{
+		ID: "acct_1", Provider: store.ProviderOpenAICodex, Name: "main", Enabled: true,
+		AccessToken: "access-token", RefreshToken: "refresh-token", ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if err := db.UpsertAccount(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.NotFoundHandler())
+	usageURL := server.URL
+	server.Close()
+	client := NewClientWithUsageURL("https://inference.invalid/responses", usageURL, NewTokenManager(db, nil))
+	info, err := client.FetchQuota(ctx, account)
+	if err == nil || !strings.Contains(err.Error(), "network error") {
+		t.Fatalf("error=%v, want network error", err)
+	}
+	if info.FetchedAt != (time.Time{}) || info.Primary != nil || info.Secondary != nil {
+		t.Fatalf("network error returned quota info: %+v", info)
 	}
 }
 
@@ -360,15 +499,11 @@ func TestFetchQuotaClearsCooldownWhenBothWindowsRecovered(t *testing.T) {
 	}
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("x-codex-primary-used-percent", "0")
-		w.Header().Set("x-codex-primary-window-minutes", "300")
-		w.Header().Set("x-codex-secondary-used-percent", "0")
-		w.Header().Set("x-codex-secondary-window-minutes", "10080")
-		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000},"secondary_window":{"used_percent":0,"limit_window_seconds":604800}}}`))
 	}))
 	defer upstream.Close()
 
-	client := NewClient(upstream.URL, NewTokenManager(db, nil))
+	client := NewClientWithUsageURL("https://inference.invalid/responses", upstream.URL, NewTokenManager(db, nil))
 	if _, err := client.FetchQuota(ctx, account); err != nil {
 		t.Fatalf("fetch quota: %v", err)
 	}
@@ -378,6 +513,64 @@ func TestFetchQuotaClearsCooldownWhenBothWindowsRecovered(t *testing.T) {
 	}
 	if updated.CooldownUntil.Valid || updated.LastFailureAt.Valid || updated.ConsecutiveFailures != 0 {
 		t.Fatalf("failure state was not cleared: %+v", updated)
+	}
+}
+
+func TestFetchQuotaDoesNotClearFailureStateOnIncompleteOrFailedResponse(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		status    int
+		body      string
+		wantError bool
+	}{
+		{name: "partial payload", status: http.StatusOK, body: `{"rate_limit":{"primary_window":{"used_percent":0},"secondary_window":{"limit_window_seconds":604800}}}`},
+		{name: "both windows missing used percent", status: http.StatusOK, body: `{"rate_limit":{"primary_window":{"limit_window_seconds":18000},"secondary_window":{"limit_window_seconds":604800}}}`},
+		{name: "both windows null used percent", status: http.StatusOK, body: `{"rate_limit":{"primary_window":{"used_percent":null},"secondary_window":{"used_percent":null}}}`},
+		{name: "failed", status: http.StatusInternalServerError, body: `{"message":"temporary failure"}`, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, err := store.Open(ctx, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			account := store.Account{
+				ID: "acct_1", Provider: store.ProviderOpenAICodex, Name: "main", Enabled: true,
+				AccessToken: "access-token", RefreshToken: "refresh-token", ExpiresAt: time.Now().Add(time.Hour),
+			}
+			if err := db.UpsertAccount(ctx, account); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.RecordRetryableFailure(ctx, account.ID, time.Now(), time.Now().Add(time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			before, err := db.MustGetAccount(ctx, account.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(test.status)
+				_, _ = w.Write([]byte(test.body))
+			}))
+			defer upstream.Close()
+			client := NewClientWithUsageURL("https://inference.invalid/responses", upstream.URL, NewTokenManager(db, nil))
+			_, fetchErr := client.FetchQuota(ctx, account)
+			if test.wantError != (fetchErr != nil) {
+				t.Fatalf("fetch error=%v, want error=%t", fetchErr, test.wantError)
+			}
+			updated, err := db.MustGetAccount(ctx, account.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if updated.ConsecutiveFailures != before.ConsecutiveFailures ||
+				updated.LastFailureAt.Valid != before.LastFailureAt.Valid ||
+				(updated.LastFailureAt.Valid && !updated.LastFailureAt.Time.Equal(before.LastFailureAt.Time)) ||
+				updated.CooldownUntil.Valid != before.CooldownUntil.Valid ||
+				(updated.CooldownUntil.Valid && !updated.CooldownUntil.Time.Equal(before.CooldownUntil.Time)) {
+				t.Fatalf("failure state changed: before=%+v after=%+v", before, updated)
+			}
+		})
 	}
 }
 
@@ -407,17 +600,12 @@ func TestFetchQuotaSetsCooldownWhenAnyWindowIsExhausted(t *testing.T) {
 			}
 			resetAt := time.Now().Add(time.Hour).Unix()
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("x-codex-primary-used-percent", test.primary)
-				w.Header().Set("x-codex-primary-window-minutes", "300")
-				w.Header().Set("x-codex-secondary-used-percent", test.secondary)
-				w.Header().Set("x-codex-secondary-window-minutes", "10080")
-				w.Header().Set("x-codex-primary-reset-at", strconv.FormatInt(resetAt, 10))
-				w.Header().Set("x-codex-secondary-reset-at", strconv.FormatInt(resetAt, 10))
-				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":%s,"limit_window_seconds":18000,"reset_at":%d},"secondary_window":{"used_percent":%s,"limit_window_seconds":604800,"reset_at":%d}}}`,
+					test.primary, resetAt, test.secondary, resetAt)))
 			}))
 			defer upstream.Close()
 
-			client := NewClient(upstream.URL, NewTokenManager(db, nil))
+			client := NewClientWithUsageURL("https://inference.invalid/responses", upstream.URL, NewTokenManager(db, nil))
 			if _, err := client.FetchQuota(ctx, account); err != nil {
 				t.Fatalf("fetch quota: %v", err)
 			}

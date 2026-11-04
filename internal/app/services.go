@@ -21,16 +21,19 @@ import (
 )
 
 const (
-	DefaultCodexBaseURL = "https://chatgpt.com/backend-api/codex/responses"
-	DefaultClaudeModel  = "claude-opus-4-8"
+	DefaultCodexBaseURL  = "https://chatgpt.com/backend-api/codex/responses"
+	DefaultCodexUsageURL = codex.DefaultUsageURL
+	DefaultClaudeModel   = "claude-opus-4-8"
 )
 
 type ProviderService struct {
 	DB                   *store.DB
 	BaseURL              string
+	CodexUsageURL        string
 	AnthropicMessagesURL string
 	AnthropicUsageURL    string
 	Logger               Logger
+	OnAccountChange      func()
 }
 
 type AuthSession struct {
@@ -107,6 +110,7 @@ func (s ProviderService) AddFromCallback(ctx context.Context, session AuthSessio
 	if err := s.DB.UpsertAccount(ctx, account); err != nil {
 		return store.Account{}, err
 	}
+	s.accountChanged()
 	return account, nil
 }
 
@@ -133,6 +137,7 @@ func (s ProviderService) ReAuthFromCallback(ctx context.Context, session AuthSes
 	if err := s.DB.UpsertAccount(ctx, updated); err != nil {
 		return store.Account{}, err
 	}
+	s.accountChanged()
 	return updated, nil
 }
 
@@ -167,6 +172,7 @@ func (s ProviderService) AddCustomProvider(ctx context.Context, params AddCustom
 	if err := s.DB.UpsertAccount(ctx, account); err != nil {
 		return store.Account{}, err
 	}
+	s.accountChanged()
 	return account, nil
 }
 
@@ -203,6 +209,7 @@ func (s ProviderService) UpdateCustomProvider(ctx context.Context, id string, pa
 	if err := s.DB.UpsertAccount(ctx, account); err != nil {
 		return store.Account{}, err
 	}
+	s.accountChanged()
 	return account, nil
 }
 
@@ -215,7 +222,11 @@ func (s ProviderService) ListProvider(ctx context.Context, provider string) ([]s
 }
 
 func (s ProviderService) Delete(ctx context.Context, id string) error {
-	return s.DB.DeleteAccount(ctx, id)
+	if err := s.DB.DeleteAccount(ctx, id); err != nil {
+		return err
+	}
+	s.accountChanged()
+	return nil
 }
 
 func (s ProviderService) Rename(ctx context.Context, id, name string) error {
@@ -223,11 +234,19 @@ func (s ProviderService) Rename(ctx context.Context, id, name string) error {
 	if name == "" {
 		return fmt.Errorf("connection alias is required")
 	}
-	return s.DB.RenameAccount(ctx, id, name)
+	if err := s.DB.RenameAccount(ctx, id, name); err != nil {
+		return err
+	}
+	s.accountChanged()
+	return nil
 }
 
 func (s ProviderService) SetEnabled(ctx context.Context, id string, enabled bool) error {
-	return s.DB.SetAccountEnabled(ctx, id, enabled)
+	if err := s.DB.SetAccountEnabled(ctx, id, enabled); err != nil {
+		return err
+	}
+	s.accountChanged()
+	return nil
 }
 
 // Reorder swaps an account with its adjacent connection inside the same
@@ -268,11 +287,17 @@ func (s ProviderService) Reorder(ctx context.Context, id string, delta int) erro
 	if !swapped {
 		return fmt.Errorf("provider priorities changed; reload and retry")
 	}
+	s.accountChanged()
 	return nil
 }
 
 func (s ProviderService) Refresh(ctx context.Context, id string) (store.Account, error) {
-	return NewProviderTokenManager(s.DB).RefreshNow(ctx, id)
+	account, err := NewProviderTokenManager(s.DB).RefreshNow(ctx, id)
+	if err != nil {
+		return store.Account{}, err
+	}
+	s.accountChanged()
+	return account, nil
 }
 
 func (s ProviderService) Test(ctx context.Context, account store.Account, model string) (ProviderTestResult, error) {
@@ -360,13 +385,23 @@ func (s ProviderService) Quota(ctx context.Context, account store.Account) (code
 	if baseURL == "" {
 		baseURL = DefaultCodexBaseURL
 	}
-	client := codex.NewClientWithLogger(baseURL, NewProviderTokenManager(s.DB), s.Logger, 64*1024)
+	usageURL := s.CodexUsageURL
+	if usageURL == "" {
+		usageURL = DefaultCodexUsageURL
+	}
+	client := codex.NewClientWithLoggerAndUsageURL(baseURL, usageURL, NewProviderTokenManager(s.DB), s.Logger, 64*1024)
 	return client.FetchQuota(ctx, account)
 }
 
 func (s ProviderService) ClaudeQuota(ctx context.Context, account store.Account) (anthropic.UsageInfo, error) {
 	client := anthropic.NewClient(s.AnthropicMessagesURL, s.AnthropicUsageURL, NewProviderTokenManager(s.DB), s.Logger)
 	return client.FetchUsage(ctx, account)
+}
+
+func (s ProviderService) accountChanged() {
+	if s.OnAccountChange != nil {
+		s.OnAccountChange()
+	}
 }
 
 func exchangeProviderCallback(ctx context.Context, provider string, session AuthSession, callback string) (oauth.TokenResponse, any, error) {
